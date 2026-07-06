@@ -67,6 +67,38 @@ pub trait DbReadOps {
         options: &ReadOptions,
     ) -> Result<Option<Bytes>, crate::Error>;
 
+    /// Get multiple values from the database with default read options.
+    ///
+    /// The returned vector preserves the same order as the input keys,
+    /// including duplicates.
+    async fn multi_get<K>(&self, keys: &[K]) -> Result<Vec<Option<Bytes>>, crate::Error>
+    where
+        K: AsRef<[u8]> + Send + Sync,
+    {
+        self.multi_get_with_options(keys, &ReadOptions::default())
+            .await
+    }
+
+    /// Get multiple values from the database with custom read options.
+    ///
+    /// The default implementation is correctness-oriented and delegates to
+    /// repeated point reads. Concrete database handles override this with a
+    /// batched implementation.
+    async fn multi_get_with_options<K>(
+        &self,
+        keys: &[K],
+        options: &ReadOptions,
+    ) -> Result<Vec<Option<Bytes>>, crate::Error>
+    where
+        K: AsRef<[u8]> + Send + Sync,
+    {
+        let mut values = Vec::with_capacity(keys.len());
+        for key in keys {
+            values.push(self.get_with_options(key, options).await?);
+        }
+        Ok(values)
+    }
+
     /// Get a key-value pair from the database with default read options.
     ///
     /// Returns the key along with its value and metadata (sequence number,
@@ -424,6 +456,22 @@ pub trait DbTransactionOps: DbReadOps {
     where
         K: AsRef<[u8]>,
         V: AsRef<[u8]>;
+
+    /// Put an owned key-value pair into the transaction with default
+    /// `PutOptions`, avoiding the copies that [`Self::put`] performs when the
+    /// caller already has owned [`Bytes`].
+    fn put_bytes(&self, key: Bytes, value: Bytes) -> Result<(), crate::Error> {
+        self.put_bytes_with_options(key, value, &PutOptions::default())
+    }
+
+    /// Put an owned key-value pair into the transaction with custom
+    /// `PutOptions`.
+    fn put_bytes_with_options(
+        &self,
+        key: Bytes,
+        value: Bytes,
+        options: &PutOptions,
+    ) -> Result<(), crate::Error>;
 
     /// Delete a key from the transaction. The delete is buffered in the
     /// transaction's write batch until commit.
