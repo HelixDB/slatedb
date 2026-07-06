@@ -236,6 +236,32 @@ impl DbInner {
             .await
     }
 
+    pub(crate) async fn multi_get_with_options<K: AsRef<[u8]>>(
+        &self,
+        keys: &[K],
+        options: &ReadOptions,
+    ) -> Result<Vec<Option<Bytes>>, SlateDBError> {
+        self.multi_get_key_value_with_options(keys, options)
+            .await
+            .map(|values| values.into_iter().map(|kv| kv.map(|kv| kv.value)).collect())
+    }
+
+    pub(crate) async fn multi_get_key_value_with_options<K: AsRef<[u8]>>(
+        &self,
+        keys: &[K],
+        options: &ReadOptions,
+    ) -> Result<Vec<Option<KeyValue>>, SlateDBError> {
+        self.check_closed()?;
+        let db_state = self.state.read().view();
+        let keys = keys
+            .iter()
+            .map(|key| Bytes::copy_from_slice(key.as_ref()))
+            .collect::<Vec<_>>();
+        self.reader
+            .multi_get_key_value_with_options(&keys, options, &db_state, None)
+            .await
+    }
+
     /// Shared scan path for plain range scans and prefix scans. When
     /// `prefix` is set, every key in `range` starts with it and prefix
     /// bloom filters are consulted to skip non-matching SSTs.
@@ -963,6 +989,31 @@ impl Db {
             .await
             .map_err(crate::Error::from)?;
         Ok(kv)
+    }
+
+    /// Get multiple values from the database with default read options.
+    ///
+    /// The returned vector preserves input order and duplicates.
+    pub async fn multi_get<K: AsRef<[u8]> + Send + Sync>(
+        &self,
+        keys: &[K],
+    ) -> Result<Vec<Option<Bytes>>, crate::Error> {
+        self.multi_get_with_options(keys, &ReadOptions::default())
+            .await
+    }
+
+    /// Get multiple values from the database with custom read options.
+    ///
+    /// The returned vector preserves input order and duplicates.
+    pub async fn multi_get_with_options<K: AsRef<[u8]> + Send + Sync>(
+        &self,
+        keys: &[K],
+        options: &ReadOptions,
+    ) -> Result<Vec<Option<Bytes>>, crate::Error> {
+        self.inner
+            .multi_get_with_options(keys, options)
+            .await
+            .map_err(crate::Error::from)
     }
 
     /// Scan a range of keys using the default scan options.
@@ -1910,6 +1961,17 @@ impl DbReadOps for Db {
         Db::get_key_value_with_options(self, key, options).await
     }
 
+    async fn multi_get_with_options<K>(
+        &self,
+        keys: &[K],
+        options: &ReadOptions,
+    ) -> Result<Vec<Option<Bytes>>, crate::Error>
+    where
+        K: AsRef<[u8]> + Send + Sync,
+    {
+        Db::multi_get_with_options(self, keys, options).await
+    }
+
     async fn scan_with_options<T>(
         &self,
         range: T,
@@ -2235,6 +2297,38 @@ mod tests {
         );
         kv_store.delete(key).await.unwrap();
         assert_eq!(None, kv_store.get(key).await.unwrap());
+        kv_store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_multi_get_matches_repeated_get_with_duplicates() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let kv_store = Db::builder("/tmp/test_multi_get", object_store)
+            .with_settings(test_db_options(0, 1024, None))
+            .build()
+            .await
+            .unwrap();
+
+        kv_store.put(b"k1", b"v1").await.unwrap();
+        kv_store.put(b"k2", b"v2").await.unwrap();
+        kv_store.put(b"k3", b"v3").await.unwrap();
+        kv_store.flush().await.unwrap();
+
+        let keys: [&[u8]; 6] = [b"k1", b"missing", b"k2", b"k1", b"k3", b"missing"];
+        let multi = kv_store.multi_get(&keys).await.unwrap();
+        let mut repeated = Vec::with_capacity(keys.len());
+        for key in keys {
+            repeated.push(kv_store.get(key).await.unwrap());
+        }
+
+        assert_eq!(multi, repeated);
+        assert_eq!(multi[0], Some(Bytes::from_static(b"v1")));
+        assert_eq!(multi[1], None);
+        assert_eq!(multi[2], Some(Bytes::from_static(b"v2")));
+        assert_eq!(multi[3], Some(Bytes::from_static(b"v1")));
+        assert_eq!(multi[4], Some(Bytes::from_static(b"v3")));
+        assert_eq!(multi[5], None);
+
         kv_store.close().await.unwrap();
     }
 
