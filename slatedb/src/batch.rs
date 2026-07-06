@@ -69,6 +69,13 @@ pub(crate) enum WriteOp {
     Merge(Bytes, MergeOptions),
 }
 
+pub(crate) enum WriteBatchLookup {
+    Put(Bytes),
+    Delete,
+    Merge,
+    NotPresent,
+}
+
 impl std::fmt::Debug for WriteOp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         fn trunc(bytes: &Bytes) -> String {
@@ -276,6 +283,15 @@ impl WriteBatch {
 
     pub fn is_empty(&self) -> bool {
         self.ops.is_empty()
+    }
+
+    pub(crate) fn lookup_latest_for_key(&self, key: &[u8]) -> WriteBatchLookup {
+        match self.ops.get(key).and_then(|ops| ops.last()) {
+            Some(WriteOp::Put(value, _)) => WriteBatchLookup::Put(value.clone()),
+            Some(WriteOp::Delete) => WriteBatchLookup::Delete,
+            Some(WriteOp::Merge(_, _)) => WriteBatchLookup::Merge,
+            None => WriteBatchLookup::NotPresent,
+        }
     }
 
     pub(crate) fn has_merge_ops(&self) -> bool {

@@ -361,7 +361,7 @@ impl DbStateReader for ReaderState {
         Arc::clone(&EMPTY_TABLE)
     }
 
-    fn imm_memtables(&self) -> Box<dyn Iterator<Item = Arc<ImmutableMemtable>> + '_> {
+    fn imm_memtables(&self) -> Box<dyn Iterator<Item = Arc<ImmutableMemtable>> + Send + '_> {
         Box::new(self.imm_memtable.iter())
     }
 
@@ -543,6 +543,33 @@ impl DbReaderInner {
             .await
     }
 
+    async fn multi_get_with_options<K: AsRef<[u8]> + Send + Sync>(
+        &self,
+        keys: &[K],
+        options: &ReadOptions,
+    ) -> Result<Vec<Option<Bytes>>, SlateDBError> {
+        self.multi_get_key_value_with_options(keys, options)
+            .await
+            .map(|values| values.into_iter().map(|kv| kv.map(|kv| kv.value)).collect())
+    }
+
+    async fn multi_get_key_value_with_options<K: AsRef<[u8]> + Send + Sync>(
+        &self,
+        keys: &[K],
+        options: &ReadOptions,
+    ) -> Result<Vec<Option<KeyValue>>, SlateDBError> {
+        self.check_closed()?;
+        let db_state = Arc::clone(&self.state.read());
+        let _permit = db_state.generation.acquire()?;
+        let keys = keys
+            .iter()
+            .map(|key| Bytes::copy_from_slice(key.as_ref()))
+            .collect::<Vec<_>>();
+        self.reader
+            .multi_get_key_value_with_options(&keys, options, db_state.as_ref(), None)
+            .await
+    }
+
     pub(crate) async fn snapshot_get_key_value_with_options<K: AsRef<[u8]> + Send>(
         &self,
         state: Arc<ReaderState>,
@@ -554,6 +581,26 @@ impl DbReaderInner {
         let _permit = state.generation.acquire()?;
         self.reader
             .get_key_value_with_options(key, options, state.as_ref(), None, Some(max_seq))
+            .await
+    }
+
+    pub(crate) async fn snapshot_multi_get_key_value_with_options<
+        K: AsRef<[u8]> + Send + Sync,
+    >(
+        &self,
+        state: Arc<ReaderState>,
+        max_seq: u64,
+        keys: &[K],
+        options: &ReadOptions,
+    ) -> Result<Vec<Option<KeyValue>>, SlateDBError> {
+        self.check_closed()?;
+        let _permit = state.generation.acquire()?;
+        let keys = keys
+            .iter()
+            .map(|key| Bytes::copy_from_slice(key.as_ref()))
+            .collect::<Vec<_>>();
+        self.reader
+            .multi_get_key_value_with_options(&keys, options, state.as_ref(), Some(max_seq))
             .await
     }
 
@@ -1635,6 +1682,31 @@ impl DbReader {
         Ok(kv)
     }
 
+    /// Get multiple values from the reader with default read options.
+    ///
+    /// The returned vector preserves input order and duplicates.
+    pub async fn multi_get<K: AsRef<[u8]> + Send + Sync>(
+        &self,
+        keys: &[K],
+    ) -> Result<Vec<Option<Bytes>>, crate::Error> {
+        self.multi_get_with_options(keys, &ReadOptions::default())
+            .await
+    }
+
+    /// Get multiple values from the reader with custom read options.
+    ///
+    /// The returned vector preserves input order and duplicates.
+    pub async fn multi_get_with_options<K: AsRef<[u8]> + Send + Sync>(
+        &self,
+        keys: &[K],
+        options: &ReadOptions,
+    ) -> Result<Vec<Option<Bytes>>, crate::Error> {
+        self.inner
+            .multi_get_with_options(keys, options)
+            .await
+            .map_err(Into::into)
+    }
+
     /// Scan a range of keys using the default scan options.
     ///
     /// returns a `DbIterator`
@@ -1878,6 +1950,17 @@ impl DbReadOps for DbReader {
         options: &ReadOptions,
     ) -> Result<Option<KeyValue>, crate::Error> {
         DbReader::get_key_value_with_options(self, key, options).await
+    }
+
+    async fn multi_get_with_options<K>(
+        &self,
+        keys: &[K],
+        options: &ReadOptions,
+    ) -> Result<Vec<Option<Bytes>>, crate::Error>
+    where
+        K: AsRef<[u8]> + Send + Sync,
+    {
+        DbReader::multi_get_with_options(self, keys, options).await
     }
 
     async fn scan_with_options<T>(
@@ -2976,6 +3059,9 @@ mod tests {
         db.put_with_options(b"key", b"v2", &PutOptions::default(), &write_options)
             .await
             .unwrap();
+        db.put_with_options(b"new", b"v3", &PutOptions::default(), &write_options)
+            .await
+            .unwrap();
         db.flush_with_options(FlushOptions {
             flush_type: FlushType::Wal,
         })
@@ -2994,6 +3080,23 @@ mod tests {
 
         assert_eq!(reader.get(b"key").await.unwrap(), Some(Bytes::from("v2")));
         assert_eq!(snapshot.get(b"key").await.unwrap(), Some(Bytes::from("v1")));
+        let keys = [&b"key"[..], &b"key"[..], &b"new"[..]];
+        assert_eq!(
+            snapshot.multi_get(&keys).await.unwrap(),
+            vec![
+                Some(Bytes::from_static(b"v1")),
+                Some(Bytes::from_static(b"v1")),
+                None,
+            ]
+        );
+        assert_eq!(
+            reader.multi_get(&keys).await.unwrap(),
+            vec![
+                Some(Bytes::from_static(b"v2")),
+                Some(Bytes::from_static(b"v2")),
+                Some(Bytes::from_static(b"v3")),
+            ]
+        );
         assert_eq!(
             reader.snapshot().await.unwrap().get(b"key").await.unwrap(),
             Some(Bytes::from("v2"))
