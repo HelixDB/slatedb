@@ -5,7 +5,6 @@ use std::sync::atomic::{self, AtomicBool};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use chrono::TimeDelta;
 use futures::future::{join, join_all};
 use parking_lot::Mutex;
 use tokio::task::JoinHandle;
@@ -522,7 +521,7 @@ impl TokioCompactionExecutorInner {
     ///   (RFC-0028)
     /// - Streams and merges input keys across all sources (per range)
     /// - Applies merge and retention policies
-    /// - Writes output SSTs up to `max_sst_size`, reporting periodic progress
+    /// - Writes output SSTs up to `max_sst_size`, reporting resumable progress
     ///
     /// ## Returns
     /// - The compaction context with all output SST handles.
@@ -535,34 +534,11 @@ impl TokioCompactionExecutorInner {
         let id = args.id;
         let destination = args.destination;
 
-        // Planning (manifest load + input-index reads) runs before
-        // `execute_compaction_job` emits its first progress event, so it would
-        // otherwise go un-heartbeated. On a cold object store with very wide
-        // input it can exceed `worker_heartbeat_timeout`, letting the
-        // coordinator reclaim a healthy job mid-plan and livelock on
-        // re-planning. Emit a liveness-only heartbeat on the
-        // `heartbeat_min_interval` cadence while planning is in flight; planning
-        // that finishes before the first tick (the common case) sends nothing.
-        let plan = self.load_manifest_and_plan(args);
-        tokio::pin!(plan);
-        let (sequence_tracker, planned) = loop {
-            tokio::select! {
-                biased;
-                res = &mut plan => break res?,
-                _ = self.clock.sleep(self.options.heartbeat_min_interval) => {
-                    if self
-                        .worker_tx
-                        .try_send(WorkerMessage::CompactionJobHeartbeat { id })
-                        .is_err()
-                    {
-                        debug!(
-                            "failed to send planning heartbeat (likely DB shutdown) [id={}]",
-                            id
-                        );
-                    }
-                }
-            }
-        };
+        // Worker liveness is refreshed by the compaction worker's own heartbeat
+        // ticker while planning is in flight. The executor only reports
+        // progress when it has compaction context that may need to be persisted
+        // for resume.
+        let (sequence_tracker, planned) = self.load_manifest_and_plan(args).await?;
 
         self.execute_compaction_job(id, destination, planned, sequence_tracker)
             .await
@@ -610,15 +586,15 @@ impl TokioCompactionExecutorInner {
     /// Executes a compaction job's subcompactions (RFC-0028), running every
     /// range concurrently.
     ///
-    /// The plan is reported (and therefore persisted by the orchestrator)
-    /// before any range output is recorded against it; per-range output SSTs
-    /// are then reported as they advance so an interrupted compaction can
-    /// resume at range granularity. Subcompactions carry no persisted status,
-    /// so every range is run: a range resumes from the output recorded against
-    /// it, and one that is already complete finds nothing left to merge and
-    /// finishes immediately. On the first range failure the remaining
-    /// subcompactions are aborted and the job fails; progress recorded by then
-    /// stays resumable.
+    /// The plan is reported (and buffered by the worker for its next
+    /// heartbeat to publish) before any range output is recorded against it;
+    /// per-range output SSTs are then reported as they advance so an
+    /// interrupted compaction can resume at range granularity. Subcompactions
+    /// carry no persisted status, so every range is run: a range resumes from
+    /// the output recorded against it, and one that is already complete finds
+    /// nothing left to merge and finishes immediately. On the first range
+    /// failure the remaining subcompactions are aborted and the job fails;
+    /// progress recorded by then stays resumable.
     async fn execute_compaction_job(
         self: &Arc<Self>,
         id: Ulid,
@@ -644,13 +620,14 @@ impl TokioCompactionExecutorInner {
         // full estimated size up front.
         let mut bytes_processed_by_sub: Vec<u64> = vec![0; subcompaction_args.len()];
 
-        // For a fresh job, report the plan immediately so it is persisted
-        // before any range records output against it; bytes are genuinely zero
-        // at this point. A resumed job's plan is already persisted (it arrived
-        // in `args.subcompactions`), so reporting it here would only republish
-        // zero bytes processed before the ranges re-report their resumed
-        // progress — a momentary drop to zero. Skip it; the per-range progress
-        // emitted as each range starts carries the resumed totals instead.
+        // For a fresh job, report the plan immediately so the worker buffers
+        // it before any range records output against it; bytes are genuinely
+        // zero at this point. A resumed job's plan is already persisted (it
+        // arrived in `args.subcompactions`), so reporting it here would only
+        // republish zero bytes processed before the ranges re-report their
+        // resumed progress — a momentary drop to zero. Skip it; the per-range
+        // progress emitted as each range starts carries the resumed totals
+        // instead.
         if ctx
             .subcompactions()
             .iter()
@@ -832,22 +809,11 @@ impl TokioCompactionExecutorInner {
             before_key.saturating_sub(before_range)
         });
 
-        // Cadence for the time-based progress send below. Caps sends at 1s (the
-        // pre-distributed-compaction default), but never coarser than the
-        // worker's `heartbeat_min_interval`, since the worker can only heartbeat
-        // when the executor sends (see `handle_progress`).
-        let progress_interval = TimeDelta::from_std(
-            self.options
-                .heartbeat_min_interval
-                .min(std::time::Duration::from_secs(1)),
-        )
-        .expect("clamped to <= 1s, which always fits in a TimeDelta");
         // Report the resume point up front so a resumed range surfaces the bytes
         // already processed in prior attempts immediately. A range that resumes
         // already-complete reports its full estimated size here (its resume
         // cursor sits at the range's last key) and never enters the loop below.
         progress(start_bytes_processed, &output_ssts);
-        let mut last_progress_report = self.clock.now();
 
         // At most one SST close runs in the background at a time (depth-1
         // pipeline). While a finished SST flushes to the object store we keep
@@ -867,15 +833,6 @@ impl TokioCompactionExecutorInner {
                 self.collect_close(pending, &mut output_ssts).await?;
                 let total_bytes = start_bytes_processed + all_iter.bytes_processed();
                 progress(total_bytes, &output_ssts);
-                last_progress_report = self.clock.now();
-            }
-
-            let duration_since_last_report =
-                self.clock.now().signed_duration_since(last_progress_report);
-            if duration_since_last_report > progress_interval {
-                let total_bytes = start_bytes_processed + all_iter.bytes_processed();
-                progress(total_bytes, &output_ssts);
-                last_progress_report = self.clock.now();
             }
 
             if let Some(block_size) = current_writer.add(kv).await? {
@@ -903,7 +860,6 @@ impl TokioCompactionExecutorInner {
                 bytes_written = 0;
                 let total_bytes = start_bytes_processed + all_iter.bytes_processed();
                 progress(total_bytes, &output_ssts);
-                last_progress_report = self.clock.now();
             }
         }
 
@@ -2804,135 +2760,6 @@ mod tests {
         }
         let expected: Vec<Bytes> = entries.iter().map(|e| e.key.clone()).collect();
         assert_eq!(read_back, expected);
-    }
-
-    /// Planning (manifest load + input-index reads) runs before the executor
-    /// emits its first progress event. On a cold object store with wide input
-    /// it can outlast `worker_heartbeat_timeout`, so the executor must emit a
-    /// liveness heartbeat while planning is in flight or a healthy job gets
-    /// reclaimed mid-plan. Simulate the stall with a gated object store and
-    /// assert a planning heartbeat lands before any progress.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn should_heartbeat_while_planning_index_reads_block() {
-        // given: the table store reads/writes through a gated object store, but
-        // the manifest store uses the ungated inner store — so we can stall the
-        // planner's input-index reads while the manifest load still completes. A
-        // short heartbeat interval makes the planning heartbeat observable.
-        let handle = tokio::runtime::Handle::current();
-        let options = Arc::new(CompactionWorkerOptions {
-            max_sst_size: SUBCOMPACTION_SST_SIZE,
-            heartbeat_min_interval: Duration::from_millis(20),
-            ..CompactionWorkerOptions::default()
-        });
-        let (tx, rx) = async_channel::unbounded::<WorkerMessage>();
-        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let gated = Arc::new(GatedObjectStore::new(inner.clone()));
-        let gated_store: Arc<dyn ObjectStore> = gated.clone();
-        let root_path = Path::from("testdb-plan-heartbeat");
-        let clock = Arc::new(DefaultSystemClock::new());
-        let table_store = Arc::new(TableStore::new(
-            ObjectStores::new(gated_store.clone(), None),
-            SsTableFormat {
-                block_size: 256,
-                ..SsTableFormat::default()
-            },
-            root_path.clone(),
-            None,
-            TableStoreKind::Compactor,
-        ));
-        let manifest_store = Arc::new(ManifestStore::new(&root_path, inner.clone()));
-        StoredManifest::create_new_db(manifest_store.clone(), ManifestCore::new(), clock.clone())
-            .await
-            .unwrap();
-
-        let executor = TokioCompactionExecutor::new(TokioCompactionExecutorOptions {
-            handle,
-            options,
-            worker_tx: tx,
-            table_store: table_store.clone(),
-            rand: Arc::new(DbRand::new(100u64)),
-            stats: {
-                let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
-                Arc::new(CompactionStats::new(&recorder))
-            },
-            worker_stats: WorkerStats::noop(),
-            clock,
-            manifest_store,
-            merge_operator: None,
-            #[cfg(feature = "compaction_filters")]
-            compaction_filter_supplier: None,
-        });
-
-        // given: multi-SST input (written with the read gate open).
-        let (l0_sst_views, sorted_runs) = split_inputs(&table_store).await;
-
-        // given: block object-store reads so the planner's index reads stall.
-        // Baseline existing read arrivals so we can wait for the next one.
-        let setup_gets = gated.get_opts_gate.arrivals();
-        gated.get_opts_gate.close();
-
-        // when: a *fresh* job (ctx = None, so it must plan) starts.
-        let id = Ulid::new();
-        executor.start_compaction_job(StartCompactionJobArgs {
-            id,
-            compaction_id: Ulid::new(),
-            destination: 0,
-            l0_sst_views,
-            sorted_runs,
-            compaction_clock_tick: 0,
-            is_dest_last_run: false,
-            retention_min_seq: Some(0),
-            ctx: None,
-        });
-
-        // then: planning parks on a blocked index read (the manifest load, on the
-        // ungated store, already succeeded) ...
-        tokio::time::timeout(
-            Duration::from_secs(30),
-            gated.get_opts_gate.wait_for_arrivals(setup_gets + 1),
-        )
-        .await
-        .expect("planning should reach the blocked read gate");
-
-        // ... and while it is parked the executor emits a planning heartbeat for
-        // this job, with no progress/finished yet (planning produced no plan).
-        let heartbeated = tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                match rx.recv().await.unwrap() {
-                    WorkerMessage::CompactionJobHeartbeat { id: hb_id } => {
-                        assert_eq!(hb_id, id, "heartbeat carried the wrong job id");
-                        break;
-                    }
-                    WorkerMessage::CompactionJobProgress { .. } => {
-                        panic!("progress emitted before planning completed")
-                    }
-                    WorkerMessage::CompactionJobFinished { .. } => {
-                        panic!("job finished while planning reads were blocked")
-                    }
-                    WorkerMessage::PollCompactions => {}
-                }
-            }
-        })
-        .await;
-        assert!(
-            heartbeated.is_ok(),
-            "expected a planning heartbeat while input-index reads were blocked"
-        );
-
-        // when: reads are unblocked, the job plans and runs to completion.
-        gated.get_opts_gate.release();
-        tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                if let WorkerMessage::CompactionJobFinished { result, .. } =
-                    rx.recv().await.unwrap()
-                {
-                    return result;
-                }
-            }
-        })
-        .await
-        .expect("job should finish after reads are unblocked")
-        .expect("compaction should succeed");
     }
 
     /// Test context for compaction executor tests.

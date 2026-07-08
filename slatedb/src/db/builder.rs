@@ -138,7 +138,7 @@ use crate::config::{Settings, SstBlockSize};
 use crate::db::Db;
 use crate::db::DbInner;
 use crate::db_cache::SplitCache;
-use crate::db_cache::{DbCache, DbCacheWrapper};
+use crate::db_cache::{DbCache, DbCacheWrapper, UnownedDbCache};
 use crate::db_reader::DbReader;
 use crate::db_status::{ClosedResultWriter, DbStatusManager};
 use crate::dispatcher::MessageHandlerExecutor;
@@ -157,7 +157,6 @@ use crate::object_stores::ObjectStoreType;
 use crate::object_stores::ObjectStores;
 use crate::paths::PathResolver;
 use crate::retrying_object_store::RetryingObjectStore;
-use crate::store_provider::DefaultStoreProvider;
 use crate::tablestore::{TableStore, TableStoreKind};
 use crate::utils::SafeSender;
 use crate::utils::WatchableOnceCell;
@@ -255,8 +254,14 @@ impl<P: Into<Path>> DbBuilder<P> {
     ///
     /// SlateDB uses a cache to efficiently store and retrieve blocks and SST metadata locally.
     /// [`slatedb::db_cache::SplitCache`] is used by default.
+    ///
+    /// A cache passed in here remains owned by the caller: it is safe to share it across
+    /// multiple `Db`/`DbReader` instances, and [`Db::close`](crate::Db::close) will *not*
+    /// close it. Call [`DbCache::close`] yourself after closing every database that uses it.
     pub fn with_db_cache(mut self, db_cache: Arc<dyn DbCache>) -> Self {
-        self.db_cache = Some(db_cache);
+        // Wrap so Db::close()/DbReader::close() can't close a cache the
+        // caller owns and may be sharing with other instances.
+        self.db_cache = Some(Arc::new(UnownedDbCache::new(db_cache)));
         self
     }
 
@@ -424,7 +429,7 @@ impl<P: Into<Path>> DbBuilder<P> {
         let recorder =
             MetricsRecorderHelper::new(self.metrics_recorder, self.settings.metric_level);
         let retrying_main_object_store = instrumented_retrying_object_store(
-            self.main_object_store,
+            self.main_object_store.clone(),
             &recorder,
             ObjectStoreComponent::Db,
             ObjectStoreType::Main,
@@ -622,9 +627,17 @@ impl<P: Into<Path>> DbBuilder<P> {
         )?;
         // The compactor and GC each get their own cacheless store (so background
         // reads do not pollute the foreground cache), tagged with their kind.
+        //
+        // The compactor reads/writes through whichever object store its builder
+        // holds: the DB's own store on the auto-from-settings path, or the one
+        // the caller supplied on their own `CompactorBuilder` (so a custom
+        // compaction read path — e.g. one that bypasses a prefetch wrapper used
+        // by the foreground read path — actually takes effect instead of being
+        // silently ignored). Either way it is wrapped in its own Compactor-tagged
+        // retry/instrumentation layer below.
         let compactor_builder = self.compactor_builder.or_else(|| {
             self.settings.compactor_options.as_ref().map(|opts| {
-                CompactorBuilder::new(path.clone(), retrying_main_object_store.clone())
+                CompactorBuilder::new(path.clone(), self.main_object_store.clone())
                     .with_options(opts.clone())
             })
         });
@@ -644,9 +657,19 @@ impl<P: Into<Path>> DbBuilder<P> {
             }
             builder = builder.with_fp_registry(self.fp_registry.clone());
 
+            // Wrap whatever object store the builder holds in the compactor's
+            // own cacheless, Compactor-tagged retry/instrumentation layer.
+            let compactor_main_object_store = instrumented_retrying_object_store(
+                builder.main_object_store.clone(),
+                &recorder,
+                ObjectStoreComponent::Compactor,
+                ObjectStoreType::Main,
+                rand.clone(),
+                system_clock.clone(),
+            );
             let compactor_table_store = Arc::new(TableStore::new_with_fp_registry(
                 ObjectStores::new(
-                    retrying_main_object_store.clone(),
+                    compactor_main_object_store,
                     retrying_wal_object_store.clone(),
                 ),
                 sst_format.clone(),
@@ -1593,8 +1616,15 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
     ///
     /// SlateDB uses a cache to efficiently store and retrieve blocks and SST metadata locally.
     /// [`slatedb::db_cache::SplitCache`] is used by default.
+    ///
+    /// A cache passed in here remains owned by the caller: it is safe to share it across
+    /// multiple `Db`/`DbReader` instances, and [`DbReader::close`](crate::DbReader::close)
+    /// will *not* close it. Call [`DbCache::close`] yourself after closing every database
+    /// that uses it.
     pub fn with_db_cache(mut self, db_cache: Arc<dyn DbCache>) -> Self {
-        self.db_cache = Some(db_cache);
+        // Wrap so Db::close()/DbReader::close() can't close a cache the
+        // caller owns and may be sharing with other instances.
+        self.db_cache = Some(Arc::new(UnownedDbCache::new(db_cache)));
         self
     }
 
@@ -1704,14 +1734,36 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
         };
 
         // Validate WAL object store configuration.
-        let manifest_store = Arc::new(ManifestStore::new(&path, retrying_object_store.clone()));
+        let manifest_store = Arc::new(ManifestStore::new(&path, retrying_object_store));
         let latest_manifest =
-            StoredManifest::try_load(manifest_store, self.system_clock.clone()).await?;
+            StoredManifest::try_load(Arc::clone(&manifest_store), self.system_clock.clone())
+                .await?;
         if let Some(latest_manifest) = &latest_manifest {
             latest_manifest
                 .db_state()
                 .validate_wal_object_store_uri(wal_object_store_uri.as_deref())?;
         }
+
+        // Resolve external SSTs against the manifest the reader will actually
+        // read from: the pinned checkpoint's manifest when a checkpoint id is
+        // given (compaction may have pruned re-localized external SSTs from
+        // the latest manifest), and the latest manifest otherwise.
+        let external_ssts = match (&latest_manifest, self.checkpoint_id) {
+            (Some(latest_stored_manifest), Some(checkpoint_id)) => {
+                let checkpoint = latest_stored_manifest
+                    .db_state()
+                    .find_checkpoint(checkpoint_id)
+                    .ok_or(SlateDBError::CheckpointMissing(checkpoint_id))?;
+                manifest_store
+                    .read_manifest(checkpoint.manifest_id)
+                    .await?
+                    .external_ssts()
+            }
+            (Some(latest_stored_manifest), None) => {
+                latest_stored_manifest.manifest().external_ssts()
+            }
+            (None, _) => HashMap::new(),
+        };
 
         let wrapped_cache = self.db_cache.as_ref().map(|c| {
             Arc::new(DbCacheWrapper::new(
@@ -1721,19 +1773,24 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
             )) as Arc<dyn DbCache>
         });
 
-        let store_provider = DefaultStoreProvider {
-            path: path.clone(),
-            object_store,
-            manifest_object_store: retrying_object_store,
-            wal_object_store: retrying_wal_object_store,
-            block_cache: wrapped_cache,
-            block_transformer: self.block_transformer.clone(),
-            filter_policies: self.filter_policies.clone(),
-            kind: TableStoreKind::Reader,
+        let sst_format = SsTableFormat {
+            filter_policies: self.filter_policies,
+            block_transformer: self.block_transformer,
+            ..SsTableFormat::default()
         };
+        let path_resolver = PathResolver::new_with_external_ssts(path.clone(), external_ssts);
+        let table_store = Arc::new(TableStore::new_with_fp_registry(
+            ObjectStores::new(object_store, retrying_wal_object_store),
+            sst_format,
+            path_resolver,
+            Arc::new(FailPointRegistry::new()),
+            wrapped_cache,
+            TableStoreKind::Reader,
+        ));
 
         let reader = DbReader::open_internal(
-            &store_provider,
+            manifest_store,
+            table_store,
             self.checkpoint_id,
             self.merge_operator,
             self.segment_extractor,

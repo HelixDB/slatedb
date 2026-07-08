@@ -98,8 +98,8 @@ pub fn build_settings_compactor(rng: &mut impl Rng) -> CompactorOptions {
     // produce `timeout < interval`, which reclaims healthy jobs and livelocks compaction.
     let compactions_poll_interval =
         rng.random_range(Duration::from_millis(1)..Duration::from_secs(5));
-    let heartbeat_min_interval = rng.random_range(Duration::from_millis(1)..Duration::from_secs(5));
-    let max_worker_heartbeat = heartbeat_min_interval.max(compactions_poll_interval);
+    let heartbeat_interval = rng.random_range(Duration::from_millis(1)..Duration::from_secs(5));
+    let max_worker_heartbeat = heartbeat_interval.max(compactions_poll_interval);
     let worker_heartbeat_timeout = max_worker_heartbeat * rng.random_range(3..=10);
 
     CompactorOptions {
@@ -116,7 +116,7 @@ pub fn build_settings_compactor(rng: &mut impl Rng) -> CompactorOptions {
         worker: Some(CompactionWorkerOptions {
             max_concurrent_compactions: rng.random_range(1..=4),
             compactions_poll_interval,
-            heartbeat_min_interval,
+            heartbeat_interval,
             max_sst_size: rng.random_range(KIB_8..GIB_2),
             max_fetch_tasks: rng.random_range(1..=8),
             bytes_to_fetch: rng.random_range(KIB_8..=(8 * MIB_1)),
@@ -281,6 +281,51 @@ pub fn build_toxic(rand: &DbRand, root_path: &str, index: usize) -> Toxic {
         operations,
         path_prefix,
     }
+}
+
+/// Environment variable holding a comma-separated list of `u64` seeds that
+/// overrides random seed generation for DST tests.
+pub const DST_SEEDS_ENV: &str = "SLATEDB_DST_SEEDS";
+
+/// Returns the seeds a DST test should run.
+///
+/// When [`DST_SEEDS_ENV`] is set, parses it as a comma-separated list of
+/// `u64` seeds so a failed run can be reproduced with the seeds it logged.
+/// Otherwise returns `default_count` random seeds.
+pub fn dst_seeds(default_count: usize) -> std::io::Result<Vec<u64>> {
+    match std::env::var(DST_SEEDS_ENV) {
+        Ok(raw) => parse_seeds(&raw),
+        Err(std::env::VarError::NotPresent) => {
+            Ok((0..default_count).map(|_| rand::random::<u64>()).collect())
+        }
+        Err(err) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid {DST_SEEDS_ENV}: {err}"),
+        )),
+    }
+}
+
+fn parse_seeds(raw: &str) -> std::io::Result<Vec<u64>> {
+    let seeds = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value.parse::<u64>().map_err(|err| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("invalid seed {value:?} in {DST_SEEDS_ENV}: {err}"),
+                )
+            })
+        })
+        .collect::<std::io::Result<Vec<u64>>>()?;
+    if seeds.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{DST_SEEDS_ENV} must contain at least one seed"),
+        ));
+    }
+    Ok(seeds)
 }
 
 // A flag so we only initialize logging once.

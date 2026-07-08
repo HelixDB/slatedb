@@ -42,7 +42,7 @@ use parking_lot::RwLock;
 use std::time::Duration;
 
 use crate::batch::WriteBatch;
-use crate::batch_write::{WriteBatchMessage, WRITE_BATCH_TASK_NAME};
+use crate::batch_write::{BatchWriterMessage, WriteBatchRequest, WRITE_BATCH_TASK_NAME};
 use crate::bytes_range::{ByteRangeBounds, BytesRange};
 use crate::cached_object_store::CachedObjectStore;
 use crate::clock::MonotonicClock;
@@ -89,7 +89,7 @@ pub(crate) struct DbInner {
     pub(crate) settings: Settings,
     pub(crate) table_store: Arc<TableStore>,
     pub(crate) memtable_flusher: Arc<MemtableFlusher>,
-    pub(crate) write_notifier: SafeSender<WriteBatchMessage>,
+    pub(crate) write_notifier: SafeSender<BatchWriterMessage>,
     pub(crate) db_stats: DbStats,
     /// Kept alive so the underlying `MetricsRecorder` is not dropped while
     /// metric handles in `DbStats` (and other stats structs) are still in use.
@@ -129,7 +129,7 @@ impl DbInner {
         table_store: Arc<TableStore>,
         manifest: DirtyObject<Manifest>,
         memtable_flusher: Arc<MemtableFlusher>,
-        write_notifier: SafeSender<WriteBatchMessage>,
+        write_notifier: SafeSender<BatchWriterMessage>,
         recorder: MetricsRecorderHelper,
         fp_registry: Arc<FailPointRegistry>,
         merge_operator: Option<crate::merge_operator::MergeOperatorType>,
@@ -179,7 +179,6 @@ impl DbInner {
             recent_flushed_wal_id,
             oracle.clone(),
             table_store.clone(),
-            mono_clock.clone(),
             settings.l0_sst_size_bytes,
             settings.flush_interval,
         ));
@@ -300,7 +299,7 @@ impl DbInner {
     }
 
     #[allow(unused_variables)]
-    pub(crate) fn wal_enabled_in_options(settings: &Settings) -> bool {
+    fn wal_enabled_in_options(settings: &Settings) -> bool {
         #[cfg(feature = "wal_disable")]
         return settings.wal_enabled;
         #[cfg(not(feature = "wal_disable"))]
@@ -321,12 +320,12 @@ impl DbInner {
         }
 
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let batch_msg = WriteBatchMessage {
+        let batch_msg = BatchWriterMessage::WriteBatch(WriteBatchRequest {
             batch,
             options: options.clone(),
             done: tx,
             txn,
-        };
+        });
 
         self.maybe_apply_backpressure().await?;
         self.write_notifier.send(batch_msg)?;
@@ -447,11 +446,6 @@ impl DbInner {
         Ok(())
     }
 
-    pub(crate) async fn flush_wals(&self) -> Result<u64, SlateDBError> {
-        self.wal_buffer.flush().await?;
-        Ok(self.wal_buffer.recent_flushed_wal_id())
-    }
-
     async fn flush_imm_memtables(&self, target: FlushTarget) -> Result<FlushResult, SlateDBError> {
         self.memtable_flusher().flush(target).await
     }
@@ -460,7 +454,9 @@ impl DbInner {
         &self,
         target: FlushTarget,
     ) -> Result<FlushResult, SlateDBError> {
-        self.freeze_current_memtable()?;
+        // flush the batch writer to freeze the active memtable and flush all WALs to unblock
+        // memtable flush
+        self.request_batch_writer_flush(true).await?;
         self.flush_imm_memtables(target).await
     }
 
@@ -493,18 +489,12 @@ impl DbInner {
         }
         match options.flush_type {
             FlushType::Wal => {
-                if self.wal_enabled {
-                    self.flush_wals().await.map(|_| ())
-                } else {
-                    Err(SlateDBError::WalDisabled)
+                if !self.wal_enabled {
+                    return Err(SlateDBError::WalDisabled);
                 }
+                self.request_batch_writer_flush(false).await
             }
-            FlushType::MemTable => {
-                if self.wal_enabled {
-                    self.flush_wals().await?;
-                }
-                self.flush_memtables(FlushTarget::All).await.map(|_| ())
-            }
+            FlushType::MemTable => self.flush_memtables(FlushTarget::All).await.map(|_| ()),
         }
     }
 
@@ -2134,7 +2124,6 @@ impl WriteHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cached_object_store::stats::{PART_ACCESS_COUNT, PART_HIT_COUNT};
     use crate::cached_object_store::{CachedObjectStore, FsCacheStorage};
     use crate::cached_object_store_stats::CachedObjectStoreStats;
     use crate::config::DurabilityLevel::{Memory, Remote};
@@ -3596,114 +3585,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_with_object_store_cache_metrics() {
-        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let mut opts = test_db_options(0, 1024, None);
-        let temp_dir = tempfile::Builder::new()
-            .prefix("objstore_cache_test_")
-            .tempdir()
-            .unwrap();
-
-        opts.object_store_cache_options.root_folder = Some(temp_dir.keep());
-        opts.object_store_cache_options.part_size_bytes = 1024;
-        let metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
-        let kv_store = Db::builder(
-            "/tmp/test_kv_store_with_cache_metrics",
-            object_store.clone(),
-        )
-        .with_settings(opts)
-        .with_db_cache_disabled()
-        .with_metrics_recorder(metrics_recorder.clone())
-        .build()
-        .await
-        .unwrap();
-
-        let access_count0 = lookup_metric(&metrics_recorder, PART_ACCESS_COUNT).unwrap();
-        let key = b"test_key";
-        let value = b"test_value";
-        kv_store.put(key, value).await.unwrap();
-        kv_store
-            .flush_with_options(FlushOptions {
-                flush_type: FlushType::MemTable,
-            })
-            .await
-            .unwrap();
-
-        let got = kv_store.get(key).await.unwrap();
-        let access_count1 = lookup_metric(&metrics_recorder, PART_ACCESS_COUNT).unwrap();
-        assert_eq!(got, Some(Bytes::from_static(value)));
-        assert!(access_count1 > 0);
-        assert!(access_count1 >= access_count0);
-        assert!(lookup_metric(&metrics_recorder, PART_HIT_COUNT).unwrap() >= 1);
-    }
-
-    #[tokio::test]
-    async fn test_db_records_remote_object_store_reads_but_not_cache_hits() {
-        // given:
-        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let mut opts = test_db_options(0, 1024, None);
-        let temp_dir = tempfile::Builder::new()
-            .prefix("objstore_metrics_test_")
-            .tempdir()
-            .unwrap();
-
-        opts.object_store_cache_options.root_folder = Some(temp_dir.keep());
-        opts.object_store_cache_options.part_size_bytes = 1024;
-        let path = "/tmp/test_db_records_remote_object_store_reads_but_not_cache_hits";
-        let kv_store = Db::builder(path, object_store.clone())
-            .with_settings(opts)
-            .build()
-            .await
-            .unwrap();
-
-        kv_store.put(b"test_key", b"test_value").await.unwrap();
-        kv_store.flush().await.unwrap();
-        kv_store
-            .flush_with_options(FlushOptions {
-                flush_type: FlushType::MemTable,
-            })
-            .await
-            .unwrap();
-        kv_store.close().await.unwrap();
-
-        let mut reopen_opts = test_db_options(0, 1024, None);
-        let reopen_temp_dir = tempfile::Builder::new()
-            .prefix("objstore_metrics_reopen_")
-            .tempdir()
-            .unwrap();
-        reopen_opts.object_store_cache_options.root_folder = Some(reopen_temp_dir.keep());
-        reopen_opts.object_store_cache_options.part_size_bytes = 1024;
-        let metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
-        let reopened = Db::builder(path, object_store)
-            .with_settings(reopen_opts)
-            .with_metrics_recorder(metrics_recorder.clone())
-            .build()
-            .await
-            .unwrap();
-
-        let requests_before =
-            lookup_object_store_op_request_count(&metrics_recorder, "db", "main", "get");
-
-        // when:
-        let _got = reopened.get(b"test_key").await.unwrap();
-        let requests_after_first =
-            lookup_object_store_op_request_count(&metrics_recorder, "db", "main", "get");
-        let got = reopened.get(b"test_key").await.unwrap();
-        let requests_after_second =
-            lookup_object_store_op_request_count(&metrics_recorder, "db", "main", "get");
-
-        // then:
-        assert!(requests_after_first > requests_before);
-        assert_eq!(got, Some(Bytes::from_static(b"test_value")));
-        assert_eq!(requests_after_second, requests_after_first);
-        assert_eq!(
-            lookup_object_store_op_histogram_count(&metrics_recorder, "db", "main", "get"),
-            requests_after_first as u64
-        );
-        reopened.close().await.unwrap();
-    }
-
-    #[tokio::test]
     async fn test_db_records_main_and_wal_object_store_requests_separately() {
         // given:
         let main_object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -3750,115 +3631,6 @@ mod tests {
         assert!(wal_hist_after > wal_hist_before);
         assert!(main_hist_after > main_hist_before);
         db.close().await.unwrap();
-    }
-
-    async fn test_object_store_cache_helper(
-        cache_puts_enabled: bool,
-        db_path: &str,
-        expected_cache_parts: Vec<(&str, usize)>,
-    ) -> (Arc<CachedObjectStore>, Db) {
-        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let mut opts = test_db_options(0, 1024, None);
-        // disable manifest polling to avoid caching manifests non-deterministically
-        opts.manifest_poll_interval = Duration::from_millis(u64::MAX);
-        let temp_dir = tempfile::Builder::new()
-            .prefix("objstore_cache_test_")
-            .tempdir()
-            .unwrap();
-
-        let recorder = MetricsRecorderHelper::noop();
-        let cache_stats = Arc::new(CachedObjectStoreStats::new(&recorder));
-        let part_size = 1024;
-        info!("temp_dir: {:?}", temp_dir.path());
-
-        let cache_storage = Arc::new(FsCacheStorage::new(
-            temp_dir.keep(),
-            None,
-            None,
-            cache_stats.clone(),
-            Arc::new(DefaultSystemClock::new()),
-            Arc::new(DbRand::default()),
-            1000,
-        ));
-
-        let cached_object_store = CachedObjectStore::new(
-            object_store.clone(),
-            cache_storage,
-            part_size,
-            cache_puts_enabled,
-            cache_stats.clone(),
-        )
-        .unwrap();
-
-        let kv_store = Db::builder(db_path, cached_object_store.clone())
-            .with_settings(opts)
-            .build()
-            .await
-            .unwrap();
-        let key = b"test_key";
-        let value = b"test_value";
-        kv_store.put(key, value).await.unwrap();
-        kv_store.flush().await.unwrap();
-
-        // Verify cache behavior
-        for (path, expected_parts) in expected_cache_parts {
-            let entry = cached_object_store
-                .cache_storage
-                .entry(&object_store::path::Path::from(path), part_size);
-            assert_eq!(
-                entry.cached_parts().await.unwrap().len(),
-                expected_parts,
-                "Path: {}",
-                path
-            );
-        }
-
-        (cached_object_store, kv_store)
-    }
-
-    #[tokio::test]
-    async fn test_get_with_object_store_cache_stored_files() {
-        let expected_cache_parts =
-            vec![
-            ("tmp/test_kv_store_with_cache_stored_files/manifest/00000000000000000001.manifest", 0),
-            // 1 part is cached because fence_writers refreshes the manifest after writing the fence.
-            ("tmp/test_kv_store_with_cache_stored_files/manifest/00000000000000000002.manifest", 1),
-            // The startup fence WAL is zero bytes, so replay does not cache any object parts.
-            ("tmp/test_kv_store_with_cache_stored_files/wal/00000000000000000001.sst", 0),
-            ("tmp/test_kv_store_with_cache_stored_files/wal/00000000000000000002.sst", 0),
-        ];
-
-        let (_cached_object_store, kv_store) = test_object_store_cache_helper(
-            false, // cache_puts disabled
-            "/tmp/test_kv_store_with_cache_stored_files",
-            expected_cache_parts,
-        )
-        .await;
-
-        kv_store.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_get_with_object_store_cache_put_caching_enabled() {
-        let expected_cache_parts =
-            vec![
-            ("tmp/test_kv_store_with_put_cache_enabled/manifest/00000000000000000001.manifest", 1),
-            // 1 part is cached because fence_writers refreshes the manifest after writing the fence.
-            ("tmp/test_kv_store_with_put_cache_enabled/manifest/00000000000000000002.manifest", 1),
-            // The startup fence WAL is zero bytes, so replay does not cache any object parts.
-            ("tmp/test_kv_store_with_put_cache_enabled/wal/00000000000000000001.sst", 0),
-            // 1 part is cached because the put with cache_puts enabled should cache the test_key put
-            ("tmp/test_kv_store_with_put_cache_enabled/wal/00000000000000000002.sst", 1),
-        ];
-
-        let (_cached_object_store, kv_store) = test_object_store_cache_helper(
-            true, // cache_puts enabled
-            "/tmp/test_kv_store_with_put_cache_enabled",
-            expected_cache_parts,
-        )
-        .await;
-
-        kv_store.close().await.unwrap();
     }
 
     async fn build_database_from_table(
@@ -4972,10 +4744,7 @@ mod tests {
         // flusher is paused at the failpoint above.
         let flush_handle = {
             let inner = Arc::clone(&db.inner);
-            tokio::spawn(async move {
-                inner.flush_wals().await?;
-                inner.flush_memtables(FlushTarget::All).await
-            })
+            tokio::spawn(async move { inner.flush_memtables(FlushTarget::All).await })
         };
 
         let mut wrote_l0_sst = false;
@@ -7349,6 +7118,7 @@ mod tests {
             commit_compacted_interval: Duration::from_millis(10),
             worker: Some(CompactionWorkerOptions {
                 compactions_poll_interval: Duration::from_millis(10),
+                heartbeat_interval: Duration::from_millis(10),
                 max_sst_size: 1,
                 ..Default::default()
             }),
@@ -7356,13 +7126,22 @@ mod tests {
         };
         let settings_without_compactor = test_db_options(0, 1024, None);
 
+        // The compactor's SST I/O runs through a gated store so the test can
+        // freeze the job after its first output SSTs upload. Manifest and
+        // `.compactions` I/O use the ungated store passed to `Db::builder`,
+        // so the worker's heartbeats keep flowing while the job is frozen.
+        let gated = Arc::new(crate::test_utils::GatedObjectStore::new(
+            object_store.clone(),
+        ));
+        let gated_store: Arc<dyn ObjectStore> = gated.clone();
+
         let db = Db::builder(path, object_store.clone())
             .with_settings(settings_without_compactor.clone())
             .with_sst_block_size(SstBlockSize::Other(1))
             .with_fp_registry(fp_registry.clone())
             .with_merge_operator(Arc::new(StringConcatMergeOperator))
             .with_compactor_builder(
-                CompactorBuilder::new(path, object_store.clone())
+                CompactorBuilder::new(path, gated_store)
                     .with_options(compactor_options.clone())
                     .with_scheduler_supplier(Arc::new(OnDemandCompactionSchedulerSupplier::new({
                         let should_compact = should_compact.clone();
@@ -7399,19 +7178,42 @@ mod tests {
             "the test requires multiple L0s so compaction has work to resume"
         );
 
+        // Fence the worker on the first heartbeat that publishes progress
+        // carrying an output SST. This leaves a partially-complete compaction
+        // (its first output SST plus the retention_min_seq captured while
+        // the snapshot was live) persisted for the resumed attempt.
         fail_parallel::cfg(
             fp_registry.clone(),
-            "compactor-progress-after-first-output-sst",
+            "compactor-heartbeat-after-output-sst",
             "return",
         )
         .unwrap();
 
         let mut status_rx = db.subscribe();
+
+        // Admit exactly one output SST upload through the closed gate, so the
+        // job reports progress with one SST and then freezes on its next
+        // upload — it cannot finish before the fencing heartbeat observes
+        // that progress.
+        let baseline_puts = gated.put_opts_gate.arrivals();
+        gated.put_opts_gate.close();
         should_compact.store(true, Ordering::SeqCst);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            gated.put_opts_gate.wait_for_arrivals(baseline_puts + 1),
+        )
+        .await
+        .expect("compaction should upload output SSTs");
+        gated.put_opts_gate.admit(1);
+
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                if status_rx.borrow().close_reason.is_some() {
-                    break;
+                match status_rx.borrow().close_reason {
+                    Some(CloseReason::Fenced) => break,
+                    Some(reason) => {
+                        panic!("expected compactor failpoint to fence DB, got {reason:?}")
+                    }
+                    None => {}
                 }
                 status_rx.changed().await.expect("db status channel closed");
             }
@@ -7420,10 +7222,11 @@ mod tests {
         .expect("compactor did not hit the failpoint");
 
         drop(snapshot);
+        gated.put_opts_gate.release();
         db.close().await.unwrap();
         fail_parallel::cfg(
             fp_registry.clone(),
-            "compactor-progress-after-first-output-sst",
+            "compactor-heartbeat-after-output-sst",
             "off",
         )
         .unwrap();
@@ -10989,7 +10792,503 @@ mod tests {
         let value_a_cached = reader_a.get(b"key1").await.unwrap();
         assert_eq!(value_a_cached, Some(Bytes::from("value_from_db_a")));
 
+        // Close reader_a; the shared cache must remain usable for reader_b.
+        reader_a.close().await.unwrap();
+
         let value_b_cached = reader_b.get(b"key1").await.unwrap();
         assert_eq!(value_b_cached, Some(Bytes::from("value_from_db_b")));
+
+        reader_b.close().await.unwrap();
+    }
+
+    #[cfg(feature = "foyer")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_close_does_not_kill_shared_hybrid_cache() {
+        use crate::db_cache::foyer_hybrid::FoyerHybridCache;
+        use crate::db_cache::{CachedEntry, CachedKey, DbCache};
+        use crate::db_state::SsTableId;
+        use crate::format::sst::BlockBuilder;
+        use foyer::{
+            BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCacheBuilder,
+            PsyncIoEngineConfig,
+        };
+
+        fn probe_entry() -> CachedEntry {
+            use rand::RngCore;
+            let mut rng = rand::rng();
+            let mut builder = BlockBuilder::new_latest(1024);
+            loop {
+                let mut k = vec![0u8; 32];
+                rng.fill_bytes(&mut k);
+                let mut v = vec![0u8; 128];
+                rng.fill_bytes(&mut v);
+                if builder.add_value(&k, &v, None, None) {
+                    break;
+                }
+            }
+            CachedEntry::with_block(Arc::new(builder.build().unwrap()))
+        }
+
+        async fn open_shared_cache(path: &std::path::Path) -> Arc<dyn DbCache> {
+            let hybrid = HybridCacheBuilder::new()
+                .with_name("shared_hybrid")
+                .memory(1024 * 1024)
+                .with_weighter(|_, v: &CachedEntry| v.size())
+                .storage()
+                .with_io_engine_config(PsyncIoEngineConfig::new())
+                .with_engine_config(
+                    BlockEngineConfig::new(
+                        FsDeviceBuilder::new(path)
+                            .with_capacity(4 * 1024 * 1024)
+                            .build()
+                            .unwrap(),
+                    )
+                    .with_block_size(64 * 1024),
+                )
+                .build()
+                .await
+                .unwrap();
+            Arc::new(FoyerHybridCache::new_with_cache(hybrid))
+        }
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let shared_cache = open_shared_cache(cache_dir.path()).await;
+
+        let object_store_a: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let object_store_b: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        let db_a = Db::builder("/tmp/test_shared_hybrid_a", object_store_a)
+            .with_settings(test_db_options(0, 1024, None))
+            .with_db_cache(shared_cache.clone())
+            .build()
+            .await
+            .unwrap();
+        let db_b = Db::builder("/tmp/test_shared_hybrid_b", object_store_b)
+            .with_settings(test_db_options(0, 1024, None))
+            .with_db_cache(shared_cache.clone())
+            .build()
+            .await
+            .unwrap();
+
+        db_a.put(b"key1", b"value_from_db_a").await.unwrap();
+        db_a.flush().await.unwrap();
+        db_b.put(b"key1", b"value_from_db_b").await.unwrap();
+        db_b.flush().await.unwrap();
+
+        // Close db_a; the shared cache must remain usable for db_b.
+        db_a.close().await.unwrap();
+
+        // db_b reads still succeed (they can fall back to the object store)...
+        let value_b = db_b.get(b"key1").await.unwrap();
+        assert_eq!(value_b, Some(Bytes::from("value_from_db_b")));
+
+        // ...and entries cached on behalf of db_b after db_a closed should
+        // still persist across the caller's own graceful shutdown sequence
+        // (close all DBs, then close the cache we own) + cache reopen, exactly
+        // like `should_persist_blocks_to_disk_on_close` proves for a cache
+        // that nobody else closed. If db_a's close had closed the shared
+        // cache, these entries could never reach disk: the disk engine drops
+        // post-close writes and the final close below becomes a no-op.
+        let mut keys = Vec::new();
+        for b in 0u64..64 {
+            let k = CachedKey::from((SsTableId::Wal(u64::MAX - 2), b));
+            shared_cache.insert(k.clone(), probe_entry()).await;
+            keys.push(k);
+        }
+
+        db_b.close().await.unwrap();
+        // The caller owns the injected cache and closes it once all DBs are
+        // closed; this flushes the memory tier to disk.
+        shared_cache.close().await.unwrap();
+        drop(db_a);
+        drop(db_b);
+        drop(shared_cache);
+
+        let reopened = open_shared_cache(cache_dir.path()).await;
+        let mut found = 0;
+        for k in &keys {
+            if reopened.get_block(k).await.unwrap().is_some() {
+                found += 1;
+            }
+        }
+        assert_eq!(
+            found,
+            keys.len(),
+            "entries cached after another DB closed the shared cache were lost \
+             ({}/{} survived cache close + reopen)",
+            found,
+            keys.len()
+        );
+    }
+
+    mod object_store_cache {
+        use super::*;
+        use crate::cached_object_store::stats::{PART_ACCESS_COUNT, PART_HIT_COUNT};
+        use object_store::ObjectStoreExt;
+
+        struct ObjectStoreCacheTest {
+            db: Db,
+            store: Arc<CachedObjectStore>,
+            db_path: String,
+            part_size: usize,
+        }
+
+        /// Builder for [`ObjectStoreCacheTest`]. Defaults: 1 KiB cache parts, a 1 KiB
+        /// L0 size, and cache_puts off.
+        struct ObjectStoreCacheTestBuilder {
+            db_path: String,
+            cache_puts: bool,
+            part_size: usize,
+            l0_sst_size_bytes: usize,
+        }
+
+        impl ObjectStoreCacheTestBuilder {
+            fn new(db_path: &str) -> Self {
+                Self {
+                    db_path: db_path.to_string(),
+                    cache_puts: false,
+                    part_size: 1024,
+                    l0_sst_size_bytes: 1024,
+                }
+            }
+
+            fn cache_puts(mut self) -> Self {
+                self.cache_puts = true;
+                self
+            }
+
+            fn part_size(mut self, part_size: usize) -> Self {
+                self.part_size = part_size;
+                self
+            }
+
+            fn l0_sst_size_bytes(mut self, bytes: usize) -> Self {
+                self.l0_sst_size_bytes = bytes;
+                self
+            }
+
+            async fn build(self) -> ObjectStoreCacheTest {
+                let Self {
+                    db_path,
+                    cache_puts,
+                    part_size,
+                    l0_sst_size_bytes,
+                } = self;
+
+                let upstream: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+                let recorder = MetricsRecorderHelper::noop();
+                let cache_stats = Arc::new(CachedObjectStoreStats::new(&recorder));
+                let temp_dir = tempfile::Builder::new()
+                    .prefix("objstore_cache_test_")
+                    .tempdir()
+                    .unwrap();
+                let cache_storage = Arc::new(FsCacheStorage::new(
+                    temp_dir.keep(),
+                    None,
+                    None,
+                    cache_stats.clone(),
+                    Arc::new(DefaultSystemClock::new()),
+                    Arc::new(DbRand::default()),
+                    1000,
+                ));
+                let store = CachedObjectStore::new(
+                    upstream,
+                    cache_storage,
+                    part_size,
+                    cache_puts,
+                    cache_stats,
+                )
+                .unwrap();
+
+                let settings = test_db_options(0, l0_sst_size_bytes, None);
+                let db = Db::builder(db_path.as_str(), store.clone())
+                    .with_settings(settings)
+                    .build()
+                    .await
+                    .unwrap();
+
+                ObjectStoreCacheTest {
+                    db,
+                    store,
+                    db_path,
+                    part_size,
+                }
+            }
+        }
+
+        impl ObjectStoreCacheTest {
+            fn builder(db_path: &str) -> ObjectStoreCacheTestBuilder {
+                ObjectStoreCacheTestBuilder::new(db_path)
+            }
+
+            fn db(&self) -> &Db {
+                &self.db
+            }
+
+            /// A path under the db root, e.g. `sub_path("wal/00..002.sst")`.
+            fn sub_path(&self, suffix: &str) -> object_store::path::Path {
+                object_store::path::Path::from(format!("{}/{}", self.db_path, suffix))
+            }
+
+            async fn cached_part_count(&self, path: &object_store::path::Path) -> usize {
+                self.store
+                    .cache_storage
+                    .entry(path, self.part_size)
+                    .cached_parts()
+                    .await
+                    .unwrap()
+                    .len()
+            }
+
+            async fn assert_cached(&self, path: &object_store::path::Path, expected_parts: usize) {
+                assert_eq!(
+                    self.cached_part_count(path).await,
+                    expected_parts,
+                    "expected {path} to be cached as {expected_parts} part(s)"
+                );
+            }
+
+            /// Asserts each of `suffixes` (relative to the db root) is uncached.
+            async fn assert_uncached(&self, suffixes: &[&str]) {
+                for suffix in suffixes {
+                    let path = self.sub_path(suffix);
+                    assert_eq!(
+                        self.cached_part_count(&path).await,
+                        0,
+                        "expected {suffix} to be uncached"
+                    );
+                }
+            }
+
+            /// Lists the compacted SSTs currently in the object store.
+            async fn compacted_locations(&self) -> Vec<object_store::path::Path> {
+                let prefix = self.sub_path("compacted");
+                self.store
+                    .list(Some(&prefix))
+                    .map(|meta| meta.unwrap().location)
+                    .collect()
+                    .await
+            }
+
+            /// The size of an object as stored upstream, in bytes.
+            async fn object_size(&self, path: &object_store::path::Path) -> u64 {
+                self.store.head(path).await.unwrap().size
+            }
+
+            async fn close(self) {
+                self.db.close().await.unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn test_get_with_object_store_cache_metrics() {
+            let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let mut opts = test_db_options(0, 1024, None);
+            let temp_dir = tempfile::Builder::new()
+                .prefix("objstore_cache_test_")
+                .tempdir()
+                .unwrap();
+
+            opts.object_store_cache_options.root_folder = Some(temp_dir.keep());
+            opts.object_store_cache_options.part_size_bytes = 1024;
+            let metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
+            let kv_store = Db::builder(
+                "/tmp/test_kv_store_with_cache_metrics",
+                object_store.clone(),
+            )
+            .with_settings(opts)
+            .with_db_cache_disabled()
+            .with_metrics_recorder(metrics_recorder.clone())
+            .build()
+            .await
+            .unwrap();
+
+            let access_count0 = lookup_metric(&metrics_recorder, PART_ACCESS_COUNT).unwrap();
+            let key = b"test_key";
+            let value = b"test_value";
+            kv_store.put(key, value).await.unwrap();
+            kv_store
+                .flush_with_options(FlushOptions {
+                    flush_type: FlushType::MemTable,
+                })
+                .await
+                .unwrap();
+
+            // First (cold) get. cache_puts is off, so the SST is not cached on the
+            // write. The whole SST is a single cache part, read as three sub-ranges
+            // (index, filter and block). The first is a cold read that fetches and
+            // caches the part (a miss) and the next two are served from the cache
+            // (hits). So three accesses, two hits.
+            let val = kv_store.get(key).await.unwrap();
+            assert_eq!(val, Some(Bytes::from_static(value)));
+            let access_count1 = lookup_metric(&metrics_recorder, PART_ACCESS_COUNT).unwrap();
+            let hit_count1 = lookup_metric(&metrics_recorder, PART_HIT_COUNT).unwrap();
+            assert_eq!(
+                access_count1 - access_count0,
+                3,
+                "one point get reads the single-part SST in three sub-ranges"
+            );
+            assert_eq!(
+                hit_count1, 2,
+                "the cold read is a miss; the next two reads hit the warm cache"
+            );
+
+            // Second (warm) get: the object is fully cached, so all three reads hit.
+            let got = kv_store.get(key).await.unwrap();
+            assert_eq!(got, Some(Bytes::from_static(value)));
+            let access_count2 = lookup_metric(&metrics_recorder, PART_ACCESS_COUNT).unwrap();
+            let hit_count2 = lookup_metric(&metrics_recorder, PART_HIT_COUNT).unwrap();
+            assert_eq!(
+                access_count2 - access_count1,
+                3,
+                "the second get reads the same three sub-ranges"
+            );
+            assert_eq!(
+                hit_count2 - hit_count1,
+                3,
+                "every read in the warm get is a cache hit"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_db_records_remote_object_store_reads_but_not_cache_hits() {
+            let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let mut opts = test_db_options(0, 1024, None);
+            let temp_dir = tempfile::Builder::new()
+                .prefix("objstore_metrics_test_")
+                .tempdir()
+                .unwrap();
+
+            opts.object_store_cache_options.root_folder = Some(temp_dir.keep());
+            opts.object_store_cache_options.part_size_bytes = 1024;
+            opts.manifest_poll_interval = Duration::from_secs(3600);
+            let metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
+            let path = "/tmp/test_db_records_remote_object_store_reads_but_not_cache_hits";
+            // Disable the in-memory block cache so reads reach the object store
+            // cache layer (the subject of this test) instead of being served from
+            // decoded blocks in memory.
+            let kv_store = Db::builder(path, object_store)
+                .with_settings(opts)
+                .with_db_cache_disabled()
+                .with_metrics_recorder(metrics_recorder.clone())
+                .build()
+                .await
+                .unwrap();
+
+            kv_store.put(b"test_key", b"test_value").await.unwrap();
+            kv_store.flush().await.unwrap();
+            kv_store
+                .flush_with_options(FlushOptions {
+                    flush_type: FlushType::MemTable,
+                })
+                .await
+                .unwrap();
+
+            let requests_before =
+                lookup_object_store_op_request_count(&metrics_recorder, "db", "main", "get");
+            let _val = kv_store.get(b"test_key").await.unwrap();
+            let requests_after_first =
+                lookup_object_store_op_request_count(&metrics_recorder, "db", "main", "get");
+            let got = kv_store.get(b"test_key").await.unwrap();
+            let requests_after_second =
+                lookup_object_store_op_request_count(&metrics_recorder, "db", "main", "get");
+
+            // The cold read misses the object store cache and fetches the SST part
+            // from the remote store; the warm read hits the cache and issues no
+            // remote request.
+            assert_eq!(requests_after_first, requests_before + 1);
+            assert_eq!(got, Some(Bytes::from_static(b"test_value")));
+            assert_eq!(requests_after_second, requests_after_first);
+            assert_eq!(
+                lookup_object_store_op_histogram_count(&metrics_recorder, "db", "main", "get"),
+                requests_after_first as u64
+            );
+            kv_store.close().await.unwrap();
+        }
+
+        /// A flushed L0 SST is a compacted SST written by the main store, so
+        /// cache_puts admits it. The manifest (untagged) and the WAL (skipped by
+        /// policy) are never cached.
+        #[tokio::test]
+        async fn test_object_store_cache_caches_flushed_sst_only() {
+            let fixture = ObjectStoreCacheTest::builder("/tmp/test_object_store_cache_flush_only")
+                .cache_puts()
+                .build()
+                .await;
+
+            // A foreground write plus a memtable flush produces a WAL entry, a
+            // manifest, and an L0 SST.
+            fixture.db().put(b"test_key", b"test_value").await.unwrap();
+            fixture.db().flush().await.unwrap();
+            fixture
+                .db()
+                .flush_with_options(FlushOptions {
+                    flush_type: FlushType::MemTable,
+                })
+                .await
+                .unwrap();
+
+            fixture
+                .assert_uncached(&[
+                    "manifest/00000000000000000001.manifest",
+                    "manifest/00000000000000000002.manifest",
+                    "wal/00000000000000000001.sst",
+                    "wal/00000000000000000002.sst",
+                ])
+                .await;
+
+            // The single explicit memtable flush produces one L0 SST, cached as one
+            // part (the key/value is well under the 1 KiB part size).
+            let compacted = fixture.compacted_locations().await;
+            assert_eq!(compacted.len(), 1, "expected exactly one flushed SST");
+            fixture.assert_cached(&compacted[0], 1).await;
+            fixture.close().await;
+        }
+
+        /// A flushed SST above the 10 MiB multipart threshold is written with a
+        /// multipart upload, whose parts are now mirrored into the cache, so the
+        /// whole SST is cached (one part per part_size chunk).
+        #[tokio::test]
+        async fn test_object_store_cache_caches_large_multipart_flush() {
+            const MIB: usize = 1024 * 1024;
+
+            let fixture = ObjectStoreCacheTest::builder("/tmp/test_object_store_cache_large_flush")
+                .cache_puts()
+                .part_size(MIB)
+                // Large enough that the whole write flushes as a single L0 SST.
+                .l0_sst_size_bytes(64 * MIB)
+                .build()
+                .await;
+
+            // ~20 MiB in one memtable, flushed as a single L0 SST above the 10 MiB
+            // multipart threshold.
+            for i in 0..20u32 {
+                let key = format!("k{:04}", i);
+                fixture
+                    .db()
+                    .put(key.as_bytes(), &vec![i as u8; MIB])
+                    .await
+                    .unwrap();
+            }
+            fixture
+                .db()
+                .flush_with_options(FlushOptions {
+                    flush_type: FlushType::MemTable,
+                })
+                .await
+                .unwrap();
+
+            let compacted = fixture.compacted_locations().await;
+            assert_eq!(compacted.len(), 1, "expected exactly one flushed SST");
+            // The SST is written with a multipart upload (each 1 MiB part teed into
+            // the cache), so every part of the SST is cached.
+            let expected_parts = (fixture.object_size(&compacted[0]).await as usize).div_ceil(MIB);
+            assert!(
+                expected_parts > 10,
+                "expected a large multipart SST, got {expected_parts} part(s)"
+            );
+            fixture.assert_cached(&compacted[0], expected_parts).await;
+            fixture.close().await;
+        }
     }
 }
