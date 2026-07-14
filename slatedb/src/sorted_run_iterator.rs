@@ -2,12 +2,13 @@ use crate::bytes_range::BytesRange;
 use crate::db_state::{SortedRun, SsTableView};
 use crate::db_stats::DbStats;
 use crate::error::SlateDBError;
-use crate::iter::RowEntryIterator;
+use crate::iter::{IterationOrder, RowEntryIterator};
 use crate::sst_iter::{SstIterator, SstIteratorOptions, SstView};
 use crate::tablestore::TableStore;
 use crate::types::RowEntry;
 use async_trait::async_trait;
 use bytes::Bytes;
+use std::cmp::Reverse;
 use std::collections::VecDeque;
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
@@ -28,38 +29,39 @@ impl<'a> SortedRunView<'a> {
     /// range does not intersect the requested range are skipped entirely.
     fn pop_sst(&mut self) -> Option<SstView<'a>> {
         match self {
-            SortedRunView::Owned(tables, r) => loop {
+            SortedRunView::Owned(tables, range) => loop {
                 let table = tables.pop_front()?;
-                if let Some(view_range) = table.calculate_view_range(r.clone()) {
-                    return Some(SstView::Owned(Box::new(table), view_range));
-                }
+                let Some(view_range) = table.calculate_view_range(range.clone()) else {
+                    continue;
+                };
+                return Some(SstView::Owned(Box::new(table), view_range));
             },
-            SortedRunView::Borrowed(tables, r) => loop {
+            SortedRunView::Borrowed(tables, range) => loop {
                 let table = tables.pop_front()?;
-                if let Some(view_range) = table.calculate_view_range(BytesRange::from_slice(*r)) {
-                    return Some(SstView::Borrowed(table, view_range));
-                }
+                let Some(view_range) = table.calculate_view_range(BytesRange::from_slice(*range))
+                else {
+                    continue;
+                };
+                return Some(SstView::Borrowed(table, view_range));
             },
         }
     }
 
-    pub(crate) async fn build_next_iter(
+    async fn build_next_iter(
         &mut self,
         table_store: Arc<TableStore>,
         sst_iterator_options: SstIteratorOptions,
         db_stats: Option<DbStats>,
     ) -> Result<Option<SstIterator<'a>>, SlateDBError> {
-        let next_iter = if let Some(view) = self.pop_sst() {
-            Some(SstIterator::new_with_stats(
-                view,
-                table_store,
-                sst_iterator_options,
-                db_stats,
-            )?)
-        } else {
-            None
+        let Some(view) = self.pop_sst() else {
+            return Ok(None);
         };
-        Ok(next_iter)
+        Ok(Some(SstIterator::new_with_stats(
+            view,
+            table_store,
+            sst_iterator_options,
+            db_stats,
+        )?))
     }
 
     fn peek_next_table(&self) -> Option<&SsTableView> {
@@ -70,32 +72,48 @@ impl<'a> SortedRunView<'a> {
     }
 }
 
+enum SortedRunIteratorState<'a> {
+    Uninitialized(IterationOrder, Option<SstIterator<'a>>),
+    Ascending(Option<SstIterator<'a>>),
+    Descending {
+        current: Option<SstIterator<'a>>,
+        buffered_entries: VecDeque<RowEntry>,
+        pending_entry: Option<RowEntry>,
+        pending_seek: Option<Bytes>,
+    },
+}
+
 pub(crate) struct SortedRunIterator<'a> {
     table_store: Arc<TableStore>,
     sst_iter_options: SstIteratorOptions,
     db_stats: Option<DbStats>,
     view: SortedRunView<'a>,
-    current_iter: Option<SstIterator<'a>>,
-    initialized: bool,
+    state: SortedRunIteratorState<'a>,
 }
 
 impl<'a> SortedRunIterator<'a> {
     async fn new(
-        view: SortedRunView<'a>,
+        mut view: SortedRunView<'a>,
         table_store: Arc<TableStore>,
         sst_iter_options: SstIteratorOptions,
         db_stats: Option<DbStats>,
     ) -> Result<Self, SlateDBError> {
-        let mut res = Self {
+        let order = sst_iter_options.order;
+        if matches!(order, IterationOrder::Descending) {
+            match &mut view {
+                SortedRunView::Owned(tables, _) => tables.make_contiguous().reverse(),
+                SortedRunView::Borrowed(tables, _) => tables.make_contiguous().reverse(),
+            }
+        }
+        let mut iter = Self {
             table_store,
             sst_iter_options,
             db_stats,
             view,
-            current_iter: None,
-            initialized: false,
+            state: SortedRunIteratorState::Uninitialized(order, None),
         };
-        res.advance_table().await?;
-        Ok(res)
+        iter.advance_table().await?;
+        Ok(iter)
     }
 
     pub(crate) async fn new_owned<T: RangeBounds<Bytes>>(
@@ -184,7 +202,7 @@ impl<'a> SortedRunIterator<'a> {
     }
 
     async fn advance_table(&mut self) -> Result<(), SlateDBError> {
-        self.current_iter = self
+        let current = self
             .view
             .build_next_iter(
                 self.table_store.clone(),
@@ -192,10 +210,127 @@ impl<'a> SortedRunIterator<'a> {
                 self.db_stats.clone(),
             )
             .await?;
-        if self.initialized {
-            if let Some(iter) = self.current_iter.as_mut() {
-                iter.init().await?;
+
+        match &mut self.state {
+            SortedRunIteratorState::Uninitialized(_, slot) => *slot = current,
+            SortedRunIteratorState::Ascending(slot) => {
+                *slot = current;
+                if let Some(current) = slot {
+                    current.init().await?;
+                }
             }
+            SortedRunIteratorState::Descending {
+                current: slot,
+                pending_seek,
+                ..
+            } => {
+                *slot = current;
+                if let Some(current) = slot {
+                    current.init().await?;
+                    if let Some(next_key) = pending_seek {
+                        current.seek(next_key).await?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn fill_descending_buffer(&mut self, first_entry: RowEntry) -> Result<(), SlateDBError> {
+        let target_key = first_entry.key.clone();
+        let mut entries = vec![first_entry];
+        let mut crossed_table_boundary = false;
+
+        loop {
+            let next = match &mut self.state {
+                SortedRunIteratorState::Descending { current, .. } => {
+                    if let Some(current) = current {
+                        current.next().await?
+                    } else {
+                        None
+                    }
+                }
+                _ => return Err(SlateDBError::IteratorNotInitialized),
+            };
+
+            match next {
+                Some(entry) if entry.key == target_key => entries.push(entry),
+                Some(entry) => {
+                    if let SortedRunIteratorState::Descending { pending_entry, .. } =
+                        &mut self.state
+                    {
+                        *pending_entry = Some(entry);
+                    }
+                    break;
+                }
+                None if self.view.peek_next_table().is_some_and(|table| {
+                    table.compacted_effective_range().contains(&target_key)
+                }) =>
+                {
+                    self.advance_table().await?;
+                    crossed_table_boundary = true;
+                }
+                None => break,
+            }
+        }
+
+        if crossed_table_boundary {
+            entries.sort_by_key(|entry| Reverse(entry.seq));
+        }
+        if let SortedRunIteratorState::Descending {
+            buffered_entries, ..
+        } = &mut self.state
+        {
+            buffered_entries.extend(entries);
+        }
+        Ok(())
+    }
+
+    async fn seek_descending(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {
+        if let SortedRunIteratorState::Descending {
+            buffered_entries,
+            pending_entry,
+            pending_seek,
+            ..
+        } = &mut self.state
+        {
+            buffered_entries.clear();
+            *pending_entry = None;
+            *pending_seek = None;
+        }
+
+        while self
+            .view
+            .peek_next_table()
+            .map(
+                |table| match table.compacted_effective_range().end_bound() {
+                    Bound::Included(end) | Bound::Excluded(end) => end.as_ref() > next_key,
+                    Bound::Unbounded => true,
+                },
+            )
+            .unwrap_or(false)
+        {
+            self.advance_table().await?;
+        }
+
+        loop {
+            let result = match &mut self.state {
+                SortedRunIteratorState::Descending { current, .. } => {
+                    let Some(current) = current else {
+                        break;
+                    };
+                    current.seek(next_key).await
+                }
+                _ => return Err(SlateDBError::IteratorNotInitialized),
+            };
+            match result {
+                Ok(()) => break,
+                Err(SlateDBError::SeekKeyOutOfKeyRange { .. }) => self.advance_table().await?,
+                Err(error) => return Err(error),
+            }
+        }
+        if let SortedRunIteratorState::Descending { pending_seek, .. } = &mut self.state {
+            *pending_seek = Some(Bytes::copy_from_slice(next_key));
         }
         Ok(())
     }
@@ -204,44 +339,96 @@ impl<'a> SortedRunIterator<'a> {
 #[async_trait]
 impl RowEntryIterator for SortedRunIterator<'_> {
     async fn init(&mut self) -> Result<(), SlateDBError> {
-        if !self.initialized {
-            if let Some(iter) = self.current_iter.as_mut() {
-                iter.init().await?;
+        let transition = match &mut self.state {
+            SortedRunIteratorState::Uninitialized(order, current) => {
+                if let Some(current) = current {
+                    current.init().await?;
+                }
+                Some((*order, current.take()))
             }
-            self.initialized = true;
+            SortedRunIteratorState::Ascending(_) | SortedRunIteratorState::Descending { .. } => {
+                None
+            }
+        };
+
+        if let Some((order, current)) = transition {
+            self.state = match order {
+                IterationOrder::Ascending => SortedRunIteratorState::Ascending(current),
+                IterationOrder::Descending => SortedRunIteratorState::Descending {
+                    current,
+                    buffered_entries: VecDeque::new(),
+                    pending_entry: None,
+                    pending_seek: None,
+                },
+            };
         }
         Ok(())
     }
 
     async fn next(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
-        if !self.initialized {
-            return Err(SlateDBError::IteratorNotInitialized);
-        }
-        while let Some(iter) = &mut self.current_iter {
-            if let Some(kv) = iter.next().await? {
-                return Ok(Some(kv));
-            } else {
-                self.advance_table().await?;
+        loop {
+            let (next, descending) = match &mut self.state {
+                SortedRunIteratorState::Uninitialized(_, _) => {
+                    return Err(SlateDBError::IteratorNotInitialized);
+                }
+                SortedRunIteratorState::Ascending(Some(current)) => (current.next().await?, false),
+                SortedRunIteratorState::Ascending(None) => return Ok(None),
+                SortedRunIteratorState::Descending {
+                    buffered_entries,
+                    pending_entry,
+                    current,
+                    ..
+                } => {
+                    if let Some(entry) = buffered_entries.pop_front() {
+                        return Ok(Some(entry));
+                    }
+                    let next = if let Some(entry) = pending_entry.take() {
+                        Some(entry)
+                    } else if let Some(current) = current {
+                        current.next().await?
+                    } else {
+                        return Ok(None);
+                    };
+                    (next, true)
+                }
+            };
+
+            if let Some(entry) = next {
+                if descending
+                    && self
+                        .view
+                        .peek_next_table()
+                        .is_some_and(|table| table.compacted_effective_range().contains(&entry.key))
+                {
+                    self.fill_descending_buffer(entry).await?;
+                    continue;
+                }
+                return Ok(Some(entry));
             }
+            self.advance_table().await?;
         }
-        Ok(None)
     }
 
     async fn seek(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {
-        if !self.initialized {
-            return Err(SlateDBError::IteratorNotInitialized);
-        }
-        while let Some(next_table) = self.view.peek_next_table() {
-            if next_table.compacted_effective_start_key() < next_key {
-                self.advance_table().await?;
-            } else {
-                break;
+        match self.state {
+            SortedRunIteratorState::Uninitialized(_, _) => {
+                Err(SlateDBError::IteratorNotInitialized)
             }
+            SortedRunIteratorState::Ascending(_) => {
+                while self
+                    .view
+                    .peek_next_table()
+                    .is_some_and(|table| table.compacted_effective_start_key() < next_key)
+                {
+                    self.advance_table().await?;
+                }
+                if let SortedRunIteratorState::Ascending(Some(current)) = &mut self.state {
+                    current.seek(next_key).await?;
+                }
+                Ok(())
+            }
+            SortedRunIteratorState::Descending { .. } => self.seek_descending(next_key).await,
         }
-        if let Some(iter) = &mut self.current_iter {
-            iter.seek(next_key).await?;
-        }
-        Ok(())
     }
 }
 
@@ -251,7 +438,6 @@ mod tests {
     use crate::bytes_generator::OrderedBytesGenerator;
     use crate::db_state::{SsTableHandle, SsTableId};
     use crate::format::sst::SsTableFormat;
-    use crate::iter::IterationOrder;
     use crate::proptest_util;
     use crate::proptest_util::sample;
     use crate::tablestore::TableStoreKind;
@@ -267,6 +453,26 @@ mod tests {
     use rand::Rng;
     use std::collections::BTreeMap;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn should_require_initialization() {
+        let mut iter = SortedRunIterator::new_owned(
+            ..,
+            SortedRun {
+                id: 0,
+                sst_views: vec![],
+            },
+            build_test_table_store(),
+            descending_options(),
+            None,
+        )
+        .await
+        .unwrap();
+        let error = iter.next().await.unwrap_err();
+        assert!(matches!(error, SlateDBError::IteratorNotInitialized));
+        let error = iter.seek(b"a").await.unwrap_err();
+        assert!(matches!(error, SlateDBError::IteratorNotInitialized));
+    }
 
     #[tokio::test]
     async fn test_one_sst_sr_iter() {
@@ -316,6 +522,7 @@ mod tests {
         let kv: KeyValue = iter.next().await.unwrap().unwrap().into();
         assert_eq!(kv.key, b"key1".as_slice());
         assert_eq!(kv.value, b"value1".as_slice());
+        iter.init().await.unwrap();
         let kv: KeyValue = iter.next().await.unwrap().unwrap().into();
         assert_eq!(kv.key, b"key2".as_slice());
         assert_eq!(kv.value, b"value2".as_slice());
@@ -438,6 +645,82 @@ mod tests {
                 Bytes::from_static(b"a"),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn should_support_descending_iteration_across_sst_boundaries() {
+        let table_store = build_test_table_store();
+        let sorted_run = sorted_run_from_ssts([
+            build_sst_from_entries(
+                &table_store,
+                &[(b"a".as_slice(), 110), (b"c", 100), (b"c", 90)],
+            )
+            .await,
+            build_sst_from_entries(
+                &table_store,
+                &[(b"c".as_slice(), 80), (b"d", 70), (b"e", 60)],
+            )
+            .await,
+            build_sst_from_entries(
+                &table_store,
+                &[(b"g".as_slice(), 50), (b"g", 40), (b"h", 30)],
+            )
+            .await,
+        ]);
+        let all = [
+            (b"h".as_slice(), 30),
+            (b"g".as_slice(), 50),
+            (b"g".as_slice(), 40),
+            (b"e".as_slice(), 60),
+            (b"d".as_slice(), 70),
+            (b"c".as_slice(), 100),
+            (b"c".as_slice(), 90),
+            (b"c".as_slice(), 80),
+            (b"a".as_slice(), 110),
+        ];
+
+        let mut borrowed = SortedRunIterator::new_borrowed_initialized(
+            ..,
+            &sorted_run,
+            table_store.clone(),
+            descending_options(),
+        )
+        .await
+        .unwrap();
+        assert_entries(&collect_entries(&mut borrowed).await, &all);
+
+        let mut bounded = SortedRunIterator::new_owned_initialized(
+            Bytes::from_static(b"b")..Bytes::from_static(b"h"),
+            sorted_run.clone(),
+            table_store.clone(),
+            descending_options(),
+        )
+        .await
+        .unwrap();
+        assert_entries(&collect_entries(&mut bounded).await, &all[1..8]);
+
+        let mut exact = SortedRunIterator::new_owned_initialized(
+            ..,
+            sorted_run.clone(),
+            table_store.clone(),
+            descending_options(),
+        )
+        .await
+        .unwrap();
+        exact.seek(b"c").await.unwrap();
+        assert_entries(&collect_entries(&mut exact).await, &all[5..]);
+
+        let mut gap = SortedRunIterator::new_owned_initialized(
+            ..,
+            sorted_run,
+            table_store,
+            descending_options(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(gap.next().await.unwrap().unwrap().key, b"h".as_slice());
+        gap.seek(b"f").await.unwrap();
+        assert_entries(&collect_entries(&mut gap).await, &all[3..]);
     }
 
     #[tokio::test]
@@ -694,6 +977,46 @@ mod tests {
         buf.freeze()
     }
 
+    fn build_test_table_store() -> Arc<TableStore> {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        Arc::new(TableStore::new(
+            ObjectStores::new(object_store, None),
+            SsTableFormat::default(),
+            Path::from(""),
+            None,
+            TableStoreKind::Main,
+        ))
+    }
+
+    fn descending_options() -> SstIteratorOptions {
+        SstIteratorOptions {
+            order: IterationOrder::Descending,
+            ..Default::default()
+        }
+    }
+
+    fn sorted_run_from_ssts(ssts: impl IntoIterator<Item = SsTableHandle>) -> SortedRun {
+        SortedRun {
+            id: 0,
+            sst_views: ssts.into_iter().map(SsTableView::identity).collect(),
+        }
+    }
+
+    async fn collect_entries(iter: &mut SortedRunIterator<'_>) -> Vec<RowEntry> {
+        let mut entries = Vec::new();
+        while let Some(entry) = iter.next().await.unwrap() {
+            entries.push(entry);
+        }
+        entries
+    }
+
+    fn assert_entries(actual: &[RowEntry], expected: &[(&[u8], u64)]) {
+        assert_eq!(actual.len(), expected.len());
+        for (entry, (key, seq)) in actual.iter().zip(expected) {
+            assert_eq!((entry.key.as_ref(), entry.seq), (*key, *seq));
+        }
+    }
+
     async fn build_sst(
         table_store: &Arc<TableStore>,
         keys_and_values: &[(&[u8], &[u8])],
@@ -705,6 +1028,20 @@ mod tests {
         let encoded = builder.build().await.unwrap();
         let id = SsTableId::Compacted(ulid::Ulid::new());
         table_store.write_sst(&id, &encoded, false).await.unwrap()
+    }
+
+    async fn build_sst_from_entries(
+        table_store: &Arc<TableStore>,
+        entries: &[(&[u8], u64)],
+    ) -> SsTableHandle {
+        let mut writer = table_store.table_writer(SsTableId::Compacted(ulid::Ulid::new()));
+        for (key, seq) in entries {
+            writer
+                .add(RowEntry::new_value(key, b"value", *seq))
+                .await
+                .unwrap();
+        }
+        writer.close().await.unwrap()
     }
 
     async fn build_sorted_run_from_table<R: SampleRange<u64> + Clone>(

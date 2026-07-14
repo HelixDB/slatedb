@@ -700,6 +700,10 @@ impl RowEntryIterator for InternalSstIterator<'_> {
                 });
             }
         }
+        if let Some(buffer) = self.descending_buffer.as_mut() {
+            buffer.clear();
+            self.pending_entry = None;
+        }
         if !self.state.is_finished() {
             if let Some(iter) = self.state.current_iter.as_mut() {
                 iter.seek(next_key).await?;
