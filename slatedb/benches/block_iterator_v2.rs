@@ -9,6 +9,7 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use pprof::criterion::{Output, PProfProfiler};
 use slatedb::block_iterator_v2_benches::BlockIteratorV2BenchConfig;
+use slatedb::IterationOrder;
 
 #[allow(clippy::redundant_closure)]
 fn criterion_benchmark(c: &mut Criterion) {
@@ -26,6 +27,20 @@ fn criterion_benchmark(c: &mut Criterion) {
             });
         },
     );
+    slatedb::block_iterator_v2_benches::block_iterator_v2_bench_with_order(
+        BlockIteratorV2BenchConfig {
+            block_size: 4096,
+            key_size: 16,
+            value_size: 512,
+            num_entries: 32,
+        },
+        IterationOrder::Descending,
+        |inner| {
+            c.bench_function("block_iterator_v2_iterate_small_values_descending", |b| {
+                b.iter(|| inner());
+            });
+        },
+    );
 
     // Single 100KB value in a nominally 4KB block. The builder's
     // oversized-entry rule accepts the first entry unconditionally, so the
@@ -39,6 +54,20 @@ fn criterion_benchmark(c: &mut Criterion) {
         },
         |inner| {
             c.bench_function("block_iterator_v2_iterate_large_value", |b| {
+                b.iter(|| inner());
+            });
+        },
+    );
+    slatedb::block_iterator_v2_benches::block_iterator_v2_bench_with_order(
+        BlockIteratorV2BenchConfig {
+            block_size: 4096,
+            key_size: 16,
+            value_size: 100 * 1024,
+            num_entries: 1,
+        },
+        IterationOrder::Descending,
+        |inner| {
+            c.bench_function("block_iterator_v2_iterate_large_value_descending", |b| {
                 b.iter(|| inner());
             });
         },

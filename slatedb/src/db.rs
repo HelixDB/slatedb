@@ -2417,6 +2417,139 @@ mod tests {
         kv_store.close().await.unwrap();
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_scan_compacted_multi_sst_sorted_run_in_descending_order() {
+        // given: a database configured to compact two L0 SSTs into a sorted
+        // run whose small size limit forces multiple output SSTs
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = "/tmp/test_scan_descending_multi_sst_sorted_run";
+        let should_compact = Arc::new(AtomicBool::new(false));
+        let scheduler_trigger = should_compact.clone();
+        let compaction_scheduler = Arc::new(OnDemandCompactionSchedulerSupplier::new(Arc::new(
+            move |_state| scheduler_trigger.swap(false, Ordering::SeqCst),
+        )));
+        let mut settings = test_db_options(
+            0,
+            1024,
+            Some(CompactorOptions {
+                poll_interval: Duration::from_millis(20),
+                max_concurrent_compactions: 1,
+                manifest_update_timeout: Duration::from_secs(300),
+                worker: Some(CompactionWorkerOptions {
+                    max_sst_size: 128,
+                    compactions_poll_interval: Duration::from_millis(20),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        );
+        settings.flush_interval = None;
+        let compactor_options = settings.compactor_options.take().unwrap();
+        let db = Db::builder(path, object_store.clone())
+            .with_settings(settings)
+            .with_sst_block_size(SstBlockSize::Other(64))
+            .with_compactor_builder(
+                CompactorBuilder::new(path, object_store.clone())
+                    .with_scheduler_supplier(compaction_scheduler)
+                    .with_options(compactor_options),
+            )
+            .build()
+            .await
+            .unwrap();
+
+        // when: two disjoint key ranges are flushed to L0 and compacted
+        let expected = [
+            Bytes::from_static(b"a"),
+            Bytes::from_static(b"b"),
+            Bytes::from_static(b"c"),
+            Bytes::from_static(b"d"),
+        ];
+        for keys in expected.chunks(2) {
+            for (index, key) in keys.iter().enumerate() {
+                let value = vec![b'0' + index as u8; 128];
+                db.put_with_options(
+                    key.as_ref(),
+                    value,
+                    &PutOptions::default(),
+                    &WriteOptions {
+                        await_durable: false,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            db.flush_with_options(FlushOptions {
+                flush_type: FlushType::MemTable,
+            })
+            .await
+            .unwrap();
+        }
+
+        let manifest_store = ManifestStore::new(&Path::from(path), object_store.clone());
+        let mut stored_manifest = StoredManifest::load(
+            Arc::new(manifest_store),
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+        let l0_state = wait_for_manifest_condition(
+            &mut stored_manifest,
+            |state| state.tree.l0.len() >= 2,
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(l0_state.tree.compacted.is_empty());
+        assert!(l0_state.tree.l0.len() >= 2);
+
+        let compacted_state = wait_for_manifest_condition(
+            &mut stored_manifest,
+            |state| {
+                let complete = state.tree.l0.is_empty() && !state.tree.compacted.is_empty();
+                if !complete {
+                    should_compact.store(true, Ordering::SeqCst);
+                }
+                complete
+            },
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(compacted_state.tree.l0.is_empty());
+        assert!(
+            compacted_state.tree.compacted[0].sst_views.len() > 1,
+            "expected a compacted sorted run with multiple SSTs"
+        );
+
+        // Reopen without a compactor so the scan observes the persisted
+        // compacted state without an in-memory view of the old L0 SSTs.
+        db.close().await.unwrap();
+        let db = Db::builder(path, object_store)
+            .with_settings(test_db_options(0, 1024, None))
+            .build()
+            .await
+            .unwrap();
+        {
+            let state = db.inner.state.read();
+            let state_view = state.state();
+            let tree = &state_view.core().tree;
+            assert!(tree.l0.is_empty());
+            assert!(tree.compacted[0].sst_views.len() > 1);
+        }
+
+        // then: a public descending scan should reverse the complete key set
+        let scan_options = ScanOptions::default().with_order(IterationOrder::Descending);
+        let mut iter = db.scan_with_options(.., &scan_options).await.unwrap();
+        let mut actual = Vec::new();
+        while let Some(entry) = iter.next().await.unwrap() {
+            actual.push(entry.key);
+        }
+        let expected_descending = expected.into_iter().rev().collect::<Vec<_>>();
+
+        assert_eq!(actual, expected_descending);
+
+        db.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn test_scan_descending_bounded_range() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());

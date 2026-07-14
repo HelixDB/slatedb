@@ -251,6 +251,7 @@ mod tests {
     use crate::bytes_generator::OrderedBytesGenerator;
     use crate::db_state::{SsTableHandle, SsTableId};
     use crate::format::sst::SsTableFormat;
+    use crate::iter::IterationOrder;
     use crate::proptest_util;
     use crate::proptest_util::sample;
     use crate::tablestore::TableStoreKind;
@@ -388,6 +389,55 @@ mod tests {
         assert_eq!(kv.value, b"value3".as_slice());
         let kv = iter.next().await.unwrap().map(KeyValue::from);
         assert!(kv.is_none());
+    }
+
+    #[tokio::test]
+    async fn should_iterate_multi_sst_sorted_run_in_descending_order() {
+        // given: two non-overlapping SSTs ordered by ascending key range
+        let root_path = Path::from("");
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let table_store = Arc::new(TableStore::new(
+            ObjectStores::new(object_store, None),
+            SsTableFormat::default(),
+            root_path,
+            None,
+            TableStoreKind::Main,
+        ));
+        let first_sst = build_sst(&table_store, &[(b"a", b"value-a"), (b"b", b"value-b")]).await;
+        let second_sst = build_sst(&table_store, &[(b"c", b"value-c"), (b"d", b"value-d")]).await;
+        let sorted_run = SortedRun {
+            id: 0,
+            sst_views: vec![
+                SsTableView::identity(first_sst),
+                SsTableView::identity(second_sst),
+            ],
+        };
+
+        // when: iterating over the complete sorted run in descending order
+        let options = SstIteratorOptions {
+            order: IterationOrder::Descending,
+            ..Default::default()
+        };
+        let mut iter =
+            SortedRunIterator::new_owned_initialized(.., sorted_run, table_store, options)
+                .await
+                .unwrap();
+
+        let mut actual = Vec::new();
+        while let Some(entry) = iter.next().await.unwrap() {
+            actual.push(entry.key);
+        }
+
+        // then: keys should be globally descending across SST boundaries
+        assert_eq!(
+            actual,
+            vec![
+                Bytes::from_static(b"d"),
+                Bytes::from_static(b"c"),
+                Bytes::from_static(b"b"),
+                Bytes::from_static(b"a"),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -642,6 +692,19 @@ mod tests {
         let mut buf = BytesMut::from(b);
         buf.put_u8(u8::MIN);
         buf.freeze()
+    }
+
+    async fn build_sst(
+        table_store: &Arc<TableStore>,
+        keys_and_values: &[(&[u8], &[u8])],
+    ) -> SsTableHandle {
+        let mut builder = table_store.table_builder();
+        for (key, value) in keys_and_values {
+            builder.add_value(key, value, Some(0), None).await.unwrap();
+        }
+        let encoded = builder.build().await.unwrap();
+        let id = SsTableId::Compacted(ulid::Ulid::new());
+        table_store.write_sst(&id, &encoded, false).await.unwrap()
     }
 
     async fn build_sorted_run_from_table<R: SampleRange<u64> + Clone>(

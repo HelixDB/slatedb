@@ -471,6 +471,7 @@ impl<B: BlockLike> RowEntryIterator for DescendingBlockIteratorV2<B> {
 #[cfg(feature = "bench-internal")]
 pub mod benches {
     use super::BlockIteratorV2;
+    use crate::iter::IterationOrder;
     use bytes::Bytes;
 
     #[cfg(feature = "bench-internal")]
@@ -486,9 +487,19 @@ pub mod benches {
         pub num_entries: usize,
     }
 
-    #[allow(clippy::panic)]
-    pub fn block_iterator_v2_bench<F>(config: BlockIteratorV2BenchConfig, mut run_bench: F)
+    pub fn block_iterator_v2_bench<F>(config: BlockIteratorV2BenchConfig, run_bench: F)
     where
+        F: FnMut(&mut dyn FnMut()),
+    {
+        block_iterator_v2_bench_with_order(config, IterationOrder::Ascending, run_bench);
+    }
+
+    #[allow(clippy::panic)]
+    pub fn block_iterator_v2_bench_with_order<F>(
+        config: BlockIteratorV2BenchConfig,
+        order: IterationOrder,
+        mut run_bench: F,
+    ) where
         F: FnMut(&mut dyn FnMut()),
     {
         use crate::format::sst::BlockBuilder;
@@ -532,7 +543,7 @@ pub mod benches {
 
         run_bench(&mut || {
             block_on(async {
-                let mut iter = BlockIteratorV2::new_ascending(&block);
+                let mut iter = BlockIteratorV2::new(&block, order);
                 while let Some(entry) = iter.next().await.expect("iterator error") {
                     std::hint::black_box(entry);
                 }
