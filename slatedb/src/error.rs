@@ -191,6 +191,15 @@ pub(crate) enum SlateDBError {
     #[error("checkpoint missing. checkpoint_id=`{0}`")]
     CheckpointMissing(Uuid),
 
+    #[error("checkpoint already exists. checkpoint_id=`{0}`")]
+    CheckpointAlreadyExists(Uuid),
+
+    #[error("reader checkpoint lease lost. checkpoint_id=`{0}`")]
+    CheckpointLeaseLost(Uuid),
+
+    #[error("reader snapshots are unsupported in FollowLatest mode")]
+    DbReaderSnapshotUnsupportedInFollowLatest,
+
     #[error(
         "unsupported {format_name} format version. supported_versions=`{supported_versions:?}`, actual_version=`{actual_version}`"
     )]
@@ -653,6 +662,7 @@ impl From<SlateDBError> for Error {
             SlateDBError::FoyerError(err) => Error::unavailable(msg).with_source(Box::new(err)),
             SlateDBError::TransactionalObjectTimeout { .. } => Error::unavailable(msg),
             SlateDBError::WalUnavailable(src) => Error::unavailable(msg).with_source(Box::new(src)),
+            SlateDBError::CheckpointLeaseLost(_) => Error::unavailable(msg),
 
             // Invalid errors
             SlateDBError::InvalidCachePartSize => Error::invalid(msg),
@@ -671,6 +681,7 @@ impl From<SlateDBError> for Error {
             SlateDBError::InvalidCheckpointLifetime(_) => Error::invalid(msg),
             SlateDBError::InvalidManifestPollInterval(_) => Error::invalid(msg),
             SlateDBError::CheckpointLifetimeTooShort { .. } => Error::invalid(msg),
+            SlateDBError::DbReaderSnapshotUnsupportedInFollowLatest => Error::invalid(msg),
             SlateDBError::SeekKeyOutOfRange { .. } => Error::invalid(msg),
             SlateDBError::SeekKeyLessThanLastReturnedKey => Error::invalid(msg),
             SlateDBError::IdenticalClonePaths { .. } => Error::invalid(msg),
@@ -712,6 +723,7 @@ impl From<SlateDBError> for Error {
             SlateDBError::BlockTransformError => Error::data(msg),
             SlateDBError::InvalidRowFlags { .. } => Error::data(msg),
             SlateDBError::CheckpointMissing(_) => Error::data(msg),
+            SlateDBError::CheckpointAlreadyExists(_) => Error::data(msg),
             SlateDBError::InvalidVersion { .. } => Error::data(msg),
             SlateDBError::ManifestMissing(_) => Error::data(msg),
             LatestTransactionalObjectVersionMissing => Error::data(msg),
