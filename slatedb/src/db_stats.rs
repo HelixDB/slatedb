@@ -40,6 +40,12 @@ pub const SST_FILTER_NEGATIVE_COUNT: &str = db_stat_name!("sst_filter_negative_c
 ///               / `MEMTABLE_WRITE_BYTES`
 pub const MEMTABLE_WRITE_BYTES: &str = db_stat_name!("memtable_write_bytes");
 pub const WAL_FLUSH_BYTES: &str = db_stat_name!("wal_flush_bytes");
+pub const READER_WAL_REPLAY_SSTS: &str = db_stat_name!("reader_wal_replay_ssts");
+pub const READER_WAL_REPLAY_BYTES: &str = db_stat_name!("reader_wal_replay_bytes");
+pub const READER_WAL_REPLAY_BATCHES: &str = db_stat_name!("reader_wal_replay_batches");
+pub const READER_REPLAY_MEMTABLES: &str = db_stat_name!("reader_replay_memtables");
+pub const READER_ACTIVE_CHECKPOINTS: &str = db_stat_name!("reader_active_checkpoints");
+pub const READER_MANIFEST_POLLS: &str = db_stat_name!("reader_manifest_polls");
 
 /// Label key distinguishing filter metrics for point lookups from those for
 /// prefix scans. Value is one of [`FILTER_KIND_POINT`] or
@@ -75,6 +81,12 @@ pub(crate) struct DbStatsInner {
     pub(crate) merge_operator_flush_operands: Arc<dyn CounterFn>,
     pub(crate) memtable_write_bytes: Arc<dyn CounterFn>,
     pub(crate) wal_flush_bytes: Arc<dyn CounterFn>,
+    pub(crate) reader_wal_replay_ssts: Arc<dyn CounterFn>,
+    pub(crate) reader_wal_replay_bytes: Arc<dyn CounterFn>,
+    pub(crate) reader_wal_replay_batches: Arc<dyn CounterFn>,
+    pub(crate) reader_replay_memtables: Arc<dyn GaugeFn>,
+    pub(crate) reader_active_checkpoints: Arc<dyn GaugeFn>,
+    pub(crate) reader_manifest_polls: Arc<dyn CounterFn>,
 }
 
 #[derive(Clone)]
@@ -161,6 +173,20 @@ impl DbStats {
                 .register(),
             memtable_write_bytes: recorder.counter(MEMTABLE_WRITE_BYTES).register(),
             wal_flush_bytes: recorder.counter(WAL_FLUSH_BYTES).register(),
+            reader_wal_replay_ssts: recorder.counter(READER_WAL_REPLAY_SSTS).register(),
+            reader_wal_replay_bytes: recorder.counter(READER_WAL_REPLAY_BYTES).register(),
+            reader_wal_replay_batches: recorder.counter(READER_WAL_REPLAY_BATCHES).register(),
+            reader_replay_memtables: recorder.gauge(READER_REPLAY_MEMTABLES).register(),
+            reader_active_checkpoints: recorder
+                .gauge(READER_ACTIVE_CHECKPOINTS)
+                .description(
+                    "Number of GC checkpoints currently managed by this DbReader's manifest poller",
+                )
+                .register(),
+            reader_manifest_polls: recorder
+                .counter(READER_MANIFEST_POLLS)
+                .description("Number of successful DbReader manifest polls completed")
+                .register(),
         };
         DbStats {
             inner: Arc::new(inner),

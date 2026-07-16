@@ -159,5 +159,15 @@ required-features = ["bench-internal"]
 name = "db_transaction"
 harness = false
 
+[[bench]]
+name = "db_reader_scaling"
+harness = false
+required-features = ["test-util"]
+
+[[bench]]
+name = "db_reader_memory_scaling"
+harness = false
+required-features = ["test-util"]
+
 [lints]
 workspace = true

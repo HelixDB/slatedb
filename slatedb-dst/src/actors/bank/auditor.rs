@@ -1,8 +1,11 @@
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use rand::RngCore;
 use slatedb::config::DbReaderOptions;
+use slatedb::db_cache::{CachedEntry, CachedKey, DbCache};
 use slatedb::{DbReadOps, DbReader, Error};
 use tracing::{info, instrument};
 
@@ -19,6 +22,8 @@ pub enum BankAuditView {
     Snapshot,
     /// Audit a long-lived read-only `DbReader`.
     Reader { options: DbReaderOptions },
+    /// Audit an O(1) snapshot captured from a long-lived read-only `DbReader`.
+    ReaderSnapshot { options: DbReaderOptions },
 }
 
 impl BankAuditView {
@@ -27,6 +32,7 @@ impl BankAuditView {
             Self::Regular => "db",
             Self::Snapshot => "db_snapshot",
             Self::Reader { .. } => "db_reader",
+            Self::ReaderSnapshot { .. } => "db_reader_snapshot",
         }
     }
 }
@@ -89,6 +95,21 @@ impl Actor for AuditorActor {
                     .expect("bank reader auditor should have opened a reader");
                 audit_bank_view(reader, &self.bank, self.step).await?;
             }
+            BankAuditView::ReaderSnapshot { options } => {
+                if self.reader.is_none() {
+                    self.reader = Some(open_bank_reader(ctx, options).await?);
+                }
+                let reader = self
+                    .reader
+                    .as_ref()
+                    .expect("bank reader snapshot auditor should have opened a reader");
+                let snapshot = reader.snapshot().await?;
+                // Make the capture-to-read window explicit so transfer, flush,
+                // compaction, GC, and fencing actors can advance after this
+                // snapshot has fixed its manifest generation and sequence.
+                tokio::task::yield_now().await;
+                audit_bank_view(snapshot.as_ref(), &self.bank, self.step).await?;
+            }
         };
 
         self.step += 1;
@@ -121,7 +142,11 @@ async fn open_bank_reader(ctx: &ActorCtx, options: DbReaderOptions) -> Result<Db
     let mut builder = DbReader::builder(ctx.path().clone(), ctx.main_object_store())
         .with_options(options)
         .with_system_clock(ctx.system_clock())
-        .with_seed(ctx.rand().rng().next_u64());
+        .with_seed(ctx.rand().rng().next_u64())
+        // Production caches may use wall clocks, randomized hashing, or
+        // background workers. This bounded FIFO cache keeps cache hits and
+        // evictions inside the deterministic single-threaded schedule.
+        .with_db_cache(Arc::new(DeterministicDbCache::new(8 * 1024 * 1024)));
 
     if let Some(wal_object_store) = ctx.wal_object_store() {
         builder = builder.with_wal_object_store(wal_object_store);
@@ -132,6 +157,86 @@ async fn open_bank_reader(ctx: &ActorCtx, options: DbReaderOptions) -> Result<Db
     }
 
     builder.build().await
+}
+
+struct DeterministicDbCache {
+    capacity: usize,
+    inner: Mutex<DeterministicDbCacheInner>,
+}
+
+#[derive(Default)]
+struct DeterministicDbCacheInner {
+    entries: HashMap<CachedKey, CachedEntry>,
+    insertion_order: VecDeque<CachedKey>,
+    size: usize,
+}
+
+impl DeterministicDbCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            inner: Mutex::new(DeterministicDbCacheInner::default()),
+        }
+    }
+
+    fn get(&self, key: &CachedKey) -> Option<CachedEntry> {
+        self.inner.lock().unwrap().entries.get(key).cloned()
+    }
+}
+
+#[async_trait]
+impl DbCache for DeterministicDbCache {
+    async fn get_block(&self, key: &CachedKey) -> Result<Option<CachedEntry>, Error> {
+        Ok(self.get(key))
+    }
+
+    async fn get_index(&self, key: &CachedKey) -> Result<Option<CachedEntry>, Error> {
+        Ok(self.get(key))
+    }
+
+    async fn get_filter(&self, key: &CachedKey) -> Result<Option<CachedEntry>, Error> {
+        Ok(self.get(key))
+    }
+
+    async fn get_stats(&self, key: &CachedKey) -> Result<Option<CachedEntry>, Error> {
+        Ok(self.get(key))
+    }
+
+    async fn insert(&self, key: CachedKey, value: CachedEntry) {
+        let value_size = value.size();
+        if value_size > self.capacity {
+            return;
+        }
+
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(previous) = inner.entries.insert(key.clone(), value) {
+            inner.size = inner.size.saturating_sub(previous.size()) + value_size;
+        } else {
+            inner.size += value_size;
+            inner.insertion_order.push_back(key);
+        }
+
+        while inner.size > self.capacity {
+            let Some(oldest) = inner.insertion_order.pop_front() else {
+                break;
+            };
+            if let Some(evicted) = inner.entries.remove(&oldest) {
+                inner.size = inner.size.saturating_sub(evicted.size());
+            }
+        }
+    }
+
+    async fn remove(&self, key: &CachedKey) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(removed) = inner.entries.remove(key) {
+            inner.size = inner.size.saturating_sub(removed.size());
+        }
+        inner.insertion_order.retain(|queued| queued != key);
+    }
+
+    fn entry_count(&self) -> u64 {
+        self.inner.lock().unwrap().entries.len() as u64
+    }
 }
 
 async fn audit_bank_view<R>(reader: &R, bank: &BankAccounts, step: u64) -> Result<(), Error>
