@@ -27,6 +27,7 @@ use crate::db_state::SsTableId;
 use crate::filter_policy::NamedFilter;
 use crate::flatbuffer_types::SsTableIndexOwned;
 use crate::format::block::Block;
+use crate::query_metrics::{self, QueryCacheKind};
 use crate::sst_stats::SstStats;
 use slatedb_common::clock::SystemClock;
 use slatedb_common::metrics::MetricsRecorderHelper;
@@ -683,6 +684,7 @@ impl DbCacheWrapper {
     }
 
     fn record_hit(&self, block_type: &str) {
+        query_metrics::record_cache_access(QueryCacheKind::Block, true);
         match block_type {
             "block" => self.stats.data_block_hit.increment(1),
             "index" => self.stats.index_hit.increment(1),
@@ -693,6 +695,7 @@ impl DbCacheWrapper {
     }
 
     fn record_miss(&self, block_type: &str) {
+        query_metrics::record_cache_access(QueryCacheKind::Block, false);
         match block_type {
             "block" => self.stats.data_block_miss.increment(1),
             "index" => self.stats.index_miss.increment(1),
@@ -744,9 +747,9 @@ impl DbCache for DbCacheWrapper {
             }
         };
         if entry.is_some() {
-            self.stats.data_block_hit.increment(1);
+            self.record_hit("block");
         } else {
-            self.stats.data_block_miss.increment(1);
+            self.record_miss("block");
         }
         Ok(entry)
     }
@@ -761,9 +764,9 @@ impl DbCache for DbCacheWrapper {
             }
         };
         if entry.is_some() {
-            self.stats.index_hit.increment(1);
+            self.record_hit("index");
         } else {
-            self.stats.index_miss.increment(1);
+            self.record_miss("index");
         }
         Ok(entry)
     }
@@ -778,9 +781,9 @@ impl DbCache for DbCacheWrapper {
             }
         };
         if entry.is_some() {
-            self.stats.filter_hit.increment(1);
+            self.record_hit("filter");
         } else {
-            self.stats.filter_miss.increment(1);
+            self.record_miss("filter");
         }
         Ok(entry)
     }
@@ -795,9 +798,9 @@ impl DbCache for DbCacheWrapper {
             }
         };
         if entry.is_some() {
-            self.stats.stats_hit.increment(1);
+            self.record_hit("stats");
         } else {
-            self.stats.stats_miss.increment(1);
+            self.record_miss("stats");
         }
         Ok(entry)
     }
