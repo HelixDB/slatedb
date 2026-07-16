@@ -1,30 +1,34 @@
 use crate::batch::WriteBatchIterator;
+use crate::block_iterator::DataBlockIterator;
 use crate::bytes_range::BytesRange;
 use crate::clock::MonotonicClock;
 use crate::config::{DurabilityLevel, ReadOptions, ScanOptions};
 use crate::db_iter::{apply_filters, DbRecencyIterator};
 use crate::db_stats::DbStats;
+use crate::filter_policy::FilterQuery;
+use crate::format::block::Block;
 use crate::iter::RowEntryIterator;
 use crate::manifest::{ManifestCore, Segment};
 use crate::mem_table::{ImmutableMemtable, KVTable};
 use crate::merge_operator::{instrument_merge_operator, MergeOperatorType};
 use crate::oracle::Oracle;
+use crate::partitioned_keyspace;
 use crate::segment_iterator::{build_segment_iter, SegmentScanContext};
 use crate::sorted_run_iterator::SortedRunIterator;
 use crate::sst_iter::{SstIterator, SstIteratorOptions};
 use crate::tablestore::TableStore;
-use crate::types::KeyValue;
+use crate::types::{KeyValue, RowEntry, ValueDeletable};
 use crate::{error::SlateDBError, DbIterator};
 
 use bytes::Bytes;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 pub(crate) trait DbStateReader {
     fn memtable(&self) -> Arc<KVTable>;
     /// Returns immutable memtables newest-first. The iterator form permits
     /// read-only replicas to use a structurally shared persistent chain.
-    fn imm_memtables(&self) -> Box<dyn Iterator<Item = Arc<ImmutableMemtable>> + '_>;
+    fn imm_memtables(&self) -> Box<dyn Iterator<Item = Arc<ImmutableMemtable>> + Send + '_>;
     fn core(&self) -> &ManifestCore;
 }
 
@@ -259,6 +263,549 @@ impl Reader {
                 }
             })
             .transpose()
+    }
+
+    pub(crate) async fn multi_get_key_value_with_options(
+        &self,
+        keys: &[Bytes],
+        options: &ReadOptions,
+        db_state: &(dyn DbStateReader + Sync + Send),
+        max_seq: Option<u64>,
+    ) -> Result<Vec<Option<KeyValue>>, SlateDBError> {
+        self.db_stats.get_requests.increment(1);
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let prepared_max_seq =
+            self.prepare_max_seq(max_seq, options.durability_filter, options.dirty);
+        let merge_operator_enabled = self.read_merge_operator.is_some();
+
+        let mut key_to_idx = HashMap::<Bytes, usize>::with_capacity(keys.len());
+        let mut unique_keys = Vec::<Bytes>::with_capacity(keys.len());
+        let mut output_positions = Vec::<Vec<usize>>::with_capacity(keys.len());
+
+        for (output_idx, key) in keys.iter().enumerate() {
+            if let Some(existing_idx) = key_to_idx.get(key).copied() {
+                output_positions[existing_idx].push(output_idx);
+                continue;
+            }
+
+            let key_idx = unique_keys.len();
+            key_to_idx.insert(key.clone(), key_idx);
+            unique_keys.push(key.clone());
+            output_positions.push(vec![output_idx]);
+        }
+
+        let mut resolved = vec![false; unique_keys.len()];
+        let mut values = vec![None; unique_keys.len()];
+        let mut fallback_to_point_get = vec![false; unique_keys.len()];
+
+        self.resolve_rows_from_memtable_for_keys(
+            db_state.memtable(),
+            &unique_keys,
+            prepared_max_seq,
+            merge_operator_enabled,
+            &mut resolved,
+            &mut values,
+            &mut fallback_to_point_get,
+        )
+        .await?;
+
+        for imm in db_state.imm_memtables() {
+            if Self::all_done(&resolved, &fallback_to_point_get) {
+                break;
+            }
+
+            self.resolve_rows_from_memtable_for_keys(
+                imm.table(),
+                &unique_keys,
+                prepared_max_seq,
+                merge_operator_enabled,
+                &mut resolved,
+                &mut values,
+                &mut fallback_to_point_get,
+            )
+            .await?;
+        }
+
+        self.resolve_rows_from_segments_for_keys(
+            db_state.core(),
+            &unique_keys,
+            prepared_max_seq,
+            options,
+            merge_operator_enabled,
+            &mut resolved,
+            &mut values,
+            &mut fallback_to_point_get,
+        )
+        .await?;
+
+        for key_idx in fallback_to_point_get
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, should_fallback)| should_fallback.then_some(idx))
+        {
+            values[key_idx] = self
+                .get_key_value_with_options(
+                    unique_keys[key_idx].as_ref(),
+                    options,
+                    db_state,
+                    None,
+                    max_seq,
+                )
+                .await?;
+            resolved[key_idx] = true;
+        }
+
+        let mut result = vec![None; keys.len()];
+        for (key_idx, positions) in output_positions.into_iter().enumerate() {
+            let value = if resolved[key_idx] {
+                values[key_idx].clone()
+            } else {
+                None
+            };
+
+            for position in positions {
+                result[position] = value.clone();
+            }
+        }
+
+        Ok(result)
+    }
+
+    fn all_done(resolved: &[bool], fallback_to_point_get: &[bool]) -> bool {
+        resolved
+            .iter()
+            .zip(fallback_to_point_get)
+            .all(|(resolved, fallback)| *resolved || *fallback)
+    }
+
+    async fn resolve_rows_from_memtable_for_keys(
+        &self,
+        table: Arc<KVTable>,
+        unique_keys: &[Bytes],
+        max_seq: Option<u64>,
+        merge_operator_enabled: bool,
+        resolved: &mut [bool],
+        values: &mut [Option<KeyValue>],
+        fallback_to_point_get: &mut [bool],
+    ) -> Result<(), SlateDBError> {
+        if table.is_empty() {
+            return Ok(());
+        }
+
+        for (key_idx, key) in unique_keys.iter().enumerate() {
+            if resolved[key_idx] || fallback_to_point_get[key_idx] {
+                continue;
+            }
+
+            let mut iter = table.range_ascending(key.clone()..=key.clone());
+            while let Some(row) = iter.next().await? {
+                if !Self::row_visible(&row, max_seq) {
+                    continue;
+                }
+
+                Self::apply_source_row_result(
+                    key_idx,
+                    row,
+                    merge_operator_enabled,
+                    resolved,
+                    values,
+                    fallback_to_point_get,
+                )?;
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn resolve_rows_from_segments_for_keys(
+        &self,
+        core: &ManifestCore,
+        unique_keys: &[Bytes],
+        max_seq: Option<u64>,
+        options: &ReadOptions,
+        merge_operator_enabled: bool,
+        resolved: &mut [bool],
+        values: &mut [Option<KeyValue>],
+        fallback_to_point_get: &mut [bool],
+    ) -> Result<(), SlateDBError> {
+        if Self::all_done(resolved, fallback_to_point_get) {
+            return Ok(());
+        }
+
+        let mut groups = BTreeMap::<Bytes, (Segment, Vec<usize>)>::new();
+        for (key_idx, key) in unique_keys.iter().enumerate() {
+            if resolved[key_idx] || fallback_to_point_get[key_idx] {
+                continue;
+            }
+
+            let range = BytesRange::from_slice(key.as_ref()..=key.as_ref());
+            let segment = match core.select_segments(&range) {
+                None => core.default_segment(),
+                Some(segments) => match segments.first() {
+                    Some(segment) => segment.clone(),
+                    None => continue,
+                },
+            };
+
+            groups
+                .entry(segment.prefix.clone())
+                .or_insert_with(|| (segment, Vec::new()))
+                .1
+                .push(key_idx);
+        }
+
+        for (_, (segment, key_indices)) in groups {
+            self.resolve_rows_from_lsm_tree_for_keys(
+                &segment,
+                &key_indices,
+                unique_keys,
+                max_seq,
+                options,
+                merge_operator_enabled,
+                resolved,
+                values,
+                fallback_to_point_get,
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn resolve_rows_from_lsm_tree_for_keys(
+        &self,
+        segment: &Segment,
+        key_indices: &[usize],
+        unique_keys: &[Bytes],
+        max_seq: Option<u64>,
+        options: &ReadOptions,
+        merge_operator_enabled: bool,
+        resolved: &mut [bool],
+        values: &mut [Option<KeyValue>],
+        fallback_to_point_get: &mut [bool],
+    ) -> Result<(), SlateDBError> {
+        let mut unresolved = key_indices
+            .iter()
+            .copied()
+            .filter(|key_idx| !resolved[*key_idx] && !fallback_to_point_get[*key_idx])
+            .collect::<Vec<_>>();
+
+        for sst in segment.tree.l0.iter() {
+            if unresolved.is_empty() {
+                return Ok(());
+            }
+
+            self.resolve_rows_from_sst_for_keys(
+                sst,
+                &unresolved,
+                unique_keys,
+                max_seq,
+                options,
+                merge_operator_enabled,
+                resolved,
+                values,
+                fallback_to_point_get,
+            )
+            .await?;
+            unresolved.retain(|idx| !resolved[*idx] && !fallback_to_point_get[*idx]);
+        }
+
+        for sr in segment.tree.compacted.iter() {
+            if unresolved.is_empty() {
+                return Ok(());
+            }
+
+            self.resolve_rows_from_sorted_run_for_keys(
+                sr,
+                &unresolved,
+                unique_keys,
+                max_seq,
+                options,
+                merge_operator_enabled,
+                resolved,
+                values,
+                fallback_to_point_get,
+            )
+            .await?;
+            unresolved.retain(|idx| !resolved[*idx] && !fallback_to_point_get[*idx]);
+        }
+
+        Ok(())
+    }
+
+    async fn resolve_rows_from_sorted_run_for_keys(
+        &self,
+        sorted_run: &crate::db_state::SortedRun,
+        key_indices: &[usize],
+        unique_keys: &[Bytes],
+        max_seq: Option<u64>,
+        options: &ReadOptions,
+        merge_operator_enabled: bool,
+        resolved: &mut [bool],
+        values: &mut [Option<KeyValue>],
+        fallback_to_point_get: &mut [bool],
+    ) -> Result<(), SlateDBError> {
+        let mut groups = BTreeMap::<ulid::Ulid, (crate::db_state::SsTableView, Vec<usize>)>::new();
+        for key_idx in key_indices.iter().copied() {
+            if resolved[key_idx] || fallback_to_point_get[key_idx] {
+                continue;
+            }
+
+            for sst in sorted_run.tables_covering_point_key(unique_keys[key_idx].as_ref()) {
+                groups
+                    .entry(sst.id)
+                    .or_insert_with(|| (sst.clone(), Vec::new()))
+                    .1
+                    .push(key_idx);
+            }
+        }
+
+        for (_, (sst, group_key_indices)) in groups {
+            self.resolve_rows_from_sst_for_keys(
+                &sst,
+                &group_key_indices,
+                unique_keys,
+                max_seq,
+                options,
+                merge_operator_enabled,
+                resolved,
+                values,
+                fallback_to_point_get,
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn resolve_rows_from_sst_for_keys(
+        &self,
+        sst: &crate::db_state::SsTableView,
+        key_indices: &[usize],
+        unique_keys: &[Bytes],
+        max_seq: Option<u64>,
+        options: &ReadOptions,
+        merge_operator_enabled: bool,
+        resolved: &mut [bool],
+        values: &mut [Option<KeyValue>],
+        fallback_to_point_get: &mut [bool],
+    ) -> Result<(), SlateDBError> {
+        let mut candidate_key_indices = Vec::with_capacity(key_indices.len());
+        let filters = self.table_store.read_filters(&sst.sst, true).await?;
+
+        for &key_idx in key_indices {
+            if resolved[key_idx] || fallback_to_point_get[key_idx] {
+                continue;
+            }
+
+            let key = unique_keys[key_idx].as_ref();
+            if sst
+                .calculate_view_range(BytesRange::from_slice(key..=key))
+                .is_none()
+            {
+                continue;
+            }
+
+            if filters.is_empty() {
+                candidate_key_indices.push(key_idx);
+                continue;
+            }
+
+            let query = FilterQuery::point(unique_keys[key_idx].clone())
+                .with_context(options.filter_context.clone());
+            if filters.iter().all(|named| named.filter.might_match(&query)) {
+                self.db_stats.sst_filter_point_positives.increment(1);
+                candidate_key_indices.push(key_idx);
+            } else {
+                self.db_stats.sst_filter_point_negatives.increment(1);
+            }
+        }
+
+        if candidate_key_indices.is_empty() {
+            return Ok(());
+        }
+
+        let index = self.table_store.read_index(&sst.sst, true).await?;
+        let block_to_key_indices = {
+            let index_ref = index.borrow();
+            let mut block_to_key_indices = BTreeMap::<usize, Vec<usize>>::new();
+            for &key_idx in &candidate_key_indices {
+                let key = unique_keys[key_idx].as_ref();
+                let start_block =
+                    partitioned_keyspace::first_partition_including_or_after_key(&index_ref, key);
+                let end_block_exclusive =
+                    partitioned_keyspace::last_partition_including_key(&index_ref, key)
+                        .map(|last| last + 1)
+                        .unwrap_or(start_block);
+
+                if start_block >= end_block_exclusive {
+                    continue;
+                }
+
+                for block_idx in start_block..end_block_exclusive {
+                    block_to_key_indices
+                        .entry(block_idx)
+                        .or_default()
+                        .push(key_idx);
+                }
+            }
+            block_to_key_indices
+        };
+
+        if block_to_key_indices.is_empty() {
+            return Ok(());
+        }
+
+        let mut block_ranges = Vec::new();
+        let mut range_start = None;
+        let mut previous_block = 0;
+        for &block_idx in block_to_key_indices.keys() {
+            if let Some(start) = range_start {
+                if block_idx == previous_block + 1 {
+                    previous_block = block_idx;
+                } else {
+                    block_ranges.push(start..(previous_block + 1));
+                    range_start = Some(block_idx);
+                    previous_block = block_idx;
+                }
+            } else {
+                range_start = Some(block_idx);
+                previous_block = block_idx;
+            }
+        }
+        if let Some(start) = range_start {
+            block_ranges.push(start..(previous_block + 1));
+        }
+
+        let mut found_in_sst = HashSet::<usize>::new();
+        for block_range in block_ranges {
+            let blocks = self
+                .table_store
+                .read_blocks_using_index(
+                    &sst.sst,
+                    index.clone(),
+                    block_range.clone(),
+                    options.cache_blocks,
+                )
+                .await?;
+
+            for (offset, block) in blocks.into_iter().enumerate() {
+                let block_idx = block_range.start + offset;
+                let Some(key_idxs) = block_to_key_indices.get(&block_idx) else {
+                    continue;
+                };
+
+                self.resolve_rows_from_block_for_keys(
+                    block,
+                    sst.sst.format_version,
+                    key_idxs,
+                    unique_keys,
+                    max_seq,
+                    merge_operator_enabled,
+                    resolved,
+                    values,
+                    fallback_to_point_get,
+                    &mut found_in_sst,
+                )
+                .await?;
+            }
+        }
+
+        if !filters.is_empty() {
+            let false_positives = candidate_key_indices
+                .iter()
+                .filter(|key_idx| !found_in_sst.contains(key_idx))
+                .count() as u64;
+            if false_positives > 0 {
+                self.db_stats
+                    .sst_filter_point_false_positives
+                    .increment(false_positives);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn resolve_rows_from_block_for_keys(
+        &self,
+        block: Arc<Block>,
+        sst_version: u16,
+        key_indices: &[usize],
+        unique_keys: &[Bytes],
+        max_seq: Option<u64>,
+        merge_operator_enabled: bool,
+        resolved: &mut [bool],
+        values: &mut [Option<KeyValue>],
+        fallback_to_point_get: &mut [bool],
+        found_in_sst: &mut HashSet<usize>,
+    ) -> Result<(), SlateDBError> {
+        let key_lookup = key_indices
+            .iter()
+            .copied()
+            .map(|key_idx| (unique_keys[key_idx].clone(), key_idx))
+            .collect::<HashMap<_, _>>();
+
+        let mut iter =
+            DataBlockIterator::new(block, sst_version, crate::iter::IterationOrder::Ascending)?;
+        while let Some(row) = iter.next().await? {
+            let Some(&key_idx) = key_lookup.get(&row.key) else {
+                continue;
+            };
+            if found_in_sst.contains(&key_idx) || !Self::row_visible(&row, max_seq) {
+                continue;
+            }
+
+            found_in_sst.insert(key_idx);
+            Self::apply_source_row_result(
+                key_idx,
+                row,
+                merge_operator_enabled,
+                resolved,
+                values,
+                fallback_to_point_get,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn row_visible(row: &RowEntry, max_seq: Option<u64>) -> bool {
+        match max_seq {
+            Some(max_seq) => row.seq <= max_seq,
+            None => true,
+        }
+    }
+
+    fn apply_source_row_result(
+        key_idx: usize,
+        row: RowEntry,
+        merge_operator_enabled: bool,
+        resolved: &mut [bool],
+        values: &mut [Option<KeyValue>],
+        fallback_to_point_get: &mut [bool],
+    ) -> Result<(), SlateDBError> {
+        match &row.value {
+            ValueDeletable::Value(_) => {
+                resolved[key_idx] = true;
+                values[key_idx] = Some(KeyValue::from(row));
+            }
+            ValueDeletable::Tombstone => {
+                resolved[key_idx] = true;
+                values[key_idx] = None;
+            }
+            ValueDeletable::Merge(_) => {
+                if !merge_operator_enabled {
+                    return Err(SlateDBError::MergeOperatorMissing);
+                }
+                fallback_to_point_get[key_idx] = true;
+            }
+        }
+
+        Ok(())
     }
 
     /// Create an iterator over a key range.
@@ -613,7 +1160,7 @@ mod tests {
             self.memtable.clone()
         }
 
-        fn imm_memtables(&self) -> Box<dyn Iterator<Item = Arc<ImmutableMemtable>> + '_> {
+        fn imm_memtables(&self) -> Box<dyn Iterator<Item = Arc<ImmutableMemtable>> + Send + '_> {
             Box::new(self.imm_memtable.iter().cloned())
         }
 

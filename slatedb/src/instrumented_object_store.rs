@@ -35,6 +35,7 @@ use object_store::{
 use slatedb_common::metrics::MetricsRecorderHelper;
 
 use crate::object_stores::ObjectStoreType;
+use crate::query_metrics;
 
 /// Which SlateDB component is issuing object store requests.
 ///
@@ -148,6 +149,7 @@ impl ObjectStore for InstrumentedObjectStore {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
+        query_metrics::record_object_storage_read();
         let metric = if options.head {
             &self.stats.head
         } else if options.range.is_some() {
@@ -166,6 +168,7 @@ impl ObjectStore for InstrumentedObjectStore {
         location: &Path,
         ranges: &[Range<u64>],
     ) -> object_store::Result<Vec<Bytes>> {
+        query_metrics::record_object_storage_read();
         let start = Instant::now();
         let result = self.inner.get_ranges(location, ranges).await;
         self.stats
@@ -226,6 +229,7 @@ impl ObjectStore for InstrumentedObjectStore {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        query_metrics::record_object_storage_read();
         self.stats.list.increment(1);
         self.inner.list(prefix)
     }
@@ -235,11 +239,13 @@ impl ObjectStore for InstrumentedObjectStore {
         prefix: Option<&Path>,
         offset: &Path,
     ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        query_metrics::record_object_storage_read();
         self.stats.list_with_offset.increment(1);
         self.inner.list_with_offset(prefix, offset)
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        query_metrics::record_object_storage_read();
         let start = Instant::now();
         let result = self.inner.list_with_delimiter(prefix).await;
         self.stats

@@ -67,6 +67,10 @@ pub use manifest::VersionedManifest;
 pub use merge_operator::{MergeOperator, MergeOperatorError};
 pub use ops::{DbCacheManagerOps, DbMetadataOps, DbReadOps, DbTransactionOps, DbWriteOps};
 pub use prefix_extractor::{PrefixExtractor, PrefixTarget};
+pub use query_metrics::{
+    scope_query_metrics, QueryCacheKind, QueryCacheStatistics, QueryMetricsObserver,
+    QueryMetricsSnapshot,
+};
 pub use slatedb_common::{DbRand, IdentifiedObjectMetadata, ObjectMetadata};
 #[cfg(test)]
 pub use sst_builder::BlockFormat;
@@ -89,6 +93,7 @@ pub mod db_cache;
 pub mod db_stats;
 pub mod manifest;
 pub mod prefix_extractor;
+pub mod query_metrics;
 pub mod seq_tracker;
 pub mod size_tiered_compaction;
 

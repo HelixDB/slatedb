@@ -695,7 +695,7 @@ impl DbStateReader for DbStateView {
         Arc::clone(&self.memtable)
     }
 
-    fn imm_memtables(&self) -> Box<dyn Iterator<Item = Arc<ImmutableMemtable>> + '_> {
+    fn imm_memtables(&self) -> Box<dyn Iterator<Item = Arc<ImmutableMemtable>> + Send + '_> {
         Box::new(self.state.imm_memtable.iter().cloned())
     }
 

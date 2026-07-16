@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::batch::{WriteBatch, WriteBatchIterator};
+use crate::batch::{WriteBatch, WriteBatchIterator, WriteBatchLookup};
 use crate::bytes_range::{ByteRangeBounds, BytesRange};
 use crate::config::{MergeOptions, PutOptions, ReadOptions, ScanOptions, WriteOptions};
 use crate::db::DbInner;
@@ -182,6 +182,145 @@ impl DbTransaction {
             .await
             .map_err(crate::Error::from)?;
         Ok(kv)
+    }
+
+    /// Get multiple values from the transaction with default read options.
+    /// This operation tracks all read keys for conflict detection in SSI mode.
+    pub async fn multi_get<K: AsRef<[u8]> + Send + Sync>(
+        &self,
+        keys: &[K],
+    ) -> Result<Vec<Option<Bytes>>, crate::Error> {
+        self.multi_get_with_options(keys, &ReadOptions::default())
+            .await
+    }
+
+    /// Get multiple values from the transaction with custom read options.
+    /// This operation tracks all read keys for conflict detection in SSI mode.
+    pub async fn multi_get_with_options<K: AsRef<[u8]> + Send + Sync>(
+        &self,
+        keys: &[K],
+        options: &ReadOptions,
+    ) -> Result<Vec<Option<Bytes>>, crate::Error> {
+        self.multi_get_key_value_with_options(keys, options)
+            .await
+            .map(|values| values.into_iter().map(|kv| kv.map(|kv| kv.value)).collect())
+    }
+
+    async fn multi_get_key_value_with_options<K: AsRef<[u8]> + Send + Sync>(
+        &self,
+        keys: &[K],
+        options: &ReadOptions,
+    ) -> Result<Vec<Option<KeyValue>>, crate::Error> {
+        self.db_inner.check_closed()?;
+
+        if self.isolation_level == IsolationLevel::SerializableSnapshot {
+            let read_keys = keys
+                .iter()
+                .map(|key| Bytes::copy_from_slice(key.as_ref()))
+                .collect::<HashSet<_>>();
+            self.txn_manager.track_read_keys(&self.txn_id, read_keys);
+        }
+
+        let db_state = self.db_inner.state.read().view();
+
+        let mut key_to_idx = std::collections::HashMap::<Bytes, usize>::with_capacity(keys.len());
+        let mut unique_keys = Vec::<Bytes>::with_capacity(keys.len());
+        let mut output_positions = Vec::<Vec<usize>>::with_capacity(keys.len());
+
+        for (output_idx, key) in keys.iter().enumerate() {
+            let key = Bytes::copy_from_slice(key.as_ref());
+            if let Some(existing_idx) = key_to_idx.get(&key).copied() {
+                output_positions[existing_idx].push(output_idx);
+                continue;
+            }
+
+            let key_idx = unique_keys.len();
+            key_to_idx.insert(key.clone(), key_idx);
+            unique_keys.push(key);
+            output_positions.push(vec![output_idx]);
+        }
+
+        let mut resolved = vec![false; unique_keys.len()];
+        let mut values = vec![None; unique_keys.len()];
+        let mut fallback_to_point_get = vec![false; unique_keys.len()];
+
+        {
+            let write_batch = self.write_batch.read();
+            for (key_idx, key) in unique_keys.iter().enumerate() {
+                match write_batch.lookup_latest_for_key(key.as_ref()) {
+                    WriteBatchLookup::Put(value) => {
+                        resolved[key_idx] = true;
+                        values[key_idx] = Some(KeyValue {
+                            key: key.clone(),
+                            value,
+                            seq: u64::MAX,
+                            create_ts: 0,
+                            expire_ts: None,
+                        });
+                    }
+                    WriteBatchLookup::Delete => {
+                        resolved[key_idx] = true;
+                    }
+                    WriteBatchLookup::Merge => {
+                        fallback_to_point_get[key_idx] = true;
+                    }
+                    WriteBatchLookup::NotPresent => {}
+                }
+            }
+        }
+
+        let reader_key_indices = unique_keys
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, _)| (!resolved[idx] && !fallback_to_point_get[idx]).then_some(idx))
+            .collect::<Vec<_>>();
+        if !reader_key_indices.is_empty() {
+            let reader_keys = reader_key_indices
+                .iter()
+                .map(|idx| unique_keys[*idx].clone())
+                .collect::<Vec<_>>();
+            let reader_values = self
+                .db_inner
+                .reader
+                .multi_get_key_value_with_options(
+                    &reader_keys,
+                    options,
+                    &db_state,
+                    Some(self.started_seq),
+                )
+                .await
+                .map_err(crate::Error::from)?;
+            for (key_idx, value) in reader_key_indices.into_iter().zip(reader_values) {
+                resolved[key_idx] = true;
+                values[key_idx] = value;
+            }
+        }
+
+        for key_idx in fallback_to_point_get
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, should_fallback)| should_fallback.then_some(idx))
+        {
+            values[key_idx] = self
+                .get_key_value_with_options(unique_keys[key_idx].as_ref(), options)
+                .await?;
+            resolved[key_idx] = true;
+        }
+
+        let mut result = vec![None; keys.len()];
+        for (key_idx, positions) in output_positions.into_iter().enumerate() {
+            let value = if resolved[key_idx] {
+                values[key_idx].clone()
+            } else {
+                None
+            };
+
+            for position in positions {
+                result[position] = value.clone();
+            }
+        }
+
+        Ok(result)
     }
 
     /// Scan a range of keys using the default scan options.
@@ -372,6 +511,25 @@ impl DbTransaction {
         self.write_batch
             .write()
             .put_with_options(key, value, options);
+        Ok(())
+    }
+
+    /// Put an owned key-value pair into the transaction without copying the
+    /// value bytes into the transaction write batch.
+    pub fn put_bytes(&self, key: Bytes, value: Bytes) -> Result<(), crate::Error> {
+        self.put_bytes_with_options(key, value, &PutOptions::default())
+    }
+
+    /// Put an owned key-value pair into the transaction with custom options.
+    pub fn put_bytes_with_options(
+        &self,
+        key: Bytes,
+        value: Bytes,
+        options: &PutOptions,
+    ) -> Result<(), crate::Error> {
+        self.write_batch
+            .write()
+            .put_bytes_with_options(key, value, options);
         Ok(())
     }
 
@@ -642,6 +800,17 @@ impl DbReadOps for DbTransaction {
         DbTransaction::get_key_value_with_options(self, key, options).await
     }
 
+    async fn multi_get_with_options<K>(
+        &self,
+        keys: &[K],
+        options: &ReadOptions,
+    ) -> Result<Vec<Option<Bytes>>, crate::Error>
+    where
+        K: AsRef<[u8]> + Send + Sync,
+    {
+        DbTransaction::multi_get_with_options(self, keys, options).await
+    }
+
     async fn scan_with_options<T>(
         &self,
         range: T,
@@ -680,6 +849,15 @@ impl DbTransactionOps for DbTransaction {
         V: AsRef<[u8]>,
     {
         DbTransaction::put_with_options(self, key, value, options)
+    }
+
+    fn put_bytes_with_options(
+        &self,
+        key: Bytes,
+        value: Bytes,
+        options: &PutOptions,
+    ) -> Result<(), crate::Error> {
+        DbTransaction::put_bytes_with_options(self, key, value, options)
     }
 
     fn delete<K: AsRef<[u8]>>(&self, key: K) -> Result<(), crate::Error> {
@@ -837,6 +1015,135 @@ mod tests {
 
         // Commit transaction
         txn.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_txn_put_bytes_read_your_writes() {
+        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = crate::Db::open("test_txn_put_bytes", object_store)
+            .await
+            .unwrap();
+
+        let txn = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        txn.put_bytes(
+            Bytes::from_static(b"bytes_key"),
+            Bytes::from_static(b"bytes_value"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            txn.get(b"bytes_key").await.unwrap(),
+            Some(Bytes::from_static(b"bytes_value"))
+        );
+        txn.commit().await.unwrap();
+
+        assert_eq!(
+            db.get(b"bytes_key").await.unwrap(),
+            Some(Bytes::from_static(b"bytes_value"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_txn_multi_get_read_your_writes() {
+        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = crate::Db::open("test_txn_multi_get_read_your_writes", object_store)
+            .await
+            .unwrap();
+
+        db.put(b"k1", b"db_v1").await.unwrap();
+
+        let txn = db
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await
+            .unwrap();
+        txn.put(b"k1", b"txn_v1").unwrap();
+        txn.put_bytes(Bytes::from_static(b"k2"), Bytes::from_static(b"txn_v2"))
+            .unwrap();
+
+        let keys: [&[u8]; 4] = [b"k1", b"k2", b"missing", b"k1"];
+        let values = txn.multi_get(&keys).await.unwrap();
+
+        assert_eq!(values[0], Some(Bytes::from_static(b"txn_v1")));
+        assert_eq!(values[1], Some(Bytes::from_static(b"txn_v2")));
+        assert_eq!(values[2], None);
+        assert_eq!(values[3], Some(Bytes::from_static(b"txn_v1")));
+
+        txn.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_txn_multi_get_matches_get_for_pending_put_delete_and_isolation() {
+        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = crate::Db::open("test_txn_multi_get_pending_overlay", object_store)
+            .await
+            .unwrap();
+
+        db.put(b"k1", b"db_v1").await.unwrap();
+        db.put(b"k2", b"db_v2").await.unwrap();
+        db.put(b"k3", b"db_v3").await.unwrap();
+
+        let txn = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        txn.put(b"k1", b"txn_v1").unwrap();
+        txn.delete(b"k2").unwrap();
+        txn.put(b"k4", b"txn_v4").unwrap();
+
+        let keys: [&[u8]; 7] = [b"k1", b"k2", b"k3", b"k4", b"missing", b"k1", b"k2"];
+        let multi = txn.multi_get(&keys).await.unwrap();
+        let mut single = Vec::with_capacity(keys.len());
+        for key in keys {
+            single.push(txn.get(key).await.unwrap());
+        }
+
+        assert_eq!(multi, single);
+        assert_eq!(multi[0], Some(Bytes::from_static(b"txn_v1")));
+        assert_eq!(multi[1], None);
+        assert_eq!(multi[2], Some(Bytes::from_static(b"db_v3")));
+        assert_eq!(multi[3], Some(Bytes::from_static(b"txn_v4")));
+        assert_eq!(multi[4], None);
+        assert_eq!(multi[5], Some(Bytes::from_static(b"txn_v1")));
+        assert_eq!(multi[6], None);
+
+        let concurrent = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let concurrent_values = concurrent
+            .multi_get(&[b"k1".as_ref(), b"k2".as_ref(), b"k4".as_ref()])
+            .await
+            .unwrap();
+        assert_eq!(concurrent_values[0], Some(Bytes::from_static(b"db_v1")));
+        assert_eq!(concurrent_values[1], Some(Bytes::from_static(b"db_v2")));
+        assert_eq!(concurrent_values[2], None);
+        concurrent.commit().await.unwrap();
+
+        txn.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_txn_multi_get_tracks_reads_for_serializable_conflicts() {
+        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = crate::Db::open("test_txn_multi_get_conflicts", object_store)
+            .await
+            .unwrap();
+
+        db.put(b"k1", b"db_v1").await.unwrap();
+
+        let txn1 = db
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await
+            .unwrap();
+        let keys: [&[u8]; 3] = [b"k1", b"k1", b"missing"];
+        let values = txn1.multi_get(&keys).await.unwrap();
+        assert_eq!(values[0], Some(Bytes::from_static(b"db_v1")));
+        assert_eq!(values[1], Some(Bytes::from_static(b"db_v1")));
+        assert_eq!(values[2], None);
+
+        let txn2 = db
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await
+            .unwrap();
+        txn2.put(b"k1", b"db_v2").unwrap();
+        txn2.commit().await.unwrap();
+
+        txn1.put(b"k2", b"txn1_write").unwrap();
+        assert!(txn1.commit().await.is_err());
     }
 
     #[tokio::test]
