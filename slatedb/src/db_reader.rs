@@ -2560,7 +2560,16 @@ mod tests {
         })
         .await
         .unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if reader.get(b"key").await.unwrap() == Some(Bytes::from_static(b"v2")) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("live reader should replay the second WAL generation");
 
         assert_eq!(reader.get(b"key").await.unwrap(), Some(Bytes::from("v2")));
         assert_eq!(snapshot.get(b"key").await.unwrap(), Some(Bytes::from("v1")));
