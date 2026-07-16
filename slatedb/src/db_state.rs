@@ -686,8 +686,8 @@ impl DbStateReader for DbStateView {
         Arc::clone(&self.memtable)
     }
 
-    fn imm_memtable(&self) -> &VecDeque<Arc<ImmutableMemtable>> {
-        &self.state.imm_memtable
+    fn imm_memtables(&self) -> Box<dyn Iterator<Item = Arc<ImmutableMemtable>> + '_> {
+        Box::new(self.state.imm_memtable.iter().cloned())
     }
 
     fn core(&self) -> &ManifestCore {
@@ -717,7 +717,7 @@ pub(crate) fn collect_touched_segments(
         return std::collections::BTreeSet::new();
     }
     let mut set = reader.memtable().touched_segments();
-    for imm in reader.imm_memtable() {
+    for imm in reader.imm_memtables() {
         set.extend(imm.table().touched_segments());
     }
     set

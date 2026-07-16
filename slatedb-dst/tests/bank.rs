@@ -152,9 +152,19 @@ fn run_bank(seed: u64, shutdown_at_ms: i64) -> Result<(), Box<dyn std::error::Er
         .actor(
             "reader-auditor",
             AuditorActor::new_with_view(
-                bank_options,
+                bank_options.clone(),
                 audit_interval,
                 BankAuditView::Reader {
+                    options: reader_options.clone(),
+                },
+            )?,
+        )
+        .actor(
+            "reader-snapshot-auditor",
+            AuditorActor::new_with_view(
+                bank_options,
+                audit_interval,
+                BankAuditView::ReaderSnapshot {
                     options: reader_options,
                 },
             )?,

@@ -5,6 +5,7 @@ use crate::config::{CheckpointOptions, DbReaderOptions, ReadOptions, ScanOptions
 use crate::db_cache::CacheTarget;
 use crate::db_cache_manager;
 use crate::db_common::extract_segment_prefix;
+use crate::db_iter::DbIteratorGuard;
 use crate::db_state::{collect_touched_segments, SsTableId};
 use crate::db_stats::DbStats;
 use crate::db_status::{ClosedResultWriter, DbStatus, DbStatusManager};
@@ -24,7 +25,7 @@ use crate::tablestore::TableStore;
 use crate::types::KeyValue;
 use crate::utils::IdGenerator;
 use crate::wal_replay::{WalReplayIterator, WalReplayOptions};
-use crate::{Checkpoint, DbIterator};
+use crate::{Checkpoint, DbIterator, DbSnapshot};
 use crate::{DbCacheManagerOps, DbMetadataOps, DbReadOps};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -35,11 +36,13 @@ use object_store::ObjectStore;
 use parking_lot::RwLock;
 use slatedb_common::clock::SystemClock;
 use slatedb_common::DbRand;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashMap};
 use std::ops::Sub;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::LazyLock;
+use std::sync::{Arc, Weak};
 use tokio::runtime::Handle;
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 pub(crate) const DB_READER_TASK_NAME: &str = "manifest_poller";
@@ -70,12 +73,17 @@ pub enum DbReaderMode {
 
 /// Read-only interface for accessing a database from either
 /// the latest persistent state or from an arbitrary checkpoint.
+///
+/// A reader that follows the latest state is read-only with respect to user
+/// data, but it appends manifest versions to create, refresh, and release GC
+/// checkpoints. Opening from an explicit checkpoint does not start that
+/// manifest-writing poller.
 pub struct DbReader {
     inner: Arc<DbReaderInner>,
     task_executor: MessageHandlerExecutor,
 }
 
-struct DbReaderInner {
+pub(crate) struct DbReaderInner {
     manifest_store: Arc<ManifestStore>,
     table_store: Arc<TableStore>,
     options: DbReaderOptions,
@@ -84,6 +92,7 @@ struct DbReaderInner {
     system_clock: Arc<dyn SystemClock>,
     oracle: Arc<DbReaderOracle>,
     reader: Reader,
+    db_stats: DbStats,
     status_manager: DbStatusManager,
     segment_extractor: Option<Arc<dyn PrefixExtractor>>,
     rand: Arc<DbRand>,
@@ -100,13 +109,208 @@ enum DbReaderMessage {
 }
 
 #[derive(Clone)]
-struct ReaderState {
-    manifest_id: u64,
-    checkpoint: Option<Checkpoint>,
-    manifest: Manifest,
-    imm_memtable: VecDeque<Arc<ImmutableMemtable>>,
+pub(crate) struct ReaderState {
+    generation: Arc<ReaderGeneration>,
+    imm_memtable: ReplayMemtables,
     last_wal_id: u64,
     last_remote_persisted_seq: u64,
+}
+
+struct ReaderGeneration {
+    manifest_id: u64,
+    checkpoint: Option<RwLock<Checkpoint>>,
+    manifest: Manifest,
+    operation_state: AtomicUsize,
+    operation_drained: Notify,
+}
+
+const GENERATION_INVALID: usize = 1 << (usize::BITS - 1);
+const GENERATION_OPERATION_COUNT: usize = !GENERATION_INVALID;
+
+struct ReaderGenerationPermit {
+    generation: Arc<ReaderGeneration>,
+}
+
+impl Drop for ReaderGenerationPermit {
+    fn drop(&mut self) {
+        self.generation.exit_operation();
+    }
+}
+
+impl ReaderGeneration {
+    fn new(
+        manifest_id: u64,
+        checkpoint: Option<Checkpoint>,
+        manifest: Manifest,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            manifest_id,
+            checkpoint: checkpoint.map(RwLock::new),
+            manifest,
+            operation_state: AtomicUsize::new(0),
+            operation_drained: Notify::new(),
+        })
+    }
+
+    fn checkpoint(&self) -> Option<Checkpoint> {
+        self.checkpoint.as_ref().map(|checkpoint| checkpoint.read().clone())
+    }
+
+    fn managed_checkpoint(&self) -> &RwLock<Checkpoint> {
+        self.checkpoint
+            .as_ref()
+            .expect("managed reader generation must have a checkpoint")
+    }
+
+    fn invalidate(&self) {
+        self.operation_state
+            .fetch_or(GENERATION_INVALID, Ordering::AcqRel);
+    }
+
+    fn acquire(self: &Arc<Self>) -> Result<ReaderGenerationPermit, SlateDBError> {
+        self.enter_operation()?;
+        Ok(ReaderGenerationPermit {
+            generation: Arc::clone(self),
+        })
+    }
+
+    fn enter_operation(&self) -> Result<(), SlateDBError> {
+        let mut state = self.operation_state.load(Ordering::Acquire);
+        loop {
+            if state & GENERATION_INVALID != 0 {
+                let checkpoint_id = self
+                    .checkpoint()
+                    .expect("only checkpoint-backed generations can be invalidated")
+                    .id;
+                return Err(SlateDBError::CheckpointLeaseLost(checkpoint_id));
+            }
+            assert_ne!(
+                state & GENERATION_OPERATION_COUNT,
+                GENERATION_OPERATION_COUNT,
+                "reader generation in-flight operation count overflow"
+            );
+            match self.operation_state.compare_exchange_weak(
+                state,
+                state + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(current) => state = current,
+            }
+        }
+    }
+
+    fn exit_operation(&self) {
+        let previous = self.operation_state.fetch_sub(1, Ordering::AcqRel);
+        assert!(
+            previous & GENERATION_OPERATION_COUNT > 0,
+            "reader generation in-flight operation count underflow"
+        );
+        if previous & GENERATION_OPERATION_COUNT == 1 {
+            self.operation_drained.notify_waiters();
+        }
+    }
+
+    async fn drain(&self) {
+        loop {
+            let notified = self.operation_drained.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.operation_state.load(Ordering::Acquire) & GENERATION_OPERATION_COUNT == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl DbIteratorGuard for ReaderGeneration {
+    fn enter(&self) -> Result<(), SlateDBError> {
+        self.enter_operation()
+    }
+
+    fn exit(&self) {
+        self.exit_operation();
+    }
+}
+
+/// Persistent newest-first collection of WAL-replayed immutable memtables.
+///
+/// A new replay poll only prepends newly decoded tables and shares the
+/// existing tail with snapshots and in-flight reads. This makes applying a WAL
+/// delta proportional to the delta rather than to the complete replay history.
+#[derive(Clone, Default)]
+struct ReplayMemtables {
+    head: Option<Arc<ReplayMemtableNode>>,
+    len: usize,
+}
+
+struct ReplayMemtableNode {
+    table: Arc<ImmutableMemtable>,
+    older: Option<Arc<ReplayMemtableNode>>,
+}
+
+type ReplayPublisher<'a> = &'a mut (dyn FnMut(&ReplayMemtables, u64, u64) + Send);
+
+impl ReaderState {
+    pub(crate) fn applied_seq(&self) -> u64 {
+        self.last_remote_persisted_seq
+    }
+}
+
+impl ReplayMemtables {
+    fn prepend(&mut self, table: Arc<ImmutableMemtable>) {
+        self.head = Some(Arc::new(ReplayMemtableNode {
+            table,
+            older: self.head.take(),
+        }));
+        self.len += 1;
+    }
+
+    fn front(&self) -> Option<&Arc<ImmutableMemtable>> {
+        self.head.as_ref().map(|node| &node.table)
+    }
+
+    fn iter(&self) -> ReplayMemtablesIter<'_> {
+        ReplayMemtablesIter {
+            next: self.head.as_deref(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl FromIterator<Arc<ImmutableMemtable>> for ReplayMemtables {
+    fn from_iter<T: IntoIterator<Item = Arc<ImmutableMemtable>>>(iter: T) -> Self {
+        let tables = iter.into_iter().collect::<Vec<_>>();
+        let mut result = Self::default();
+        for table in tables.into_iter().rev() {
+            result.prepend(table);
+        }
+        result
+    }
+}
+
+struct ReplayMemtablesIter<'a> {
+    next: Option<&'a ReplayMemtableNode>,
+}
+
+impl Iterator for ReplayMemtablesIter<'_> {
+    type Item = Arc<ImmutableMemtable>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let node = self.next?;
+        self.next = node.older.as_deref();
+        Some(Arc::clone(&node.table))
+    }
 }
 
 static EMPTY_TABLE: LazyLock<Arc<KVTable>> = LazyLock::new(|| Arc::new(KVTable::new()));
@@ -116,18 +320,21 @@ impl DbStateReader for ReaderState {
         Arc::clone(&EMPTY_TABLE)
     }
 
-    fn imm_memtable(&self) -> &VecDeque<Arc<ImmutableMemtable>> {
-        &self.imm_memtable
+    fn imm_memtables(&self) -> Box<dyn Iterator<Item = Arc<ImmutableMemtable>> + '_> {
+        Box::new(self.imm_memtable.iter())
     }
 
     fn core(&self) -> &ManifestCore {
-        &self.manifest.core
+        &self.generation.manifest.core
     }
 }
 
 impl From<&ReaderState> for VersionedManifest {
     fn from(state: &ReaderState) -> Self {
-        Self::from_manifest(state.manifest_id, state.manifest.clone())
+        Self::from_manifest(
+            state.generation.manifest_id,
+            state.generation.manifest.clone(),
+        )
     }
 }
 
@@ -156,16 +363,19 @@ impl DbReaderInner {
         };
         let replay_new_wals =
             !matches!(mode, DbReaderMode::Checkpoint(_)) && !options.skip_wal_replay;
+        let db_stats = DbStats::new(&recorder);
         let initial_state = Arc::new(
             Self::build_reader_state(
                 checkpoint,
                 manifest_id,
                 initial_manifest,
-                VecDeque::new(),
+                ReplayMemtables::default(),
                 replay_new_wals,
                 Arc::clone(&table_store),
                 &options,
                 segment_extractor.as_ref(),
+                None,
+                &db_stats,
             )
             .await?,
         );
@@ -190,12 +400,10 @@ impl DbReaderInner {
             status_manager.clone(),
         ));
 
-        let db_stats = DbStats::new(&recorder);
-
         let state = RwLock::new(initial_state);
         let reader = Reader::new(
             Arc::clone(&table_store),
-            db_stats,
+            db_stats.clone(),
             Arc::clone(&mono_clock),
             oracle.clone(),
             merge_operator,
@@ -210,6 +418,7 @@ impl DbReaderInner {
             system_clock,
             oracle,
             reader,
+            db_stats,
             status_manager,
             segment_extractor,
             rand,
@@ -265,8 +474,23 @@ impl DbReaderInner {
     ) -> Result<Option<KeyValue>, SlateDBError> {
         self.check_closed()?;
         let db_state = Arc::clone(&self.state.read());
+        let _permit = db_state.generation.acquire()?;
         self.reader
             .get_key_value_with_options(key, options, db_state.as_ref(), None, None)
+            .await
+    }
+
+    pub(crate) async fn snapshot_get_key_value_with_options<K: AsRef<[u8]> + Send>(
+        &self,
+        state: Arc<ReaderState>,
+        max_seq: u64,
+        key: K,
+        options: &ReadOptions,
+    ) -> Result<Option<KeyValue>, SlateDBError> {
+        self.check_closed()?;
+        let _permit = state.generation.acquire()?;
+        self.reader
+            .get_key_value_with_options(key, options, state.as_ref(), None, Some(max_seq))
             .await
     }
 
@@ -278,7 +502,9 @@ impl DbReaderInner {
     ) -> Result<DbIterator, SlateDBError> {
         self.check_closed()?;
         let db_state = Arc::clone(&self.state.read());
-        self.reader
+        let _permit = db_state.generation.acquire()?;
+        let iter = self
+            .reader
             .scan_with_options(
                 range,
                 options,
@@ -289,7 +515,34 @@ impl DbReaderInner {
                     prefix,
                 },
             )
-            .await
+            .await?;
+        Ok(iter.with_iteration_guard(Arc::clone(&db_state.generation)))
+    }
+
+    pub(crate) async fn snapshot_scan_with_options(
+        &self,
+        state: Arc<ReaderState>,
+        max_seq: u64,
+        range: BytesRange,
+        options: &ScanOptions,
+        prefix: Option<Bytes>,
+    ) -> Result<DbIterator, SlateDBError> {
+        self.check_closed()?;
+        let _permit = state.generation.acquire()?;
+        let iter = self
+            .reader
+            .scan_with_options(
+                range,
+                options,
+                ScanContext {
+                    db_state: state.as_ref(),
+                    write_batch_iter: None,
+                    max_seq: Some(max_seq),
+                    prefix,
+                },
+            )
+            .await?;
+        Ok(iter.with_iteration_guard(Arc::clone(&state.generation)))
     }
 
     fn should_reestablish_checkpoint(&self, latest: &ManifestCore) -> bool {
@@ -306,24 +559,17 @@ impl DbReaderInner {
             || latest.segments != current_state.segments
     }
 
-    async fn replace_checkpoint(
+    async fn create_checkpoint(
         &self,
         stored_manifest: &mut StoredManifest,
     ) -> Result<Checkpoint, SlateDBError> {
-        let current_checkpoint_id = self
-            .state
-            .read()
-            .checkpoint
-            .as_ref()
-            .expect("managed reader must have a checkpoint")
-            .id;
         let options = CheckpointOptions {
             lifetime: Some(self.options.checkpoint_lifetime),
             ..CheckpointOptions::default()
         };
         let new_checkpoint_id = self.rand.rng().gen_uuid();
         stored_manifest
-            .replace_checkpoint(current_checkpoint_id, new_checkpoint_id, &options)
+            .write_checkpoint(new_checkpoint_id, &options)
             .await
     }
 
@@ -349,39 +595,42 @@ impl DbReaderInner {
         if self.options.skip_wal_replay {
             return Ok(());
         }
-        let last_replayed_wal_id = self.state.read().last_wal_id;
-        let last_seen_wal_id = self
-            .table_store
-            .last_seen_wal_id(last_replayed_wal_id)
-            .await?;
-        if last_seen_wal_id > last_replayed_wal_id {
-            let current_state = Arc::clone(&self.state.read());
-            let mut imm_memtable = current_state.imm_memtable().clone();
+        let current_state = Arc::clone(&self.state.read());
+        let mut imm_memtable = current_state.imm_memtable.clone();
+        let generation = Arc::clone(&current_state.generation);
+        let mut publish =
+            |imm_memtable: &ReplayMemtables, last_wal_id: u64, last_committed_seq: u64| {
+                self.oracle.advance_durable_seq(last_committed_seq);
+                self.db_stats
+                    .reader_replay_memtables
+                    .set(imm_memtable.len() as i64);
+                let mut write_guard = self.state.write();
+                *write_guard = Arc::new(ReaderState {
+                    generation: Arc::clone(&generation),
+                    imm_memtable: imm_memtable.clone(),
+                    last_wal_id,
+                    last_remote_persisted_seq: last_committed_seq,
+                });
+                drop(write_guard);
+                self.status_manager
+                    .report_memtable_segments(collect_touched_segments(self.state.read().as_ref()));
+            };
 
-            let (last_wal_id, last_committed_seq) = Self::replay_wal_into(
-                Arc::clone(&self.table_store),
-                &self.options,
-                current_state.core(),
-                &mut imm_memtable,
-                true,
-                self.segment_extractor.as_ref(),
-            )
-            .await?;
-
-            self.oracle.advance_durable_seq(last_committed_seq);
-            let mut write_guard = self.state.write();
-            *write_guard = Arc::new(ReaderState {
-                manifest_id: current_state.manifest_id,
-                checkpoint: current_state.checkpoint.clone(),
-                manifest: current_state.manifest.clone(),
-                imm_memtable,
-                last_wal_id,
-                last_remote_persisted_seq: last_committed_seq,
-            });
-            drop(write_guard);
-            self.status_manager
-                .report_memtable_segments(collect_touched_segments(self.state.read().as_ref()));
-        }
+        Self::replay_wal_into(
+            Arc::clone(&self.table_store),
+            &self.options,
+            current_state.core(),
+            &mut imm_memtable,
+            Some((
+                current_state.last_wal_id,
+                current_state.last_remote_persisted_seq,
+            )),
+            true,
+            self.segment_extractor.as_ref(),
+            Some(&mut publish),
+            Some(&self.db_stats),
+        )
+        .await?;
         Ok(())
     }
 
@@ -402,7 +651,13 @@ impl DbReaderInner {
         manifest: Manifest,
     ) -> Result<ReaderState, SlateDBError> {
         let prior = self.state.read().clone();
-        let mut imm_memtable = VecDeque::new();
+        let replay_cursor = Some((
+            prior.last_wal_id.max(manifest.core.replay_after_wal_id),
+            prior
+                .last_remote_persisted_seq
+                .max(manifest.core.last_l0_seq),
+        ));
+        let mut retained_memtables = Vec::new();
 
         for table in prior.imm_memtable.iter() {
             let table_meta = table.table().metadata();
@@ -411,7 +666,7 @@ impl DbReaderInner {
                 continue;
             } else if table_meta.first_seq > manifest.core.last_l0_seq {
                 // Keep the entire table since all rows are newer than L0+.
-                imm_memtable.push_back(Arc::clone(table));
+                retained_memtables.push(table);
             } else {
                 // The table has some rows that are newer than L0+ and some that are older. This
                 // happens when the table spans multiple WAL files. Some of those WAL files can
@@ -424,10 +679,11 @@ impl DbReaderInner {
                 )?;
                 // Push to the back because we are iterating prior from newest to oldest, and we
                 // want the imm memtables in checkpoint state to be ordered the same way.
-                imm_memtable.push_back(Arc::new(filtered_table));
+                retained_memtables.push(Arc::new(filtered_table));
             }
         }
 
+        let imm_memtable = retained_memtables.into_iter().collect();
         Self::build_reader_state(
             checkpoint,
             manifest_id,
@@ -437,6 +693,8 @@ impl DbReaderInner {
             Arc::clone(&self.table_store),
             &self.options,
             self.segment_extractor.as_ref(),
+            replay_cursor,
+            &self.db_stats,
         )
         .await
     }
@@ -445,26 +703,33 @@ impl DbReaderInner {
         checkpoint: Option<Checkpoint>,
         manifest_id: u64,
         manifest: Manifest,
-        mut imm_memtable: VecDeque<Arc<ImmutableMemtable>>,
+        mut imm_memtable: ReplayMemtables,
         replay_new_wals: bool,
         table_store: Arc<TableStore>,
         options: &DbReaderOptions,
         segment_extractor: Option<&Arc<dyn PrefixExtractor>>,
+        replay_cursor: Option<(u64, u64)>,
+        db_stats: &DbStats,
     ) -> Result<ReaderState, SlateDBError> {
         let (last_wal_id, last_committed_seq) = Self::replay_wal_into(
             Arc::clone(&table_store),
             options,
             &manifest.core,
             &mut imm_memtable,
+            replay_cursor,
             replay_new_wals,
             segment_extractor,
+            None,
+            Some(db_stats),
         )
         .await?;
 
+        db_stats
+            .reader_replay_memtables
+            .set(imm_memtable.len() as i64);
+
         Ok(ReaderState {
-            manifest_id,
-            checkpoint,
-            manifest,
+            generation: ReaderGeneration::new(manifest_id, checkpoint, manifest),
             imm_memtable,
             last_wal_id,
             last_remote_persisted_seq: last_committed_seq,
@@ -481,7 +746,7 @@ impl DbReaderInner {
         latest_manifest: VersionedManifest,
     ) -> Result<(), SlateDBError> {
         let manifest_id = latest_manifest.id;
-        if manifest_id <= self.state.read().manifest_id {
+        if manifest_id <= self.state.read().generation.manifest_id {
             return self.maybe_replay_new_wals().await;
         }
 
@@ -493,15 +758,14 @@ impl DbReaderInner {
         Ok(())
     }
 
+    #[cfg(test)]
     async fn maybe_refresh_checkpoint(
         &self,
         stored_manifest: &mut StoredManifest,
     ) -> Result<(), SlateDBError> {
-        let checkpoint = self
-            .state
-            .read()
-            .checkpoint
-            .clone()
+        let generation = Arc::clone(&self.state.read().generation);
+        let checkpoint = generation
+            .checkpoint()
             .expect("managed reader must have a checkpoint");
         let half_lifetime = self
             .options
@@ -524,7 +788,7 @@ impl DbReaderInner {
                     // GC reaped it. Re-establish a fresh checkpoint against the latest
                     // manifest instead of failing the reader permanently.
                     warn!("reader checkpoint missing, re-establishing [checkpoint_id={id}]");
-                    let checkpoint = self.replace_checkpoint(stored_manifest).await?;
+                    let checkpoint = self.create_checkpoint(stored_manifest).await?;
                     self.reestablish_checkpoint(checkpoint).await?;
                     return Ok(());
                 }
@@ -534,20 +798,11 @@ impl DbReaderInner {
             // Update our local checkpoint copy so we know the latest expiration time
             // and can calculate future refresh deadlines correctly.
             {
-                let mut write_guard = self.state.write();
-                let current_state = write_guard.as_ref();
-                // Defensively, only update checkpoint if the id and expiry still match.
-                if current_state
-                    .checkpoint
-                    .as_ref()
-                    .is_some_and(|current_checkpoint| {
-                        current_checkpoint.id == checkpoint.id
-                            && current_checkpoint.expire_time == checkpoint.expire_time
-                    })
+                let mut current_checkpoint = generation.managed_checkpoint().write();
+                if current_checkpoint.id == checkpoint.id
+                    && current_checkpoint.expire_time == checkpoint.expire_time
                 {
-                    let mut updated_state = current_state.clone();
-                    updated_state.checkpoint = Some(refreshed_checkpoint.clone());
-                    *write_guard = Arc::new(updated_state);
+                    *current_checkpoint = refreshed_checkpoint.clone();
                 }
             }
 
@@ -563,9 +818,7 @@ impl DbReaderInner {
         self: &Arc<Self>,
         task_executor: &MessageHandlerExecutor,
     ) -> Result<(), SlateDBError> {
-        let poller = ManifestPoller {
-            inner: Arc::clone(self),
-        };
+        let poller = ManifestPoller::new(Arc::clone(self));
         let (_tx, rx) = async_channel::unbounded();
         let result = task_executor.add_handler(
             DB_READER_TASK_NAME.to_string(),
@@ -581,9 +834,12 @@ impl DbReaderInner {
         table_store: Arc<TableStore>,
         reader_options: &DbReaderOptions,
         core: &ManifestCore,
-        into_tables: &mut VecDeque<Arc<ImmutableMemtable>>,
+        into_tables: &mut ReplayMemtables,
+        replay_cursor: Option<(u64, u64)>,
         replay_new_wals: bool,
         segment_extractor: Option<&Arc<dyn PrefixExtractor>>,
+        mut publish: Option<ReplayPublisher<'_>>,
+        db_stats: Option<&DbStats>,
     ) -> Result<(u64, u64), SlateDBError> {
         let sst_iter_options = SstIteratorOptions {
             max_fetch_tasks: 1,
@@ -597,14 +853,16 @@ impl DbReaderInner {
         };
 
         let (mut replay_after_wal_id, mut last_committed_seq) =
-            if let Some(latest_replayed_table) = into_tables.front() {
-                (
-                    latest_replayed_table.recent_flushed_wal_id(),
-                    latest_replayed_table.table().last_seq().unwrap_or(0),
-                )
-            } else {
-                (core.replay_after_wal_id, core.last_l0_seq)
-            };
+            replay_cursor.unwrap_or_else(|| {
+                if let Some(latest_replayed_table) = into_tables.front() {
+                    (
+                        latest_replayed_table.recent_flushed_wal_id(),
+                        latest_replayed_table.table().last_seq().unwrap_or(0),
+                    )
+                } else {
+                    (core.replay_after_wal_id, core.last_l0_seq)
+                }
+            });
         let wal_id_end = if replay_new_wals {
             table_store.last_seen_wal_id(replay_after_wal_id).await? + 1
         } else {
@@ -634,7 +892,16 @@ impl DbReaderInner {
             Err(err) => return Err(err),
         } {
             assert!(replayed_table.last_wal_id > replay_after_wal_id);
+            let replayed_ssts = replayed_table.last_wal_id - replay_after_wal_id;
             replay_after_wal_id = replayed_table.last_wal_id;
+            if let Some(db_stats) = db_stats {
+                let metadata = replayed_table.table.metadata();
+                db_stats.reader_wal_replay_ssts.increment(replayed_ssts);
+                db_stats
+                    .reader_wal_replay_bytes
+                    .increment(metadata.entries_size_in_bytes as u64);
+                db_stats.reader_wal_replay_batches.increment(1);
+            }
             if !replayed_table.table.is_empty() && replayed_table.last_seq > last_committed_seq {
                 let first_seq = replayed_table
                     .table
@@ -653,7 +920,10 @@ impl DbReaderInner {
                 }
                 let imm_memtable =
                     ImmutableMemtable::new(replayed_table.table, replayed_table.last_wal_id);
-                into_tables.push_front(Arc::new(imm_memtable));
+                into_tables.prepend(Arc::new(imm_memtable));
+            }
+            if let Some(publish) = publish.as_mut() {
+                publish(into_tables, replay_after_wal_id, last_committed_seq);
             }
         }
 
@@ -708,6 +978,149 @@ impl DbReaderInner {
 
 struct ManifestPoller {
     inner: Arc<DbReaderInner>,
+    generations: HashMap<Uuid, Weak<ReaderGeneration>>,
+}
+
+impl ManifestPoller {
+    fn new(inner: Arc<DbReaderInner>) -> Self {
+        let mut generations = HashMap::new();
+        if inner.mode == DbReaderMode::ManagedCheckpoint {
+            let generation = Arc::clone(&inner.state.read().generation);
+            let checkpoint_id = generation
+                .checkpoint()
+                .expect("managed reader must have a checkpoint")
+                .id;
+            generations.insert(checkpoint_id, Arc::downgrade(&generation));
+        }
+        let poller = Self {
+            inner,
+            generations,
+        };
+        poller.report_active_checkpoints();
+        poller
+    }
+
+    fn report_active_checkpoints(&self) {
+        self.inner
+            .db_stats
+            .reader_active_checkpoints
+            .set(self.generations.len() as i64);
+    }
+
+    fn register_current_generation(&mut self) {
+        let generation = Arc::clone(&self.inner.state.read().generation);
+        let checkpoint_id = generation
+            .checkpoint()
+            .expect("managed reader must have a checkpoint")
+            .id;
+        self.generations
+            .insert(checkpoint_id, Arc::downgrade(&generation));
+        self.report_active_checkpoints();
+    }
+
+    async fn delete_released_checkpoints(
+        &mut self,
+        manifest: &mut StoredManifest,
+    ) -> Result<(), SlateDBError> {
+        let released = self
+            .generations
+            .iter()
+            .filter_map(|(id, generation)| generation.upgrade().is_none().then_some(*id))
+            .collect::<Vec<_>>();
+        if released.is_empty() {
+            return Ok(());
+        }
+        manifest.delete_checkpoints(&released).await?;
+        for id in released {
+            self.generations.remove(&id);
+        }
+        self.report_active_checkpoints();
+        Ok(())
+    }
+
+    async fn refresh_live_checkpoints(
+        &mut self,
+        manifest: &mut StoredManifest,
+    ) -> Result<(), SlateDBError> {
+        let half_lifetime = self
+            .inner
+            .options
+            .checkpoint_lifetime
+            .checked_div(2)
+            .expect("checkpoint lifetime division failed");
+        loop {
+            let live = self
+                .generations
+                .iter()
+                .filter_map(|(id, generation)| {
+                    generation.upgrade().map(|generation| (*id, generation))
+                })
+                .collect::<Vec<_>>();
+            let now = self.inner.system_clock.now();
+            let refresh_due = live.iter().any(|(_, generation)| {
+                generation
+                    .checkpoint()
+                    .expect("managed reader generation must have a checkpoint")
+                    .expire_time
+                    .is_some_and(|expiry| now > expiry.sub(half_lifetime))
+            });
+            if !refresh_due {
+                return Ok(());
+            }
+
+            let ids = live.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+            match manifest
+                .refresh_checkpoints(&ids, self.inner.options.checkpoint_lifetime)
+                .await
+            {
+                Ok(refreshed) => {
+                    for checkpoint in refreshed {
+                        if let Some(generation) =
+                            self.generations.get(&checkpoint.id).and_then(Weak::upgrade)
+                        {
+                            *generation.managed_checkpoint().write() = checkpoint;
+                        }
+                    }
+                    return Ok(());
+                }
+                Err(SlateDBError::CheckpointMissing(id)) => {
+                    warn!("reader checkpoint lease lost [checkpoint_id={id}]");
+                    if let Some(generation) = self.generations.remove(&id).and_then(|g| g.upgrade())
+                    {
+                        generation.invalidate();
+                        generation.drain().await;
+                    }
+                    self.report_active_checkpoints();
+
+                    let current_id = self
+                        .inner
+                        .state
+                        .read()
+                        .generation
+                        .checkpoint()
+                        .expect("managed reader must have a checkpoint")
+                        .id;
+                    if current_id == id {
+                        let checkpoint = self.inner.create_checkpoint(manifest).await?;
+                        self.inner.reestablish_checkpoint(checkpoint).await?;
+                        self.register_current_generation();
+                    }
+                    // Other live generations may be due at the same time. Retry
+                    // the batch immediately after removing the missing lease so
+                    // one lost checkpoint cannot make their refresh a poll late.
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+}
+
+impl Drop for ManifestPoller {
+    fn drop(&mut self) {
+        // The gauge tracks only GC checkpoints actively managed by this
+        // poller. Reset it even if startup, cleanup, or the poller task fails.
+        self.inner.db_stats.reader_active_checkpoints.set(0);
+    }
 }
 
 #[async_trait]
@@ -728,24 +1141,30 @@ impl MessageHandler<DbReaderMessage> for ManifestPoller {
                     self.inner.system_clock.clone(),
                 )
                 .await?;
+                self.delete_released_checkpoints(&mut manifest).await?;
 
                 let latest_manifest = manifest.manifest();
                 if self
                     .inner
                     .should_reestablish_checkpoint(&latest_manifest.core)
                 {
-                    let checkpoint = self.inner.replace_checkpoint(&mut manifest).await?;
+                    let checkpoint = self.inner.create_checkpoint(&mut manifest).await?;
                     self.inner.reestablish_checkpoint(checkpoint).await?;
+                    self.register_current_generation();
                 } else {
                     self.inner.maybe_replay_new_wals().await?;
                 }
 
-                self.inner.maybe_refresh_checkpoint(&mut manifest).await
+                self.refresh_live_checkpoints(&mut manifest).await?;
+                self.inner.db_stats.reader_manifest_polls.increment(1);
+                Ok(())
             }
             DbReaderMode::FollowLatest => {
                 let result = self.inner.refresh_latest_manifest().await;
                 if let Err(error) = result {
                     warn!("failed to refresh reader to latest manifest [error={error:?}]");
+                } else {
+                    self.inner.db_stats.reader_manifest_polls.increment(1);
                 }
                 Ok(())
             }
@@ -767,19 +1186,29 @@ impl MessageHandler<DbReaderMessage> for ManifestPoller {
             self.inner.system_clock.clone(),
         )
         .await?;
-        let checkpoint_id = self
-            .inner
-            .state
-            .read()
-            .checkpoint
-            .as_ref()
-            .expect("managed reader must have a checkpoint")
-            .id;
-        info!(
-            "deleting reader established checkpoint for shutdown [checkpoint_id={}]",
-            checkpoint_id
-        );
-        manifest.delete_checkpoint(checkpoint_id).await?;
+        let checkpoint_ids = self.generations.keys().copied().collect::<Vec<_>>();
+        if !checkpoint_ids.is_empty() {
+            let live_generations = self
+                .generations
+                .values()
+                .filter_map(Weak::upgrade)
+                .collect::<Vec<_>>();
+            // Invalidate every generation before waiting on any one of them,
+            // otherwise operations could continue entering a later gate while
+            // shutdown is draining an earlier one.
+            for generation in &live_generations {
+                generation.invalidate();
+            }
+            for generation in live_generations {
+                generation.drain().await;
+            }
+            info!(
+                "deleting reader established checkpoints for shutdown [checkpoint_ids={:?}]",
+                checkpoint_ids
+            );
+            manifest.delete_checkpoints(&checkpoint_ids).await?;
+        }
+        self.inner.db_stats.reader_active_checkpoints.set(0);
         Ok(())
     }
 }
@@ -814,11 +1243,11 @@ impl DbReader {
         path: object_store::path::Path,
     ) -> Result<(), SlateDBError> {
         let state = Arc::clone(&self.inner.state.read());
-        let external_ssts = state.manifest.external_ssts();
+        let external_ssts = state.generation.manifest.external_ssts();
         let path_resolver = PathResolver::new_with_external_ssts(path, external_ssts);
         let cache_opts = &self.inner.options.object_store_cache_options;
         crate::utils::preload_cache_from_manifest(
-            &state.manifest.core,
+            &state.generation.manifest.core,
             cached_obj_store,
             &path_resolver,
             cache_opts.preload_disk_cache_on_startup,
@@ -828,9 +1257,10 @@ impl DbReader {
     }
 
     /// Creates a database reader that can read the contents of a database (but cannot write any
-    /// data). [`DbReaderMode`] controls whether the reader manages a checkpoint, remains pinned to
-    /// a supplied checkpoint, or follows the latest manifest without garbage-collection
-    /// protection.
+    /// user data). [`DbReaderMode`] controls whether the reader manages GC checkpoints, remains
+    /// pinned to a supplied checkpoint, or follows the latest manifest without GC protection.
+    /// Managed readers retain each generation's checkpoint until all snapshots, iterators, and
+    /// in-flight reads using that generation are gone.
     pub async fn open<P: Into<Path>>(
         path: P,
         object_store: Arc<dyn ObjectStore>,
@@ -843,6 +1273,44 @@ impl DbReader {
             .with_reader_mode(mode)
             .build()
             .await
+    }
+
+    /// Captures the reader's latest fully applied state as a read-only
+    /// snapshot-isolation transaction.
+    ///
+    /// This is an O(1) local operation: WAL discovery and replay remain the
+    /// responsibility of the long-lived reader poller. Creating a snapshot
+    /// never performs object-store I/O or forces a flush. Snapshots created
+    /// from the same manifest generation share one GC checkpoint.
+    pub async fn snapshot(&self) -> Result<Arc<DbSnapshot>, crate::Error> {
+        if self.inner.mode == DbReaderMode::FollowLatest {
+            return Err(SlateDBError::DbReaderSnapshotUnsupportedInFollowLatest.into());
+        }
+        loop {
+            self.inner.check_closed()?;
+            let state = Arc::clone(&self.inner.state.read());
+            match state.generation.acquire() {
+                Ok(_permit) => {
+                    // Keep the generation gate held until the snapshot has
+                    // captured the state. Lease-loss recovery cannot
+                    // invalidate this generation between validation and
+                    // construction.
+                    return Ok(DbSnapshot::new_reader(Arc::clone(&self.inner), state));
+                }
+                Err(err @ SlateDBError::CheckpointLeaseLost(_)) => {
+                    // Recovery may have replaced the invalid generation while
+                    // we were waiting for its gate. Retry only in that case;
+                    // otherwise report the lease loss instead of returning a
+                    // snapshot whose every read is guaranteed to fail.
+                    let current = Arc::clone(&self.inner.state.read());
+                    if !Arc::ptr_eq(&state, &current) {
+                        continue;
+                    }
+                    return Err(err.into());
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
     }
 
     /// Creates a new builder for a database reader at the given path.
@@ -1260,6 +1728,11 @@ impl DbReader {
     /// ```
     ///
     pub async fn close(&self) -> Result<(), crate::Error> {
+        // Fixed-checkpoint readers do not have a manifest poller to publish
+        // their clean shutdown, so close the shared status explicitly for
+        // both reader modes before shutting down any managed task.
+        self.inner.status_manager.write_result(Ok(()));
+
         self.task_executor
             .shutdown_task(DB_READER_TASK_NAME)
             .await
@@ -1386,13 +1859,17 @@ fn has_not_found_object_store_error(err: &(dyn std::error::Error + 'static)) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{DbReaderMessage, ManifestPoller, ReaderState};
+    use super::{
+        DbReaderMessage, ManifestPoller, ReaderGeneration, ReaderState, ReplayMemtables,
+    };
     use crate::block_cache_policy::BlockCachePolicy;
     use crate::clock::MonotonicClock;
     use crate::config::{
         CheckpointOptions, CheckpointScope, FlushOptions, FlushType, MergeOptions, PutOptions,
         Settings, WriteOptions,
     };
+    use crate::db_cache::test_utils::TestCache;
+    use crate::db_cache::DbCache;
     use crate::db_reader::{DbReader, DbReaderInner, DbReaderMode, DbReaderOptions};
     use crate::db_state::SsTableId;
     use crate::db_stats::DbStats;
@@ -1426,6 +1903,28 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use uuid::Uuid;
+
+    async fn wait_for_reader_generation_change(reader: &DbReader, previous: Uuid) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if reader
+                    .inner
+                    .state
+                    .read()
+                    .generation
+                    .checkpoint()
+                    .unwrap()
+                    .id
+                    != previous
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("reader did not install a new manifest generation");
+    }
 
     #[tokio::test]
     async fn should_get_value_from_db() {
@@ -1821,9 +2320,17 @@ mod tests {
         assert!(latest_manifest.id > initial_manifest_id);
         assert!(latest_manifest.manifest.core.checkpoints.is_empty());
 
-        let mut poller = ManifestPoller {
-            inner: Arc::clone(&reader.inner),
+        let snapshot_error = match reader.snapshot().await {
+            Ok(_) => panic!("FollowLatest must not create an unprotected snapshot"),
+            Err(error) => error,
         };
+        assert_eq!(snapshot_error.kind(), crate::ErrorKind::Invalid);
+        assert!(snapshot_error
+            .to_string()
+            .contains("snapshots are unsupported in FollowLatest mode"));
+        assert!(recording_store.write_kinds().is_empty());
+
+        let mut poller = ManifestPoller::new(Arc::clone(&reader.inner));
         poller.handle(DbReaderMessage::PollManifest).await.unwrap();
 
         assert!(reader.manifest().id() >= latest_manifest.id);
@@ -1893,9 +2400,7 @@ mod tests {
             saved_manifests.push((location, bytes));
         }
 
-        let mut poller = ManifestPoller {
-            inner: Arc::clone(&reader.inner),
-        };
+        let mut poller = ManifestPoller::new(Arc::clone(&reader.inner));
         poller.handle(DbReaderMessage::PollManifest).await.unwrap();
 
         assert_eq!(reader.manifest().id(), manifest_id);
@@ -2169,7 +2674,13 @@ mod tests {
         )
         .await
         .unwrap();
-        let reader_checkpoint_id = inner.state.read().checkpoint.as_ref().unwrap().id;
+        let reader_checkpoint_id = inner
+            .state
+            .read()
+            .generation
+            .checkpoint()
+            .unwrap()
+            .id;
 
         // Simulate the writer's GC reaping the expired checkpoint.
         let mut stored_manifest = StoredManifest::load(Arc::clone(&manifest_store), clock.clone())
@@ -2191,7 +2702,13 @@ mod tests {
             .unwrap();
 
         // The reader should have replaced the reaped checkpoint with a new one.
-        let new_checkpoint_id = inner.state.read().checkpoint.as_ref().unwrap().id;
+        let new_checkpoint_id = inner
+            .state
+            .read()
+            .generation
+            .checkpoint()
+            .unwrap()
+            .id;
         assert_ne!(reader_checkpoint_id, new_checkpoint_id);
         let latest_manifest = manifest_store.read_latest_manifest().await.unwrap();
         let checkpoints = &latest_manifest.manifest.core.checkpoints;
@@ -2229,6 +2746,553 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reader_snapshot_should_remain_stable_while_wal_replay_advances() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_db_reader_snapshot_wal_isolation");
+        let test_provider = TestProvider::new(path, Arc::clone(&object_store));
+        let db = test_provider
+            .new_db(Settings {
+                flush_interval: None,
+                compactor_options: None,
+                garbage_collector_options: None,
+                ..Settings::default()
+            })
+            .await
+            .unwrap();
+
+        let write_options = WriteOptions {
+            await_durable: false,
+            ..WriteOptions::default()
+        };
+        db.put_with_options(b"key", b"v1", &PutOptions::default(), &write_options)
+            .await
+            .unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::Wal,
+        })
+        .await
+        .unwrap();
+
+        let reader = test_provider
+            .new_db_reader(
+                DbReaderOptions {
+                    manifest_poll_interval: Duration::from_millis(10),
+                    ..DbReaderOptions::default()
+                },
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let snapshot = reader.snapshot().await.unwrap();
+
+        db.put_with_options(b"key", b"v2", &PutOptions::default(), &write_options)
+            .await
+            .unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::Wal,
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert_eq!(reader.get(b"key").await.unwrap(), Some(Bytes::from("v2")));
+        assert_eq!(snapshot.get(b"key").await.unwrap(), Some(Bytes::from("v1")));
+        assert_eq!(
+            reader.snapshot().await.unwrap().get(b"key").await.unwrap(),
+            Some(Bytes::from("v2"))
+        );
+    }
+
+    #[tokio::test]
+    async fn reader_snapshot_isolation_should_survive_db_cache_hits_and_eviction() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_db_reader_snapshot_db_cache_isolation");
+        let db = Db::builder(path.clone(), Arc::clone(&object_store))
+            .with_settings(Settings {
+                flush_interval: None,
+                compactor_options: None,
+                garbage_collector_options: None,
+                ..Settings::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        let write_options = WriteOptions {
+            await_durable: false,
+            ..WriteOptions::default()
+        };
+        db.put_with_options(b"key", b"v1", &PutOptions::default(), &write_options)
+            .await
+            .unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+
+        let cache = Arc::new(TestCache::new());
+        let reader = DbReader::builder(path, Arc::clone(&object_store))
+            .with_options(DbReaderOptions {
+                manifest_poll_interval: Duration::from_millis(10),
+                ..DbReaderOptions::default()
+            })
+            .with_db_cache(cache.clone())
+            .build()
+            .await
+            .unwrap();
+        let old_snapshot = reader.snapshot().await.unwrap();
+        let old_generation = reader
+            .inner
+            .state
+            .read()
+            .generation
+            .checkpoint()
+            .unwrap()
+            .id;
+
+        assert_eq!(
+            old_snapshot.get(b"key").await.unwrap(),
+            Some(Bytes::from_static(b"v1"))
+        );
+        assert!(
+            cache.inserts() > 0,
+            "the cold read should populate the cache"
+        );
+        let hits_after_cold_read = cache.hits();
+        assert_eq!(
+            old_snapshot.get(b"key").await.unwrap(),
+            Some(Bytes::from_static(b"v1"))
+        );
+        assert!(
+            cache.hits() > hits_after_cold_read,
+            "the second old-generation read should hit the cache"
+        );
+
+        db.put_with_options(b"key", b"v2", &PutOptions::default(), &write_options)
+            .await
+            .unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+        wait_for_reader_generation_change(&reader, old_generation).await;
+
+        assert_eq!(reader.get(b"key").await.unwrap(), Some(Bytes::from("v2")));
+        let hits_before_old_generation_read = cache.hits();
+        assert_eq!(
+            old_snapshot.get(b"key").await.unwrap(),
+            Some(Bytes::from_static(b"v1"))
+        );
+        assert!(
+            cache.hits() > hits_before_old_generation_read,
+            "warming the new SST must not displace or alias the old SST's cache key"
+        );
+
+        cache.clear();
+        assert_eq!(cache.entry_count(), 0);
+        let misses_before_reload = cache.misses();
+        let inserts_before_reload = cache.inserts();
+        assert_eq!(
+            old_snapshot.get(b"key").await.unwrap(),
+            Some(Bytes::from_static(b"v1"))
+        );
+        assert!(cache.misses() > misses_before_reload);
+        assert!(
+            cache.inserts() > inserts_before_reload,
+            "an evicted old-generation block should reload from its checkpoint-pinned SST"
+        );
+        assert_eq!(
+            reader.snapshot().await.unwrap().get(b"key").await.unwrap(),
+            Some(Bytes::from_static(b"v2"))
+        );
+
+        drop(old_snapshot);
+        reader.close().await.unwrap();
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reader_snapshot_isolation_should_survive_warm_object_store_cache_hits() {
+        use crate::cached_object_store::stats::PART_HIT_COUNT;
+        use slatedb_common::metrics::{lookup_metric, DefaultMetricsRecorder};
+
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_db_reader_snapshot_object_cache_isolation");
+        let db = Db::builder(path.clone(), Arc::clone(&object_store))
+            .with_settings(Settings {
+                flush_interval: None,
+                compactor_options: None,
+                garbage_collector_options: None,
+                ..Settings::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        let write_options = WriteOptions {
+            await_durable: false,
+            ..WriteOptions::default()
+        };
+        db.put_with_options(b"key", b"v1", &PutOptions::default(), &write_options)
+            .await
+            .unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+
+        let cache_dir = tempfile::Builder::new()
+            .prefix("dbreader_snapshot_object_cache_")
+            .tempdir()
+            .unwrap();
+        let mut options = DbReaderOptions {
+            manifest_poll_interval: Duration::from_millis(10),
+            ..DbReaderOptions::default()
+        };
+        options.object_store_cache_options.root_folder = Some(cache_dir.path().to_path_buf());
+        options.object_store_cache_options.part_size_bytes = 1024;
+        options.object_store_cache_options.scan_interval = None;
+        let metrics = Arc::new(DefaultMetricsRecorder::new());
+        let reader = DbReader::builder(path, Arc::clone(&object_store))
+            .with_options(options)
+            // Force SST reads through the object-store cache instead of allowing
+            // the in-memory block cache to satisfy the second read first.
+            .with_db_cache_disabled()
+            .with_metrics_recorder(metrics.clone())
+            .build()
+            .await
+            .unwrap();
+        let old_snapshot = reader.snapshot().await.unwrap();
+        let old_generation = reader
+            .inner
+            .state
+            .read()
+            .generation
+            .checkpoint()
+            .unwrap()
+            .id;
+
+        assert_eq!(
+            old_snapshot.get(b"key").await.unwrap(),
+            Some(Bytes::from_static(b"v1"))
+        );
+        let hits_after_cold_read = lookup_metric(&metrics, PART_HIT_COUNT).unwrap_or(0);
+        assert_eq!(
+            old_snapshot.get(b"key").await.unwrap(),
+            Some(Bytes::from_static(b"v1"))
+        );
+        assert!(
+            lookup_metric(&metrics, PART_HIT_COUNT).unwrap_or(0) > hits_after_cold_read,
+            "the second read should be served from the local object-store cache"
+        );
+
+        db.put_with_options(b"key", b"v2", &PutOptions::default(), &write_options)
+            .await
+            .unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+        wait_for_reader_generation_change(&reader, old_generation).await;
+        assert_eq!(reader.get(b"key").await.unwrap(), Some(Bytes::from("v2")));
+
+        let hits_before_old_generation_read = lookup_metric(&metrics, PART_HIT_COUNT).unwrap_or(0);
+        assert_eq!(
+            old_snapshot.get(b"key").await.unwrap(),
+            Some(Bytes::from_static(b"v1"))
+        );
+        assert!(
+            lookup_metric(&metrics, PART_HIT_COUNT).unwrap_or(0) > hits_before_old_generation_read,
+            "the old snapshot should still use the cached bytes for its own immutable SST"
+        );
+
+        drop(old_snapshot);
+        reader.close().await.unwrap();
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reader_snapshot_creation_should_do_no_io_and_share_generation_checkpoint() {
+        let recording = Arc::new(test_utils::RecordingObjectStore::new(Arc::new(
+            InMemory::new(),
+        )));
+        let object_store: Arc<dyn ObjectStore> = recording.clone();
+        let path = Path::from("/tmp/test_db_reader_snapshot_no_io");
+        let test_provider = TestProvider::new(path, Arc::clone(&object_store));
+        let db = test_provider.new_db(Settings::default()).await.unwrap();
+        db.put(b"key", b"value").await.unwrap();
+        db.flush().await.unwrap();
+        let checkpoint = db
+            .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
+            .await
+            .unwrap();
+        let reader = test_provider
+            .new_db_reader(DbReaderOptions::default(), Some(checkpoint.id), None)
+            .await
+            .unwrap();
+        recording.clear();
+
+        let snapshots = futures::future::try_join_all((0..100).map(|_| reader.snapshot()))
+            .await
+            .unwrap();
+
+        assert_eq!(100, snapshots.len());
+        assert!(recording.get_kinds(false).is_empty());
+        assert!(recording.get_kinds(true).is_empty());
+        assert!(recording.write_kinds().is_empty());
+        let manifest = test_provider
+            .manifest_store()
+            .read_latest_manifest()
+            .await
+            .unwrap();
+        assert_eq!(1, manifest.manifest.core.checkpoints.len());
+    }
+
+    #[tokio::test]
+    async fn reader_snapshot_should_reject_an_invalid_current_generation() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_db_reader_snapshot_invalid_generation");
+        let test_provider = TestProvider::new(path, Arc::clone(&object_store));
+        let db = test_provider.new_db(Settings::default()).await.unwrap();
+        let checkpoint = db
+            .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
+            .await
+            .unwrap();
+        let reader = test_provider
+            .new_db_reader(DbReaderOptions::default(), Some(checkpoint.id), None)
+            .await
+            .unwrap();
+        reader.inner.state.read().generation.invalidate();
+
+        let result = reader.snapshot().await;
+
+        let err = match result {
+            Ok(_) => panic!("an invalid generation must not produce a snapshot"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("reader checkpoint lease lost"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_should_keep_old_generation_checkpoint_until_drop() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_db_reader_snapshot_checkpoint_retention");
+        let test_provider = TestProvider::new(path, Arc::clone(&object_store));
+        let db = test_provider
+            .new_db(Settings {
+                flush_interval: None,
+                compactor_options: None,
+                garbage_collector_options: None,
+                ..Settings::default()
+            })
+            .await
+            .unwrap();
+        let write_options = WriteOptions {
+            await_durable: false,
+            ..WriteOptions::default()
+        };
+        db.put_with_options(b"key", b"v1", &PutOptions::default(), &write_options)
+            .await
+            .unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+
+        let reader = test_provider
+            .new_db_reader(
+                DbReaderOptions {
+                    manifest_poll_interval: Duration::from_millis(10),
+                    ..DbReaderOptions::default()
+                },
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let snapshot = reader.snapshot().await.unwrap();
+        let old_checkpoint_id = reader
+            .inner
+            .state
+            .read()
+            .generation
+            .checkpoint()
+            .unwrap()
+            .id;
+
+        db.put_with_options(b"key", b"v2", &PutOptions::default(), &write_options)
+            .await
+            .unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let new_checkpoint_id = reader
+            .inner
+            .state
+            .read()
+            .generation
+            .checkpoint()
+            .unwrap()
+            .id;
+        assert_ne!(old_checkpoint_id, new_checkpoint_id);
+        let manifest = test_provider
+            .manifest_store()
+            .read_latest_manifest()
+            .await
+            .unwrap();
+        assert!(manifest
+            .manifest
+            .core
+            .find_checkpoint(old_checkpoint_id)
+            .is_some());
+        assert!(manifest
+            .manifest
+            .core
+            .find_checkpoint(new_checkpoint_id)
+            .is_some());
+        assert_eq!(snapshot.get(b"key").await.unwrap(), Some(Bytes::from("v1")));
+
+        drop(snapshot);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let manifest = test_provider
+            .manifest_store()
+            .read_latest_manifest()
+            .await
+            .unwrap();
+        assert!(manifest
+            .manifest
+            .core
+            .find_checkpoint(old_checkpoint_id)
+            .is_none());
+        assert!(manifest
+            .manifest
+            .core
+            .find_checkpoint(new_checkpoint_id)
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn snapshot_iterator_should_retain_checkpoint_after_snapshot_drop() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_db_reader_snapshot_iterator_retention");
+        let test_provider = TestProvider::new(path, Arc::clone(&object_store));
+        let db = test_provider
+            .new_db(Settings {
+                flush_interval: None,
+                compactor_options: None,
+                garbage_collector_options: None,
+                ..Settings::default()
+            })
+            .await
+            .unwrap();
+        let write_options = WriteOptions {
+            await_durable: false,
+            ..WriteOptions::default()
+        };
+        db.put_with_options(b"a", b"old", &PutOptions::default(), &write_options)
+            .await
+            .unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+
+        let reader = test_provider
+            .new_db_reader(
+                DbReaderOptions {
+                    manifest_poll_interval: Duration::from_millis(10),
+                    ..DbReaderOptions::default()
+                },
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let snapshot = reader.snapshot().await.unwrap();
+        let mut iter = snapshot.scan(..).await.unwrap();
+        let old_checkpoint_id = reader
+            .inner
+            .state
+            .read()
+            .generation
+            .checkpoint()
+            .unwrap()
+            .id;
+        drop(snapshot);
+
+        db.put_with_options(b"b", b"new", &PutOptions::default(), &write_options)
+            .await
+            .unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let manifest = test_provider
+            .manifest_store()
+            .read_latest_manifest()
+            .await
+            .unwrap();
+        assert!(manifest
+            .manifest
+            .core
+            .find_checkpoint(old_checkpoint_id)
+            .is_some());
+        let row = iter.next().await.unwrap().unwrap();
+        assert_eq!(row.key, Bytes::from("a"));
+        assert_eq!(row.value, Bytes::from("old"));
+        assert!(iter.next().await.unwrap().is_none());
+
+        drop(iter);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let manifest = test_provider
+            .manifest_store()
+            .read_latest_manifest()
+            .await
+            .unwrap();
+        assert!(manifest
+            .manifest
+            .core
+            .find_checkpoint(old_checkpoint_id)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn generation_drain_should_wait_for_in_flight_operations_and_reject_new_ones() {
+        let clock: Arc<dyn SystemClock> = Arc::new(DefaultSystemClock::new());
+        let generation = ReaderGeneration::new(
+            1,
+            Some(test_checkpoint(1, clock)),
+            Manifest::initial(ManifestCore::new()),
+        );
+        let permit = generation.acquire().unwrap();
+        generation.invalidate();
+        let draining_generation = Arc::clone(&generation);
+        let drain = tokio::spawn(async move { draining_generation.drain().await });
+        tokio::task::yield_now().await;
+        assert!(!drain.is_finished());
+
+        drop(permit);
+        drain.await.unwrap();
+        assert!(matches!(
+            generation.acquire(),
+            Err(SlateDBError::CheckpointLeaseLost(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn replay_wal_into_should_use_latest_existing_table_and_keep_newest_first_order() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let path = Path::from("/tmp/test_db_reader_replay_order");
@@ -2250,15 +3314,18 @@ mod tests {
         .await
         .unwrap();
 
-        let mut into_tables = VecDeque::new();
-        into_tables.push_front(immutable_memtable(
-            3,
-            vec![RowEntry::new_value(b"stale_key", b"stale_value", 3)],
-        ));
-        into_tables.push_back(immutable_memtable(
-            2,
-            vec![RowEntry::new_value(b"older_key", b"older_value", 2)],
-        ));
+        let mut into_tables: ReplayMemtables = [
+            immutable_memtable(
+                3,
+                vec![RowEntry::new_value(b"stale_key", b"stale_value", 3)],
+            ),
+            immutable_memtable(
+                2,
+                vec![RowEntry::new_value(b"older_key", b"older_value", 2)],
+            ),
+        ]
+        .into_iter()
+        .collect();
 
         let mut core = ManifestCore::new();
         core.next_wal_sst_id = 5;
@@ -2268,7 +3335,10 @@ mod tests {
             &DbReaderOptions::default(),
             &core,
             &mut into_tables,
+            None,
             false,
+            None,
+            None,
             None,
         )
         .await
@@ -2287,6 +3357,73 @@ mod tests {
             vec![RowEntry::new_value(b"fresh_key", b"fresh_value", 4)],
         )
         .await;
+    }
+
+    #[test]
+    fn replay_memtable_prepend_should_share_the_existing_tail() {
+        let mut original = ReplayMemtables::default();
+        original.prepend(immutable_memtable(
+            1,
+            vec![RowEntry::new_value(b"old", b"value", 1)],
+        ));
+        let original_head = Arc::clone(original.head.as_ref().unwrap());
+
+        let mut extended = original.clone();
+        extended.prepend(immutable_memtable(
+            2,
+            vec![RowEntry::new_value(b"new", b"value", 2)],
+        ));
+
+        let shared_tail = extended.head.as_ref().unwrap().older.as_ref().unwrap();
+        assert!(Arc::ptr_eq(shared_tail, &original_head));
+        assert_eq!(1, original.len());
+        assert_eq!(2, extended.len());
+    }
+
+    #[tokio::test]
+    async fn replay_wal_into_should_publish_each_bounded_batch() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_db_reader_incremental_replay_publication");
+        let test_provider = TestProvider::new(path, Arc::clone(&object_store));
+        let table_store = test_provider.table_store();
+        let rows = (1..=3)
+            .map(|seq| RowEntry::new_value(format!("key-{seq}").as_bytes(), &[b'x'; 128], seq))
+            .collect::<Vec<_>>();
+        for (wal_id, row) in rows.iter().cloned().enumerate() {
+            write_wal_sst(Arc::clone(&table_store), wal_id as u64 + 1, vec![row])
+                .await
+                .unwrap();
+        }
+        let max_memtable_bytes =
+            table_store.estimate_encoded_size_compacted(1, rows[0].estimated_size()) as u64;
+        let options = DbReaderOptions {
+            max_memtable_bytes,
+            ..DbReaderOptions::default()
+        };
+        let mut core = ManifestCore::new();
+        core.next_wal_sst_id = 4;
+        let mut into_tables = ReplayMemtables::default();
+        let mut publications = Vec::new();
+        let mut publish = |tables: &ReplayMemtables, wal_id, seq| {
+            publications.push((wal_id, seq, tables.len()));
+        };
+
+        let result = DbReaderInner::replay_wal_into(
+            Arc::clone(&table_store),
+            &options,
+            &core,
+            &mut into_tables,
+            None,
+            false,
+            None,
+            Some(&mut publish),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!((3, 3), result);
+        assert_eq!(vec![(1, 1, 1), (2, 2, 2), (3, 3, 3)], publications);
     }
 
     #[test]
@@ -2324,7 +3461,7 @@ mod tests {
         .await
         .unwrap();
 
-        let mut into_tables = VecDeque::new();
+        let mut into_tables = ReplayMemtables::default();
         let mut core = ManifestCore::new();
         core.next_wal_sst_id = 3;
 
@@ -2333,7 +3470,10 @@ mod tests {
             &DbReaderOptions::default(),
             &core,
             &mut into_tables,
+            None,
             false,
+            None,
+            None,
             None,
         )
         .await
@@ -2371,7 +3511,7 @@ mod tests {
         .await
         .unwrap();
 
-        let mut into_tables = VecDeque::new();
+        let mut into_tables = ReplayMemtables::default();
         let mut core = ManifestCore::new();
         // Force the reader to attempt to read up to 4 even though 3 and 4 don't exist.
         core.next_wal_sst_id = 4;
@@ -2385,7 +3525,10 @@ mod tests {
             &reader_options,
             &core,
             &mut into_tables,
+            None,
             false,
+            None,
+            None,
             None,
         )
         .await
@@ -2413,7 +3556,7 @@ mod tests {
         let test_provider = TestProvider::new(path, Arc::clone(&object_store));
         let table_store = test_provider.table_store();
 
-        let mut into_tables = VecDeque::new();
+        let mut into_tables = ReplayMemtables::default();
         let core = ManifestCore::new();
 
         let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
@@ -2421,7 +3564,10 @@ mod tests {
             &DbReaderOptions::default(),
             &core,
             &mut into_tables,
+            None,
             true,
+            None,
+            None,
             None,
         )
         .await
@@ -2444,7 +3590,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut into_tables = VecDeque::new();
+        let mut into_tables = ReplayMemtables::default();
         let core = ManifestCore::new();
 
         let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
@@ -2452,7 +3598,10 @@ mod tests {
             &DbReaderOptions::default(),
             &core,
             &mut into_tables,
+            None,
             true,
+            None,
+            None,
             None,
         )
         .await
@@ -2480,8 +3629,8 @@ mod tests {
             .await
             .unwrap();
 
-        let mut into_tables = VecDeque::new();
-        into_tables.push_front(immutable_memtable(
+        let mut into_tables = ReplayMemtables::default();
+        into_tables.prepend(immutable_memtable(
             5,
             vec![
                 RowEntry::new_value(b"existing_key_1", b"existing_value_1", 9),
@@ -2498,7 +3647,10 @@ mod tests {
             &DbReaderOptions::default(),
             &core,
             &mut into_tables,
+            None,
             true,
+            None,
+            None,
             None,
         )
         .await
@@ -2506,10 +3658,36 @@ mod tests {
 
         assert_eq!(last_wal_id, 6);
         assert_eq!(last_committed_seq, 10);
+
+        let head_after_first_replay = Arc::clone(into_tables.head.as_ref().unwrap());
+        let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
+            Arc::clone(&table_store),
+            &DbReaderOptions::default(),
+            &core,
+            &mut into_tables,
+            Some((last_wal_id, last_committed_seq)),
+            true,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(last_wal_id, 6);
+        assert_eq!(last_committed_seq, 10);
+        assert!(Arc::ptr_eq(
+            into_tables.head.as_ref().unwrap(),
+            &head_after_first_replay
+        ));
     }
 
     #[tokio::test(start_paused = true)]
     async fn should_fail_new_reads_if_manifest_poller_crashes() {
+        use slatedb_common::metrics::{
+            lookup_metric, DefaultMetricsRecorder, MetricLevel, MetricsRecorderHelper,
+        };
+
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let path = Path::from("/tmp/test_kv_store");
         let test_provider = TestProvider::new(path.clone(), Arc::clone(&object_store));
@@ -2519,10 +3697,27 @@ mod tests {
             manifest_poll_interval: Duration::from_millis(500),
             ..DbReaderOptions::default()
         };
-        let reader = test_provider
-            .new_db_reader(reader_options, None, None)
-            .await
-            .unwrap();
+        let metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
+        let reader = DbReader::open_internal(
+            test_provider.manifest_store(),
+            test_provider.table_store(),
+            DbReaderMode::ManagedCheckpoint,
+            None,
+            None,
+            reader_options,
+            Arc::clone(&test_provider.system_clock),
+            Arc::clone(&test_provider.rand),
+            MetricsRecorderHelper::new(metrics_recorder.clone(), MetricLevel::default()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            Some(1),
+            lookup_metric(
+                &metrics_recorder,
+                crate::db_stats::READER_ACTIVE_CHECKPOINTS
+            )
+        );
 
         fail_parallel::cfg(
             Arc::clone(&test_provider.fp_registry),
@@ -2532,8 +3727,14 @@ mod tests {
         .unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
         let result = reader.get(b"key").await.unwrap_err();
-        dbg!(&result);
         assert_eq!(result.to_string(), "Unavailable error: io error (oops)");
+        assert_eq!(
+            Some(0),
+            lookup_metric(
+                &metrics_recorder,
+                crate::db_stats::READER_ACTIVE_CHECKPOINTS
+            )
+        );
     }
 
     #[tokio::test]
@@ -2917,12 +4118,14 @@ mod tests {
         // Seed the prior checkpoint state with IMMs.
         let input_tables: Vec<_> = case.tables.iter().map(InputMemtable::build).collect();
         let prior_state = ReaderState {
-            manifest_id: stored_manifest.id(),
-            checkpoint: Some(test_checkpoint(
+            generation: ReaderGeneration::new(
                 stored_manifest.id(),
-                test_provider.system_clock.clone(),
-            )),
-            manifest: stored_manifest.manifest().clone(),
+                Some(test_checkpoint(
+                    stored_manifest.id(),
+                    test_provider.system_clock.clone(),
+                )),
+                stored_manifest.manifest().clone(),
+            ),
             imm_memtable: input_tables.iter().cloned().collect(),
             last_wal_id: 0,
             last_remote_persisted_seq: 0,
@@ -2948,9 +4151,10 @@ mod tests {
         // directly. skip_wal_replay keeps the test scoped to the IMM retention logic.
         let oracle = Arc::new(DbReaderOracle::new(0, DbStatusManager::new(0)));
         let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let db_stats = DbStats::new(&recorder);
         let reader = Reader::new(
             Arc::clone(&table_store),
-            DbStats::new(&recorder),
+            db_stats.clone(),
             Arc::new(MonotonicClock::new(
                 test_provider.system_clock.clone(),
                 i64::MIN,
@@ -2970,6 +4174,7 @@ mod tests {
             system_clock: test_provider.system_clock.clone(),
             oracle,
             reader,
+            db_stats,
             status_manager: DbStatusManager::new(0),
             segment_extractor: None,
             rand: test_provider.rand.clone(),
@@ -2985,7 +4190,10 @@ mod tests {
             .unwrap();
 
         // The rebuilt checkpoint should reflect the new manifest.
-        assert_eq!(rebuilt_state.manifest.core.last_l0_seq, case.last_l0_seq);
+        assert_eq!(
+            rebuilt_state.generation.manifest.core.last_l0_seq,
+            case.last_l0_seq
+        );
         assert_eq!(rebuilt_state.imm_memtable.len(), case.expected.len());
 
         for (rebuilt_table, expected_table) in
@@ -3021,22 +4229,27 @@ mod tests {
         let table_store = test_provider.table_store();
 
         let prior_state = ReaderState {
-            manifest_id: 1,
-            checkpoint: Some(test_checkpoint(1, test_provider.system_clock.clone())),
-            manifest: Manifest::initial(current_core.clone()),
-            imm_memtable: VecDeque::from([immutable_memtable(
+            generation: ReaderGeneration::new(
+                1,
+                Some(test_checkpoint(1, test_provider.system_clock.clone())),
+                Manifest::initial(current_core.clone()),
+            ),
+            imm_memtable: [immutable_memtable(
                 1,
                 vec![RowEntry::new_value(b"key", b"value", 10)],
-            )]),
+            )]
+            .into_iter()
+            .collect(),
             last_wal_id: 1,
             last_remote_persisted_seq: 10,
         };
 
         let oracle = Arc::new(DbReaderOracle::new(0, DbStatusManager::new(0)));
         let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let db_stats = DbStats::new(&recorder);
         let reader = Reader::new(
             Arc::clone(&table_store),
-            DbStats::new(&recorder),
+            db_stats.clone(),
             Arc::new(MonotonicClock::new(
                 test_provider.system_clock.clone(),
                 i64::MIN,
@@ -3053,6 +4266,7 @@ mod tests {
             system_clock: test_provider.system_clock.clone(),
             oracle,
             reader,
+            db_stats,
             status_manager: DbStatusManager::new(0),
             segment_extractor: None,
             rand: test_provider.rand.clone(),
@@ -3239,7 +4453,9 @@ mod tests {
 
     #[tokio::test]
     async fn should_record_metrics_with_recorder() {
-        use slatedb_common::metrics::{lookup_metric_with_labels, DefaultMetricsRecorder};
+        use slatedb_common::metrics::{
+            lookup_metric, lookup_metric_with_labels, DefaultMetricsRecorder,
+        };
 
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let path = Path::from("/tmp/test_db_reader_metrics");
@@ -3273,6 +4489,180 @@ mod tests {
             ),
             Some(1)
         );
+        for _ in 0..1_000 {
+            if lookup_metric(&metrics_recorder, crate::db_stats::READER_MANIFEST_POLLS) == Some(1) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            lookup_metric(&metrics_recorder, crate::db_stats::READER_MANIFEST_POLLS,),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn should_record_incremental_wal_replay_metrics() {
+        use slatedb_common::metrics::{lookup_metric, DefaultMetricsRecorder};
+
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_db_reader_wal_replay_metrics");
+        let db = Db::builder(path.clone(), Arc::clone(&object_store))
+            .with_settings(Settings {
+                flush_interval: None,
+                compactor_options: None,
+                garbage_collector_options: None,
+                ..Settings::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        db.put_with_options(
+            b"key",
+            b"value",
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..WriteOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::Wal,
+        })
+        .await
+        .unwrap();
+
+        let metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
+        let reader = DbReader::builder(path, object_store)
+            .with_metrics_recorder(metrics_recorder.clone())
+            .build()
+            .await
+            .unwrap();
+
+        assert!(
+            lookup_metric(&metrics_recorder, crate::db_stats::READER_WAL_REPLAY_SSTS)
+                .is_some_and(|value| value > 0)
+        );
+        assert!(
+            lookup_metric(&metrics_recorder, crate::db_stats::READER_WAL_REPLAY_BYTES)
+                .is_some_and(|value| value > 0)
+        );
+        assert!(lookup_metric(
+            &metrics_recorder,
+            crate::db_stats::READER_WAL_REPLAY_BATCHES
+        )
+        .is_some_and(|value| value > 0));
+        assert_eq!(
+            Some(1),
+            lookup_metric(&metrics_recorder, crate::db_stats::READER_REPLAY_MEMTABLES)
+        );
+        assert_eq!(
+            Some(1),
+            lookup_metric(
+                &metrics_recorder,
+                crate::db_stats::READER_ACTIVE_CHECKPOINTS
+            )
+        );
+
+        reader.close().await.unwrap();
+        assert_eq!(
+            Some(0),
+            lookup_metric(
+                &metrics_recorder,
+                crate::db_stats::READER_ACTIVE_CHECKPOINTS
+            )
+        );
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fixed_checkpoint_reader_should_not_manage_or_delete_its_checkpoint() {
+        use slatedb_common::metrics::{lookup_metric, DefaultMetricsRecorder};
+
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_fixed_db_reader_checkpoint_metric");
+        let db = Db::builder(path.clone(), Arc::clone(&object_store))
+            .with_settings(Settings::default())
+            .build()
+            .await
+            .unwrap();
+        db.put(b"key", b"value").await.unwrap();
+        let checkpoint = db
+            .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
+            .await
+            .unwrap();
+        db.close().await.unwrap();
+
+        let metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
+        let reader = DbReader::builder(path.clone(), Arc::clone(&object_store))
+            .with_reader_mode(DbReaderMode::Checkpoint(checkpoint.id))
+            .with_metrics_recorder(metrics_recorder.clone())
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            Some(0),
+            lookup_metric(
+                &metrics_recorder,
+                crate::db_stats::READER_ACTIVE_CHECKPOINTS
+            )
+        );
+        assert_eq!(
+            reader.get(b"key").await.unwrap(),
+            Some(Bytes::from("value"))
+        );
+
+        reader.close().await.unwrap();
+        assert_eq!(reader.status().close_reason, Some(CloseReason::Clean));
+        assert!(reader.get(b"key").await.is_err());
+        assert_eq!(
+            Some(0),
+            lookup_metric(
+                &metrics_recorder,
+                crate::db_stats::READER_ACTIVE_CHECKPOINTS
+            )
+        );
+
+        let manifest_store = ManifestStore::new(&path, Arc::clone(&object_store));
+        let manifest = manifest_store.read_latest_manifest().await.unwrap();
+        assert!(manifest
+            .manifest
+            .core
+            .find_checkpoint(checkpoint.id)
+            .is_some());
+
+        let drop_metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
+        let dropped_reader = DbReader::builder(path, Arc::clone(&object_store))
+            .with_reader_mode(DbReaderMode::Checkpoint(checkpoint.id))
+            .with_metrics_recorder(drop_metrics_recorder.clone())
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            Some(0),
+            lookup_metric(
+                &drop_metrics_recorder,
+                crate::db_stats::READER_ACTIVE_CHECKPOINTS
+            )
+        );
+        drop(dropped_reader);
+        assert_eq!(
+            Some(0),
+            lookup_metric(
+                &drop_metrics_recorder,
+                crate::db_stats::READER_ACTIVE_CHECKPOINTS
+            )
+        );
+
+        let manifest = manifest_store.read_latest_manifest().await.unwrap();
+        assert!(manifest
+            .manifest
+            .core
+            .find_checkpoint(checkpoint.id)
+            .is_some());
     }
 
     impl TestProvider {
@@ -3428,7 +4818,18 @@ mod tests {
         let timeout = Duration::from_secs(30);
         let start = tokio::time::Instant::now();
         loop {
-            if reader.inner.state.read().manifest.core.tree.l0.len() == 1 {
+            if reader
+                .inner
+                .state
+                .read()
+                .generation
+                .manifest
+                .core
+                .tree
+                .l0
+                .len()
+                == 1
+            {
                 break;
             }
             // The reader poller may observe the pre-flush manifest on one tick and
