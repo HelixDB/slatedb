@@ -7,6 +7,7 @@ use crate::cached_object_store::storage_fs::FsCacheStorage;
 use crate::cached_object_store::LocalCacheEntry;
 use crate::config::ObjectStoreCacheOptions;
 use crate::object_store_tag::ObjectStoreCallTag;
+use crate::query_metrics::{self, QueryCacheKind};
 use bytes::{Bytes, BytesMut};
 use futures::{future::BoxFuture, stream, stream::BoxStream, StreamExt};
 use object_store::{path::Path, GetOptions, GetResult, ObjectMeta, ObjectStore, ObjectStoreExt};
@@ -259,12 +260,17 @@ impl CachedObjectStore {
                 let location = location.clone();
                 async move {
                     this.stats.object_store_cache_part_access.increment(1);
-                    let (bytes, part_source) = this
+                    let result = this
                         .read_part(&location, part_id, range_in_part, force_refresh)
-                        .await?;
-                    if head_source == ReadResultSource::Disk
-                        && part_source == ReadResultSource::Disk
-                    {
+                        .await;
+                    let Ok((bytes, part_source)) = result else {
+                        query_metrics::record_cache_access(QueryCacheKind::Object, false);
+                        return result.map(|(bytes, _)| bytes);
+                    };
+                    let hit = head_source == ReadResultSource::Disk
+                        && part_source == ReadResultSource::Disk;
+                    query_metrics::record_cache_access(QueryCacheKind::Object, hit);
+                    if hit {
                         this.stats.object_store_cache_part_hits.increment(1);
                     }
                     Ok::<Bytes, object_store::Error>(bytes)
