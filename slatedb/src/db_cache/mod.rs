@@ -44,7 +44,17 @@ pub const DEFAULT_BLOCK_CACHE_CAPACITY: u64 = 512 * 1024 * 1024;
 pub const DEFAULT_META_CACHE_CAPACITY: u64 = 128 * 1024 * 1024;
 
 /// Atomic counter to generate unique scope IDs for `DbCacheWrapper` instances.
-static NEXT_CACHE_SCOPE_ID: AtomicU64 = AtomicU64::new(0);
+/// Scope `0` belongs exclusively to cache keys serialized before scoping was
+/// introduced, so live wrappers start at `1` and can never alias those entries.
+static NEXT_CACHE_SCOPE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_cache_scope_id() -> u64 {
+    NEXT_CACHE_SCOPE_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .expect("cache scope IDs exhausted")
+}
 
 /// A `FnOnce` returning a future that produces a [`CachedEntry`] on cache miss.
 ///
@@ -617,7 +627,7 @@ impl DbCacheWrapper {
         Self {
             stats: DbCacheStats::new(recorder),
             cache,
-            scope_id: NEXT_CACHE_SCOPE_ID.fetch_add(1, Ordering::Relaxed),
+            scope_id: next_cache_scope_id(),
             last_err_log_time: Mutex::new(None),
             system_clock,
         }
@@ -1017,6 +1027,7 @@ pub(crate) mod test_utils {
     use crate::db_cache::{CachedEntry, CachedKey, DbCache};
     use async_trait::async_trait;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
     /// A cache that always returns an error from get operations.
@@ -1057,39 +1068,68 @@ pub(crate) mod test_utils {
 
     pub(crate) struct TestCache {
         items: Mutex<HashMap<CachedKey, CachedEntry>>,
+        hits: AtomicU64,
+        misses: AtomicU64,
+        inserts: AtomicU64,
     }
 
     impl TestCache {
         pub(crate) fn new() -> Self {
             Self {
                 items: Mutex::new(HashMap::new()),
+                hits: AtomicU64::new(0),
+                misses: AtomicU64::new(0),
+                inserts: AtomicU64::new(0),
             }
+        }
+
+        fn get(&self, key: &CachedKey) -> Option<CachedEntry> {
+            let entry = self.items.lock().unwrap().get(key).cloned();
+            if entry.is_some() {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+            }
+            entry
+        }
+
+        pub(crate) fn hits(&self) -> u64 {
+            self.hits.load(Ordering::Relaxed)
+        }
+
+        pub(crate) fn misses(&self) -> u64 {
+            self.misses.load(Ordering::Relaxed)
+        }
+
+        pub(crate) fn inserts(&self) -> u64 {
+            self.inserts.load(Ordering::Relaxed)
+        }
+
+        pub(crate) fn clear(&self) {
+            self.items.lock().unwrap().clear();
         }
     }
 
     #[async_trait]
     impl DbCache for TestCache {
         async fn get_block(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
-            let guard = self.items.lock().unwrap();
-            Ok(guard.get(key).cloned())
+            Ok(self.get(key))
         }
 
         async fn get_index(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
-            let guard = self.items.lock().unwrap();
-            Ok(guard.get(key).cloned())
+            Ok(self.get(key))
         }
 
         async fn get_filter(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
-            let guard = self.items.lock().unwrap();
-            Ok(guard.get(key).cloned())
+            Ok(self.get(key))
         }
 
         async fn get_stats(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
-            let guard = self.items.lock().unwrap();
-            Ok(guard.get(key).cloned())
+            Ok(self.get(key))
         }
 
         async fn insert(&self, key: CachedKey, value: CachedEntry) {
+            self.inserts.fetch_add(1, Ordering::Relaxed);
             let mut guard = self.items.lock().unwrap();
             guard.insert(key, value);
         }
@@ -1468,6 +1508,14 @@ mod tests {
         let shared_cache: Arc<dyn DbCache> = Arc::new(TestCache::new());
         let cache_a = DbCacheWrapper::new(shared_cache.clone(), &recorder_a, system_clock.clone());
         let cache_b = DbCacheWrapper::new(shared_cache.clone(), &recorder_b, system_clock);
+        assert_ne!(
+            cache_a.scope_id, 0,
+            "live wrappers must not use legacy scope 0"
+        );
+        assert_ne!(
+            cache_b.scope_id, 0,
+            "live wrappers must not use legacy scope 0"
+        );
         assert_ne!(cache_a.scope_id, cache_b.scope_id);
 
         let policy = BloomFilterPolicy::new(1);

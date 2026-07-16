@@ -290,10 +290,7 @@ impl DbTransaction {
                 )
                 .await
                 .map_err(crate::Error::from)?;
-            for (key_idx, value) in reader_key_indices
-                .into_iter()
-                .zip(reader_values.into_iter())
-            {
+            for (key_idx, value) in reader_key_indices.into_iter().zip(reader_values) {
                 resolved[key_idx] = true;
                 values[key_idx] = value;
             }

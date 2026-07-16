@@ -15,6 +15,29 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::VecDeque;
 use std::ops::RangeBounds;
+use std::sync::Arc;
+
+pub(crate) trait DbIteratorGuard: Send + Sync {
+    fn enter(&self) -> Result<(), SlateDBError>;
+    fn exit(&self);
+}
+
+struct DbIteratorGuardPermit {
+    guard: Arc<dyn DbIteratorGuard>,
+}
+
+impl DbIteratorGuardPermit {
+    fn acquire(guard: Arc<dyn DbIteratorGuard>) -> Result<Self, SlateDBError> {
+        guard.enter()?;
+        Ok(Self { guard })
+    }
+}
+
+impl Drop for DbIteratorGuardPermit {
+    fn drop(&mut self) {
+        self.guard.exit();
+    }
+}
 
 /// [`DbIteratorRangeTracker`] records the *requested* scan range of a
 /// [`DbIterator`] so that the transaction manager can detect read-write
@@ -183,6 +206,10 @@ pub struct DbIterator {
     iter: Box<dyn RowEntryIterator + 'static>,
     invalidated_error: Option<SlateDBError>,
     last_key: Option<Bytes>,
+    /// Keeps any reader-generation state needed by the iterator alive. The
+    /// concrete type is intentionally opaque so the common iterator does not
+    /// depend on `DbReader` internals.
+    iteration_guard: Option<Arc<dyn DbIteratorGuard>>,
 }
 
 impl DbIterator {
@@ -253,7 +280,23 @@ impl DbIterator {
             iter,
             invalidated_error: None,
             last_key: None,
+            iteration_guard: None,
         })
+    }
+
+    pub(crate) fn with_iteration_guard<T>(mut self, guard: Arc<T>) -> Self
+    where
+        T: DbIteratorGuard + 'static,
+    {
+        self.iteration_guard = Some(guard);
+        self
+    }
+
+    fn acquire_iteration_guard(&self) -> Result<Option<DbIteratorGuardPermit>, SlateDBError> {
+        self.iteration_guard
+            .as_ref()
+            .map(|guard| DbIteratorGuardPermit::acquire(Arc::clone(guard)))
+            .transpose()
     }
 
     /// Get the next key-value pair.
@@ -280,6 +323,7 @@ impl DbIterator {
     }
 
     pub(crate) async fn next_entry(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
+        let _permit = self.acquire_iteration_guard()?;
         if let Some(error) = self.invalidated_error.clone() {
             Err(error)
         } else {
@@ -328,6 +372,7 @@ impl DbIterator {
     ///
     /// Returns [`Error`] if the iterator has been invalidated in order to reclaim resources.
     pub async fn seek<K: AsRef<[u8]>>(&mut self, next_key: K) -> Result<(), crate::Error> {
+        let _permit = self.acquire_iteration_guard().map_err(crate::Error::from)?;
         let next_key = next_key.as_ref();
         if let Some(error) = self.invalidated_error.clone() {
             Err(error.into())

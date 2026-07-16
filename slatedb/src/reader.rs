@@ -26,7 +26,9 @@ use std::sync::Arc;
 
 pub(crate) trait DbStateReader {
     fn memtable(&self) -> Arc<KVTable>;
-    fn imm_memtable(&self) -> &VecDeque<Arc<ImmutableMemtable>>;
+    /// Returns immutable memtables newest-first. The iterator form permits
+    /// read-only replicas to use a structurally shared persistent chain.
+    fn imm_memtables(&self) -> Box<dyn Iterator<Item = Arc<ImmutableMemtable>> + Send + '_>;
     fn core(&self) -> &ManifestCore;
 }
 
@@ -145,7 +147,7 @@ impl Reader {
     ) -> Result<IteratorSources, SlateDBError> {
         let mut memtables = VecDeque::new();
         memtables.push_back(db_state.memtable());
-        for memtable in db_state.imm_memtable() {
+        for memtable in db_state.imm_memtables() {
             memtables.push_back(memtable.table());
         }
         let mem_iters = memtables
@@ -310,7 +312,7 @@ impl Reader {
         )
         .await?;
 
-        for imm in db_state.imm_memtable() {
+        for imm in db_state.imm_memtables() {
             if Self::all_done(&resolved, &fallback_to_point_get) {
                 break;
             }
@@ -928,7 +930,7 @@ impl Reader {
                 .memtable()
                 .range(range.clone(), sst_iter_options.order),
         ));
-        for memtable in db_state.imm_memtable() {
+        for memtable in db_state.imm_memtables() {
             all_iters.push(Box::new(
                 memtable
                     .table()
@@ -1158,8 +1160,8 @@ mod tests {
             self.memtable.clone()
         }
 
-        fn imm_memtable(&self) -> &VecDeque<Arc<ImmutableMemtable>> {
-            &self.imm_memtable
+        fn imm_memtables(&self) -> Box<dyn Iterator<Item = Arc<ImmutableMemtable>> + Send + '_> {
+            Box::new(self.imm_memtable.iter().cloned())
         }
 
         fn core(&self) -> &ManifestCore {
