@@ -2,7 +2,8 @@ use crate::checkpoint::Checkpoint;
 use crate::config::CheckpointOptions;
 use crate::error::SlateDBError;
 use crate::error::SlateDBError::{
-    CheckpointMissing, InvalidDBState, LatestTransactionalObjectVersionMissing, ManifestMissing,
+    CheckpointAlreadyExists, CheckpointMissing, InvalidDBState,
+    LatestTransactionalObjectVersionMissing, ManifestMissing,
 };
 use crate::flatbuffer_types::FlatBufferManifestCodec;
 use crate::manifest::{Manifest, ManifestCore, VersionedManifest};
@@ -16,7 +17,7 @@ use slatedb_txn_obj::{
     DirtyObject, FenceableTransactionalObject, MonotonicId, SequencedStorageProtocol,
     SimpleTransactionalObject, TransactionalObject, TransactionalStorageProtocol,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::RangeBounds;
 use std::sync::Arc;
 use std::time::Duration;
@@ -297,6 +298,14 @@ impl StoredManifest {
         self.inner
             .maybe_apply_update(|sr| {
                 let mut new_val = sr.object().clone();
+                if new_val
+                    .core
+                    .checkpoints
+                    .iter()
+                    .any(|checkpoint| checkpoint.id == checkpoint_id)
+                {
+                    return Err(CheckpointAlreadyExists(checkpoint_id));
+                }
                 let checkpoint = Self::new_checkpoint(
                     &new_val,
                     sr.id().into(),
@@ -342,9 +351,42 @@ impl StoredManifest {
             .await?)
     }
 
+    /// Deletes several checkpoints in one manifest append. Missing checkpoint
+    /// IDs are treated as already deleted so cleanup remains idempotent.
+    pub(crate) async fn delete_checkpoints(
+        &mut self,
+        checkpoint_ids: &[Uuid],
+    ) -> Result<(), SlateDBError> {
+        if checkpoint_ids.is_empty() {
+            return Ok(());
+        }
+        let checkpoint_ids = checkpoint_ids.iter().copied().collect::<BTreeSet<_>>();
+        Ok(self
+            .inner
+            .maybe_apply_update(|sr| {
+                let mut new_val = sr.object().clone();
+                let before = new_val.core.checkpoints.len();
+                new_val
+                    .core
+                    .checkpoints
+                    .retain(|cp| !checkpoint_ids.contains(&cp.id));
+                let result: Result<Option<DirtyObject<Manifest>>, SlateDBError> =
+                    if new_val.core.checkpoints.len() == before {
+                        Ok(None)
+                    } else {
+                        let mut dirty = sr.prepare_dirty()?;
+                        dirty.value = new_val;
+                        Ok(Some(dirty))
+                    };
+                result
+            })
+            .await?)
+    }
+
     /// Replace an existing checkpoint with a new checkpoint. If the old checkpoint
     /// is missing, the new checkpoint will still be added. This helps avoid
     /// issuing two manifest updates when creating a new checkpoint.
+    #[cfg(test)]
     pub(crate) async fn replace_checkpoint(
         &mut self,
         old_checkpoint_id: Uuid,
@@ -382,6 +424,7 @@ impl StoredManifest {
         Ok(new_checkpoint)
     }
 
+    #[cfg(test)]
     pub(crate) async fn refresh_checkpoint(
         &mut self,
         checkpoint_id: Uuid,
@@ -411,6 +454,47 @@ impl StoredManifest {
             .expect("update applied but checkpoint not found")
             .clone();
         Ok(checkpoint)
+    }
+
+    /// Refreshes several checkpoint leases in one manifest append.
+    pub(crate) async fn refresh_checkpoints(
+        &mut self,
+        checkpoint_ids: &[Uuid],
+        new_lifetime: Duration,
+    ) -> Result<Vec<Checkpoint>, SlateDBError> {
+        if checkpoint_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let checkpoint_ids = checkpoint_ids.iter().copied().collect::<BTreeSet<_>>();
+        let clock = Arc::clone(&self.clock);
+        self.inner
+            .maybe_apply_update(|sr| {
+                let mut new_val = sr.object().clone();
+                for checkpoint_id in &checkpoint_ids {
+                    if !new_val
+                        .core
+                        .checkpoints
+                        .iter()
+                        .any(|checkpoint| checkpoint.id == *checkpoint_id)
+                    {
+                        return Err(CheckpointMissing(*checkpoint_id));
+                    }
+                }
+                let expire_time = clock.now() + new_lifetime;
+                for checkpoint in &mut new_val.core.checkpoints {
+                    if checkpoint_ids.contains(&checkpoint.id) {
+                        checkpoint.expire_time = Some(expire_time);
+                    }
+                }
+                let mut dirty = sr.prepare_dirty()?;
+                dirty.value = new_val;
+                Ok(Some(dirty))
+            })
+            .await?;
+        Ok(checkpoint_ids
+            .iter()
+            .filter_map(|id| self.db_state().find_checkpoint(*id).cloned())
+            .collect())
     }
 
     pub(crate) async fn update(
@@ -1295,6 +1379,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn should_refresh_checkpoints_atomically_in_one_manifest() {
+        let ms = new_memory_manifest_store();
+        let mut sm = StoredManifest::create_new_db(
+            ms,
+            ManifestCore::new(),
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+        let options = CheckpointOptions {
+            lifetime: Some(Duration::from_secs(100)),
+            ..CheckpointOptions::default()
+        };
+        let first = sm
+            .write_checkpoint(uuid::Uuid::new_v4(), &options)
+            .await
+            .unwrap();
+        let second = sm
+            .write_checkpoint(uuid::Uuid::new_v4(), &options)
+            .await
+            .unwrap();
+        let manifest_id = sm.id();
+
+        let refreshed = sm
+            .refresh_checkpoints(&[first.id, second.id], Duration::from_secs(500))
+            .await
+            .unwrap();
+
+        assert_eq!(manifest_id + 1, sm.id());
+        assert_eq!(2, refreshed.len());
+        assert_eq!(refreshed[0].expire_time, refreshed[1].expire_time);
+        assert!(refreshed[0].expire_time > first.expire_time);
+    }
+
+    #[tokio::test]
+    async fn should_not_partially_refresh_when_any_checkpoint_is_missing() {
+        let ms = new_memory_manifest_store();
+        let mut sm = StoredManifest::create_new_db(
+            ms,
+            ManifestCore::new(),
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+        let checkpoint = sm
+            .write_checkpoint(uuid::Uuid::new_v4(), &CheckpointOptions::default())
+            .await
+            .unwrap();
+        let manifest_id = sm.id();
+        let missing = uuid::Uuid::new_v4();
+
+        let result = sm
+            .refresh_checkpoints(&[checkpoint.id, missing], Duration::from_secs(500))
+            .await;
+
+        assert!(matches!(result, Err(SlateDBError::CheckpointMissing(id)) if id == missing));
+        assert_eq!(manifest_id, sm.id());
+        assert_eq!(
+            checkpoint.expire_time,
+            sm.db_state()
+                .find_checkpoint(checkpoint.id)
+                .unwrap()
+                .expire_time
+        );
+    }
+
+    #[tokio::test]
     async fn should_fail_refresh_if_checkpoint_missing() {
         let ms = new_memory_manifest_store();
         let state = ManifestCore::new();
@@ -1398,6 +1549,103 @@ mod tests {
 
         sm.delete_checkpoint(checkpoint.id).await.unwrap();
         assert_eq!(None, sm.manifest().core.find_checkpoint(checkpoint.id));
+    }
+
+    #[tokio::test]
+    async fn should_delete_checkpoints_idempotently_in_one_manifest() {
+        let ms = new_memory_manifest_store();
+        let mut sm = StoredManifest::create_new_db(
+            ms,
+            ManifestCore::new(),
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+        let first = sm
+            .write_checkpoint(uuid::Uuid::new_v4(), &CheckpointOptions::default())
+            .await
+            .unwrap();
+        let second = sm
+            .write_checkpoint(uuid::Uuid::new_v4(), &CheckpointOptions::default())
+            .await
+            .unwrap();
+        let manifest_id = sm.id();
+
+        sm.delete_checkpoints(&[first.id, second.id]).await.unwrap();
+
+        assert_eq!(manifest_id + 1, sm.id());
+        assert!(sm.db_state().checkpoints.is_empty());
+        let manifest_id = sm.id();
+        sm.delete_checkpoints(&[first.id, second.id]).await.unwrap();
+        assert_eq!(manifest_id, sm.id());
+    }
+
+    #[tokio::test]
+    async fn should_reject_duplicate_checkpoint_ids_without_appending() {
+        let ms = new_memory_manifest_store();
+        let mut sm = StoredManifest::create_new_db(
+            ms,
+            ManifestCore::new(),
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+        let checkpoint_id = uuid::Uuid::new_v4();
+        sm.write_checkpoint(checkpoint_id, &CheckpointOptions::default())
+            .await
+            .unwrap();
+        let manifest_id = sm.id();
+
+        let result = sm
+            .write_checkpoint(checkpoint_id, &CheckpointOptions::default())
+            .await;
+
+        assert!(
+            matches!(result, Err(SlateDBError::CheckpointAlreadyExists(id)) if id == checkpoint_id)
+        );
+        assert_eq!(manifest_id, sm.id());
+        assert_eq!(1, sm.db_state().checkpoints.len());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_append_should_merge_with_a_concurrent_manifest_writer() {
+        let ms = new_memory_manifest_store();
+        StoredManifest::create_new_db(
+            Arc::clone(&ms),
+            ManifestCore::new(),
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+        let mut reader_manifest =
+            StoredManifest::load(Arc::clone(&ms), Arc::new(DefaultSystemClock::new()))
+                .await
+                .unwrap();
+        let mut writer_manifest =
+            StoredManifest::load(Arc::clone(&ms), Arc::new(DefaultSystemClock::new()))
+                .await
+                .unwrap();
+        let checkpoint_id = uuid::Uuid::new_v4();
+        let checkpoint_options = CheckpointOptions::default();
+
+        let (checkpoint_result, writer_result) = tokio::join!(
+            reader_manifest.write_checkpoint(checkpoint_id, &checkpoint_options),
+            writer_manifest.maybe_apply_update(|manifest| {
+                let mut dirty = manifest.prepare_dirty()?;
+                dirty.value.core.last_l0_seq = 42;
+                Ok(Some(dirty))
+            })
+        );
+
+        checkpoint_result.unwrap();
+        writer_result.unwrap();
+        let latest = ms.read_latest_manifest().await.unwrap();
+        assert_eq!(42, latest.manifest.core.last_l0_seq);
+        assert!(latest
+            .manifest
+            .core
+            .find_checkpoint(checkpoint_id)
+            .is_some());
     }
 
     #[tokio::test]

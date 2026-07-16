@@ -8,13 +8,30 @@ use crate::db_iter::DbIterator;
 use crate::types::KeyValue;
 
 use crate::db::DbInner;
+use crate::db_reader::{CheckpointState, DbReaderInner};
 use crate::reader::ScanContext;
 use crate::DbReadOps;
 
+/// An immutable snapshot-isolation view created by either [`crate::Db`] or
+/// [`crate::DbReader`].
+///
+/// Reader-backed snapshots pin the reader's already-replayed local state. They
+/// do not replay WALs or create a checkpoint per snapshot; snapshots from the
+/// same manifest generation share the reader's GC checkpoint.
 pub struct DbSnapshot {
-    snapshot_id: Uuid,
     started_seq: u64,
-    db_inner: Arc<DbInner>,
+    backend: DbSnapshotBackend,
+}
+
+enum DbSnapshotBackend {
+    Db {
+        snapshot_id: Uuid,
+        inner: Arc<DbInner>,
+    },
+    Reader {
+        inner: Arc<DbReaderInner>,
+        state: Arc<CheckpointState>,
+    },
 }
 
 impl DbSnapshot {
@@ -22,9 +39,18 @@ impl DbSnapshot {
         let (snapshot_id, started_seq) = db_inner.snapshot_manager.new_snapshot(seq);
 
         Arc::new(Self {
-            snapshot_id,
             started_seq,
-            db_inner,
+            backend: DbSnapshotBackend::Db {
+                snapshot_id,
+                inner: db_inner,
+            },
+        })
+    }
+
+    pub(crate) fn new_reader(inner: Arc<DbReaderInner>, state: Arc<CheckpointState>) -> Arc<Self> {
+        Arc::new(Self {
+            started_seq: state.applied_seq(),
+            backend: DbSnapshotBackend::Reader { inner, state },
         })
     }
 
@@ -78,15 +104,32 @@ impl DbSnapshot {
         key: K,
         options: &ReadOptions,
     ) -> Result<Option<KeyValue>, crate::Error> {
-        self.db_inner.check_closed()?;
-        let db_state = self.db_inner.state.read().view();
-        let kv = self
-            .db_inner
-            .reader
-            .get_key_value_with_options(key, options, &db_state, None, Some(self.started_seq))
-            .await
-            .map_err(crate::Error::from)?;
-        Ok(kv)
+        match &self.backend {
+            DbSnapshotBackend::Db { inner, .. } => {
+                inner.check_closed()?;
+                let db_state = inner.state.read().view();
+                inner
+                    .reader
+                    .get_key_value_with_options(
+                        key,
+                        options,
+                        &db_state,
+                        None,
+                        Some(self.started_seq),
+                    )
+                    .await
+                    .map_err(crate::Error::from)
+            }
+            DbSnapshotBackend::Reader { inner, state } => inner
+                .snapshot_get_key_value_with_options(
+                    Arc::clone(state),
+                    self.started_seq,
+                    key,
+                    options,
+                )
+                .await
+                .map_err(crate::Error::from),
+        }
     }
 
     /// Scan a range of keys using the default scan options.
@@ -186,22 +229,36 @@ impl DbSnapshot {
         options: &ScanOptions,
         prefix: Option<Bytes>,
     ) -> Result<DbIterator, crate::Error> {
-        self.db_inner.check_closed()?;
-        let db_state = self.db_inner.state.read().view();
-        self.db_inner
-            .reader
-            .scan_with_options(
-                range,
-                options,
-                ScanContext {
-                    db_state: &db_state,
-                    write_batch_iter: None,
-                    max_seq: Some(self.started_seq),
+        match &self.backend {
+            DbSnapshotBackend::Db { inner, .. } => {
+                inner.check_closed()?;
+                let db_state = inner.state.read().view();
+                inner
+                    .reader
+                    .scan_with_options(
+                        range,
+                        options,
+                        ScanContext {
+                            db_state: &db_state,
+                            write_batch_iter: None,
+                            max_seq: Some(self.started_seq),
+                            prefix,
+                        },
+                    )
+                    .await
+                    .map_err(Into::into)
+            }
+            DbSnapshotBackend::Reader { inner, state } => inner
+                .snapshot_scan_with_options(
+                    Arc::clone(state),
+                    self.started_seq,
+                    range,
+                    options,
                     prefix,
-                },
-            )
-            .await
-            .map_err(Into::into)
+                )
+                .await
+                .map_err(Into::into),
+        }
     }
 }
 
@@ -250,9 +307,9 @@ impl DbReadOps for DbSnapshot {
 
 impl Drop for DbSnapshot {
     fn drop(&mut self) {
-        self.db_inner
-            .snapshot_manager
-            .drop_snapshot(&self.snapshot_id);
+        if let DbSnapshotBackend::Db { snapshot_id, inner } = &self.backend {
+            inner.snapshot_manager.drop_snapshot(snapshot_id);
+        }
     }
 }
 
