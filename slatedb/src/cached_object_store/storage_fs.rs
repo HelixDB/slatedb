@@ -16,10 +16,11 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::{Mutex, Notify, OnceCell};
 use walkdir::WalkDir;
 
 use crate::cached_object_store::storage::{LocalCacheEntry, LocalCacheHead, LocalCacheStorage};
+use crate::db_cache::CacheUsageSnapshot;
 use crate::utils::format_bytes_si;
 
 /// A cached file handle node. Callers that obtain an `Arc<CachedFileHandle>`
@@ -150,7 +151,7 @@ fn read_exact_at_offset(file: &std::fs::File, buf: &mut [u8], offset: u64) -> st
 #[derive(Debug)]
 pub struct FsCacheStorage {
     root_folder: std::path::PathBuf,
-    evictor: Option<Arc<FsCacheEvictor>>,
+    evictor: Arc<FsCacheEvictor>,
     rand: Arc<DbRand>,
     file_handle_cache: FileHandleCache,
 }
@@ -166,17 +167,15 @@ impl FsCacheStorage {
         max_open_file_handles: usize,
     ) -> Self {
         let file_handle_cache = FileHandleCache::new(max_open_file_handles);
-        let evictor = max_cache_size_bytes.map(|max_cache_size_bytes| {
-            Arc::new(FsCacheEvictor::new(
-                root_folder.clone(),
-                max_cache_size_bytes,
-                scan_interval,
-                stats,
-                system_clock,
-                rand.clone(),
-                file_handle_cache.clone(),
-            ))
-        });
+        let evictor = Arc::new(FsCacheEvictor::new(
+            root_folder.clone(),
+            max_cache_size_bytes,
+            scan_interval,
+            stats,
+            system_clock,
+            rand.clone(),
+            file_handle_cache.clone(),
+        ));
 
         Self {
             root_folder,
@@ -202,7 +201,7 @@ impl LocalCacheStorage for FsCacheStorage {
         Box::new(FsCacheEntry {
             root_folder: self.root_folder.clone(),
             location: location.clone(),
-            evictor: self.evictor.clone(),
+            evictor: Some(self.evictor.clone()),
             part_size,
             rand: self.rand.clone(),
             file_handle_cache: self.file_handle_cache.clone(),
@@ -210,9 +209,11 @@ impl LocalCacheStorage for FsCacheStorage {
     }
 
     async fn start_evictor(&self) {
-        if let Some(evictor) = &self.evictor {
-            evictor.start().await
-        }
+        self.evictor.start().await
+    }
+
+    fn usage_snapshot(&self) -> CacheUsageSnapshot {
+        self.evictor.usage_snapshot()
     }
 }
 
@@ -235,18 +236,17 @@ pub(crate) struct FsCacheEntry {
 impl FsCacheEntry {
     async fn atomic_write(&self, path: std::path::PathBuf, buf: Bytes) -> object_store::Result<()> {
         let tmp_path = path.with_extension(format!("_tmp{}", self.make_rand_suffix()));
+        let bytes = buf.len();
 
-        // try triggering evict before writing
-        if let Some(evictor) = &self.evictor {
+        let Some(write_reservation) = (if let Some(evictor) = &self.evictor {
             // If the evictor is backpressured, skip this cache write to avoid
             // stalling foreground PUTs. Cache writes are best-effort.
-            if !evictor
-                .track_entry_accessed(path.clone(), EntryAccess::Write(buf.len()))
-                .await
-            {
-                return Ok(());
-            }
-        }
+            evictor.reserve_entry_access()
+        } else {
+            Some(WriteReservation::Untracked)
+        }) else {
+            return Ok(());
+        };
 
         // Spawn a blocking task and do synchronous I/O rather than use the tokio async apis.
         // Under the hood, on linux systems , tokio itself spawns a blocking task for each call to
@@ -275,6 +275,10 @@ impl FsCacheEntry {
         })
         .await?
         .map_err(wrap_io_err)?;
+
+        if let WriteReservation::Reserved(permit) = write_reservation {
+            permit.send((invalidate_path.clone(), EntryAccess::Write(bytes)));
+        }
 
         // The rename replaced the file at `path`, so any previously cached
         // handle now points to the old (unlinked) inode. Invalidate it so
@@ -522,9 +526,13 @@ impl LocalCacheEntry for FsCacheEntry {
         };
 
         if let Some(evictor) = &self.evictor {
-            evictor
-                .track_entry_accessed(path, EntryAccess::Delete)
-                .await;
+            if evictor.max_cache_size_bytes.is_some() {
+                evictor
+                    .track_entry_accessed(path, EntryAccess::Delete)
+                    .await;
+            } else {
+                evictor.inner.delete_entry(path).await;
+            }
         } else {
             delete_cache_entry(path, self.file_handle_cache.clone()).await;
         }
@@ -538,6 +546,11 @@ enum EntryAccess {
 }
 
 type FsCacheEvictorWork = (std::path::PathBuf, EntryAccess);
+
+enum WriteReservation<'a> {
+    Untracked,
+    Reserved(tokio::sync::mpsc::Permit<'a, FsCacheEvictorWork>),
+}
 // Minimum time between aggregated "evictor queue is full" warnings.
 const QUEUE_FULL_LOG_INTERVAL_MS: i64 = 30_000;
 
@@ -546,8 +559,7 @@ const QUEUE_FULL_LOG_INTERVAL_MS: i64 = 30_000;
 /// is added.
 #[derive(Debug)]
 struct FsCacheEvictor {
-    root_folder: std::path::PathBuf,
-    max_cache_size_bytes: usize,
+    max_cache_size_bytes: Option<usize>,
     scan_interval: Option<Duration>,
     tx: tokio::sync::mpsc::Sender<FsCacheEvictorWork>,
     rx: Mutex<Option<tokio::sync::mpsc::Receiver<FsCacheEvictorWork>>>,
@@ -556,16 +568,37 @@ struct FsCacheEvictor {
     last_queue_full_log_ms: AtomicI64,
     background_evict_handle: OnceCell<tokio::task::JoinHandle<()>>,
     background_scan_handle: OnceCell<tokio::task::JoinHandle<()>>,
-    stats: Arc<CachedObjectStoreStats>,
     system_clock: Arc<dyn SystemClock>,
-    rand: Arc<DbRand>,
-    file_handle_cache: FileHandleCache,
+    usage: Arc<FsCacheUsage>,
+    reconcile_notify: Arc<Notify>,
+    inner: Arc<FsCacheEvictorInner>,
+}
+
+#[derive(Debug)]
+struct FsCacheUsage {
+    initialized: AtomicBool,
+    used_bytes: AtomicU64,
+    capacity_bytes: Option<u64>,
+}
+
+impl FsCacheUsage {
+    fn snapshot(&self) -> CacheUsageSnapshot {
+        if !self.initialized.load(Ordering::Acquire) {
+            return CacheUsageSnapshot::Initializing {
+                capacity_bytes: self.capacity_bytes,
+            };
+        }
+        CacheUsageSnapshot::Ready {
+            used_bytes: self.used_bytes.load(Ordering::Acquire),
+            capacity_bytes: self.capacity_bytes,
+        }
+    }
 }
 
 impl FsCacheEvictor {
     fn new(
         root_folder: std::path::PathBuf,
-        max_cache_size_bytes: usize,
+        max_cache_size_bytes: Option<usize>,
         scan_interval: Option<Duration>,
         stats: Arc<CachedObjectStoreStats>,
         system_clock: Arc<dyn SystemClock>,
@@ -573,8 +606,20 @@ impl FsCacheEvictor {
         file_handle_cache: FileHandleCache,
     ) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(100);
+        let usage = Arc::new(FsCacheUsage {
+            initialized: AtomicBool::new(false),
+            used_bytes: AtomicU64::new(0),
+            capacity_bytes: max_cache_size_bytes.map(|bytes| bytes as u64),
+        });
+        let inner = Arc::new(FsCacheEvictorInner::new_with_usage(
+            root_folder.clone(),
+            max_cache_size_bytes,
+            stats.clone(),
+            rand.clone(),
+            file_handle_cache.clone(),
+            usage.clone(),
+        ));
         Self {
-            root_folder,
             scan_interval,
             max_cache_size_bytes,
             tx,
@@ -584,21 +629,15 @@ impl FsCacheEvictor {
             last_queue_full_log_ms: AtomicI64::new(i64::MIN),
             background_evict_handle: OnceCell::new(),
             background_scan_handle: OnceCell::new(),
-            stats,
             system_clock,
-            rand,
-            file_handle_cache,
+            usage,
+            reconcile_notify: Arc::new(Notify::new()),
+            inner,
         }
     }
 
     async fn start(&self) {
-        let inner = Arc::new(FsCacheEvictorInner::new(
-            self.root_folder.clone(),
-            self.max_cache_size_bytes,
-            self.stats.clone(),
-            self.rand.clone(),
-            self.file_handle_cache.clone(),
-        ));
+        let inner = self.inner.clone();
 
         let guard = self.rx.lock();
         let rx = guard.await.take().expect("evictor already started");
@@ -612,6 +651,7 @@ impl FsCacheEvictor {
                 inner.clone(),
                 self.scan_interval,
                 self.system_clock.clone(),
+                self.reconcile_notify.clone(),
             )))
             .ok();
 
@@ -627,6 +667,53 @@ impl FsCacheEvictor {
 
     fn started(&self) -> bool {
         self.started.load(Ordering::Acquire)
+    }
+
+    fn usage_snapshot(&self) -> CacheUsageSnapshot {
+        self.usage.snapshot()
+    }
+
+    fn reserve_entry_access(&self) -> Option<WriteReservation<'_>> {
+        if !self.started() {
+            return Some(WriteReservation::Untracked);
+        }
+        match self.tx.try_reserve() {
+            Ok(permit) => Some(WriteReservation::Reserved(permit)),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                self.mark_accounting_dirty();
+                self.record_queue_full();
+                None
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.mark_accounting_dirty();
+                None
+            }
+        }
+    }
+
+    fn mark_accounting_dirty(&self) {
+        self.usage.initialized.store(false, Ordering::Release);
+        self.reconcile_notify.notify_one();
+    }
+
+    fn record_queue_full(&self) {
+        self.queue_full_count.fetch_add(1, Ordering::AcqRel);
+        let now_ms = self.system_clock.now().timestamp_millis();
+        let last_log_ms = self.last_queue_full_log_ms.load(Ordering::Acquire);
+        if now_ms.saturating_sub(last_log_ms) < QUEUE_FULL_LOG_INTERVAL_MS {
+            return;
+        }
+        if self
+            .last_queue_full_log_ms
+            .compare_exchange(last_log_ms, now_ms, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let queue_full_count = self.queue_full_count.swap(0, Ordering::AcqRel);
+            warn!(
+                "evictor queue skipped cache write/access event because it was full {} times in the last 30s",
+                queue_full_count,
+            );
+        }
     }
 
     async fn background_evict(
@@ -660,14 +747,21 @@ impl FsCacheEvictor {
         inner: Arc<FsCacheEvictorInner>,
         scan_interval: Option<Duration>,
         system_clock: Arc<dyn SystemClock>,
+        reconcile_notify: Arc<Notify>,
     ) {
         inner.clone().scan_entries(true).await;
 
-        if let Some(scan_interval) = scan_interval {
-            loop {
-                system_clock.clone().sleep(scan_interval).await;
-                inner.clone().scan_entries(true).await;
+        loop {
+            if let Some(scan_interval) = scan_interval {
+                let clock = system_clock.clone();
+                tokio::select! {
+                    () = clock.sleep(scan_interval) => {}
+                    () = reconcile_notify.notified() => {}
+                }
+            } else {
+                reconcile_notify.notified().await;
             }
+            inner.clone().scan_entries(true).await;
         }
     }
 
@@ -683,24 +777,14 @@ impl FsCacheEvictor {
         match self.tx.try_send((path, access)) {
             Ok(()) => true,
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                self.queue_full_count.fetch_add(1, Ordering::AcqRel);
-                let now_ms = self.system_clock.now().timestamp_millis();
-                let last_log_ms = self.last_queue_full_log_ms.load(Ordering::Acquire);
-                if now_ms.saturating_sub(last_log_ms) >= QUEUE_FULL_LOG_INTERVAL_MS
-                    && self
-                        .last_queue_full_log_ms
-                        .compare_exchange(last_log_ms, now_ms, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
-                {
-                    let queue_full_count = self.queue_full_count.swap(0, Ordering::AcqRel);
-                    warn!(
-                        "evictor queue skipped cache write/access event because it was full {} times in the last 30s",
-                        queue_full_count,
-                    );
-                }
+                self.mark_accounting_dirty();
+                self.record_queue_full();
                 false
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.mark_accounting_dirty();
+                false
+            }
         }
     }
 }
@@ -744,16 +828,17 @@ impl CacheState {
 #[derive(Debug)]
 struct FsCacheEvictorInner {
     root_folder: std::path::PathBuf,
-    max_cache_size_bytes: usize,
+    max_cache_size_bytes: Option<usize>,
     track_lock: Mutex<()>,
     cache_state: Mutex<CacheState>,
-    cache_size_bytes: AtomicU64,
+    usage: Arc<FsCacheUsage>,
     stats: Arc<CachedObjectStoreStats>,
     rand: Arc<DbRand>,
     file_handle_cache: FileHandleCache,
 }
 
 impl FsCacheEvictorInner {
+    #[cfg(test)]
     fn new(
         root_folder: std::path::PathBuf,
         max_cache_size_bytes: usize,
@@ -761,12 +846,34 @@ impl FsCacheEvictorInner {
         rand: Arc<DbRand>,
         file_handle_cache: FileHandleCache,
     ) -> Self {
+        Self::new_with_usage(
+            root_folder,
+            Some(max_cache_size_bytes),
+            stats,
+            rand,
+            file_handle_cache,
+            Arc::new(FsCacheUsage {
+                initialized: AtomicBool::new(false),
+                used_bytes: AtomicU64::new(0),
+                capacity_bytes: Some(max_cache_size_bytes as u64),
+            }),
+        )
+    }
+
+    fn new_with_usage(
+        root_folder: std::path::PathBuf,
+        max_cache_size_bytes: Option<usize>,
+        stats: Arc<CachedObjectStoreStats>,
+        rand: Arc<DbRand>,
+        file_handle_cache: FileHandleCache,
+        usage: Arc<FsCacheUsage>,
+    ) -> Self {
         Self {
             root_folder,
             max_cache_size_bytes,
             track_lock: Mutex::new(()),
             cache_state: Mutex::new(CacheState::default()),
-            cache_size_bytes: AtomicU64::new(0_u64),
+            usage,
             stats,
             rand,
             file_handle_cache,
@@ -791,6 +898,7 @@ impl FsCacheEvictorInner {
         .await
         .unwrap_or_default();
 
+        let scanned_paths: HashSet<_> = paths.iter().cloned().collect();
         for path in paths {
             let metadata = match tokio::fs::metadata(&path).await {
                 Ok(metadata) => metadata,
@@ -814,6 +922,34 @@ impl FsCacheEvictorInner {
 
             self.track_entry_accessed(path, bytes, atime, evict).await;
         }
+
+        let tracked_paths = self.cache_state.lock().await.keys.clone();
+        let mut missing_paths = Vec::new();
+        for path in tracked_paths {
+            if !scanned_paths.contains(&path)
+                && !tokio::fs::try_exists(&path).await.unwrap_or(false)
+            {
+                missing_paths.push(path);
+            }
+        }
+        if !missing_paths.is_empty() {
+            let _track_guard = self.track_lock.lock().await;
+            let mut cache_state = self.cache_state.lock().await;
+            for path in missing_paths {
+                if let Some(removed) = cache_state.remove_entry(&path) {
+                    self.usage
+                        .used_bytes
+                        .fetch_sub(removed.size_bytes as u64, Ordering::AcqRel);
+                }
+            }
+            self.stats
+                .object_store_cache_keys
+                .set(cache_state.entries.len() as i64);
+            self.stats
+                .object_store_cache_bytes
+                .set(self.usage.used_bytes.load(Ordering::Relaxed) as i64);
+        }
+        self.usage.initialized.store(true, Ordering::Release);
     }
 
     /// track the cache entry access, and evict the cache files when the cache size exceeds the limit if evict is true,
@@ -834,6 +970,18 @@ impl FsCacheEvictorInner {
             match cache_state.entries.get_mut(&path) {
                 Some(entry) => {
                     entry.access_time = accessed_time;
+                    if entry.size_bytes != bytes {
+                        if bytes > entry.size_bytes {
+                            self.usage
+                                .used_bytes
+                                .fetch_add((bytes - entry.size_bytes) as u64, Ordering::AcqRel);
+                        } else {
+                            self.usage
+                                .used_bytes
+                                .fetch_sub((entry.size_bytes - bytes) as u64, Ordering::AcqRel);
+                        }
+                        entry.size_bytes = bytes;
+                    }
                 }
                 None => {
                     let key_index = cache_state.keys.len();
@@ -846,7 +994,8 @@ impl FsCacheEvictorInner {
                             key_index,
                         },
                     );
-                    self.cache_size_bytes
+                    self.usage
+                        .used_bytes
                         .fetch_add(bytes as u64, Ordering::SeqCst);
                 }
             }
@@ -856,10 +1005,13 @@ impl FsCacheEvictorInner {
         self.stats.object_store_cache_keys.set(entry_count as i64);
         self.stats
             .object_store_cache_bytes
-            .set(self.cache_size_bytes.load(Ordering::Relaxed) as i64);
+            .set(self.usage.used_bytes.load(Ordering::Relaxed) as i64);
 
+        let Some(max_cache_size_bytes) = self.max_cache_size_bytes else {
+            return 0;
+        };
         // if the cache size is still below the limit, do nothing
-        if self.cache_size_bytes.load(Ordering::Relaxed) <= self.max_cache_size_bytes as u64 {
+        if self.usage.used_bytes.load(Ordering::Relaxed) <= max_cache_size_bytes as u64 {
             return 0;
         }
         // TODO: check the disk space ratio here, if the disk space is low, also triggers evict.
@@ -871,10 +1023,10 @@ impl FsCacheEvictorInner {
         // It's ok to call evict after inserting the new entry, because we will evict entries with eailer `accessed_time`.
         // This ensures that the newly added entry will not be evicted immediately.
         let evicted_bytes: usize = if evict
-            && self.cache_size_bytes.load(Ordering::Relaxed) > self.max_cache_size_bytes as u64
+            && self.usage.used_bytes.load(Ordering::Relaxed) > max_cache_size_bytes as u64
         {
             // We sacrifice floating-point precision error to prevent possible overflow(i.e. self.max_cache_size_bytes * 9 / 10).
-            let target_size = ((self.max_cache_size_bytes as f64) * 0.9) as u64;
+            let target_size = ((max_cache_size_bytes as f64) * 0.9) as u64;
             self.evict_to_target_size(target_size).await
         } else {
             0
@@ -890,11 +1042,11 @@ impl FsCacheEvictorInner {
         let picked_targets = self.pick_evict_targets(target_size).await;
 
         if picked_targets.is_empty() {
-            if self.cache_size_bytes.load(Ordering::Relaxed) > target_size {
+            if self.usage.used_bytes.load(Ordering::Relaxed) > target_size {
                 warn!(
                     "cache_size_bytes still exceeds max_cache_size_bytes but no more entries can be evicted(cache_size_bytes={}, max_cache_size_bytes={})",
-                    format_bytes_si(self.cache_size_bytes.load(Ordering::Relaxed)),
-                    format_bytes_si(self.max_cache_size_bytes as u64)
+                    format_bytes_si(self.usage.used_bytes.load(Ordering::Relaxed)),
+                    format_bytes_si(self.max_cache_size_bytes.unwrap_or_default() as u64)
                 );
             }
             return 0;
@@ -938,7 +1090,8 @@ impl FsCacheEvictorInner {
 
             for (target, target_bytes) in deleted_targets.iter() {
                 if cache_state.remove_entry(target).is_some() {
-                    self.cache_size_bytes
+                    self.usage
+                        .used_bytes
                         .fetch_sub(*target_bytes as u64, Ordering::SeqCst);
                     total_bytes += target_bytes;
                 }
@@ -957,7 +1110,7 @@ impl FsCacheEvictorInner {
         self.stats.object_store_cache_keys.set(entry_count as i64);
         self.stats
             .object_store_cache_bytes
-            .set(self.cache_size_bytes.load(Ordering::Relaxed) as i64);
+            .set(self.usage.used_bytes.load(Ordering::Relaxed) as i64);
 
         total_evicted_bytes
     }
@@ -975,7 +1128,8 @@ impl FsCacheEvictorInner {
             let mut cache_state = self.cache_state.lock().await;
             for deleted_entry in deleted_entries {
                 if let Some(removed) = cache_state.remove_entry(&deleted_entry) {
-                    self.cache_size_bytes
+                    self.usage
+                        .used_bytes
                         .fetch_sub(removed.size_bytes as u64, Ordering::SeqCst);
                 }
             }
@@ -986,7 +1140,7 @@ impl FsCacheEvictorInner {
         self.stats.object_store_cache_keys.set(entry_count as i64);
         self.stats
             .object_store_cache_bytes
-            .set(self.cache_size_bytes.load(Ordering::Relaxed) as i64);
+            .set(self.usage.used_bytes.load(Ordering::Relaxed) as i64);
     }
 
     /// Pick multiple eviction targets in a single pass using pick-of-2 strategy, which is an approximation
@@ -1003,7 +1157,7 @@ impl FsCacheEvictorInner {
         let mut targets = Vec::new();
         // Track the simulated cache size during eviction but do not modify the actual cache size until
         // after files are deleted.
-        let mut simulated_size = self.cache_size_bytes.load(Ordering::Relaxed);
+        let mut simulated_size = self.usage.used_bytes.load(Ordering::Relaxed);
         // Track which indices have been selected for eviction
         let mut picked_indices: HashSet<usize> = HashSet::new();
 
@@ -1235,7 +1389,7 @@ mod tests {
 
         let evictor = FsCacheEvictor::new(
             temp_dir.path().to_path_buf(),
-            1024,
+            Some(1024),
             None,
             Arc::new(CachedObjectStoreStats::new(&recorder)),
             Arc::new(DefaultSystemClock::new()),
@@ -1255,6 +1409,15 @@ mod tests {
                 .await;
             assert!(accepted);
         }
+
+        evictor.usage.initialized.store(true, Ordering::Release);
+        assert!(evictor.reserve_entry_access().is_none());
+        assert_eq!(
+            evictor.usage_snapshot(),
+            CacheUsageSnapshot::Initializing {
+                capacity_bytes: Some(1024),
+            }
+        );
 
         let accepted = evictor
             .track_entry_accessed(std::path::PathBuf::from("overflow"), EntryAccess::Write(1))
@@ -1314,11 +1477,148 @@ mod tests {
 
         // rescan two times, the cache size should be 2049 unchanged
         evictor.clone().scan_entries(false).await;
-        let cache_size_bytes = evictor.cache_size_bytes.load(Ordering::SeqCst);
+        let cache_size_bytes = evictor.usage.used_bytes.load(Ordering::SeqCst);
         assert_eq!(cache_size_bytes, 2049);
         evictor.clone().scan_entries(false).await;
-        let cache_size_bytes = evictor.cache_size_bytes.load(Ordering::SeqCst);
+        let cache_size_bytes = evictor.usage.used_bytes.load(Ordering::SeqCst);
         assert_eq!(cache_size_bytes, 2049);
+    }
+
+    #[tokio::test]
+    async fn usage_snapshot_reconciles_bounded_and_unbounded_cache_files() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("objstore_cache_usage_snapshot_")
+            .tempdir()
+            .unwrap();
+        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let usage = Arc::new(FsCacheUsage {
+            initialized: AtomicBool::new(false),
+            used_bytes: AtomicU64::new(0),
+            capacity_bytes: None,
+        });
+        let evictor = Arc::new(FsCacheEvictorInner::new_with_usage(
+            temp_dir.path().to_path_buf(),
+            None,
+            Arc::new(CachedObjectStoreStats::new(&recorder)),
+            Arc::new(DbRand::default()),
+            FileHandleCache::new(1000),
+            usage.clone(),
+        ));
+        assert_eq!(
+            usage.snapshot(),
+            CacheUsageSnapshot::Initializing {
+                capacity_bytes: None,
+            }
+        );
+
+        let path = gen_rand_file(temp_dir.path(), "file", 17);
+        evictor.clone().scan_entries(false).await;
+        assert_eq!(
+            usage.snapshot(),
+            CacheUsageSnapshot::Ready {
+                used_bytes: 17,
+                capacity_bytes: None,
+            }
+        );
+
+        gen_rand_file(temp_dir.path(), "file", 29);
+        evictor.clone().scan_entries(false).await;
+        assert_eq!(
+            usage.snapshot(),
+            CacheUsageSnapshot::Ready {
+                used_bytes: 29,
+                capacity_bytes: None,
+            }
+        );
+
+        std::fs::remove_file(path).unwrap();
+        evictor.scan_entries(false).await;
+        assert_eq!(
+            usage.snapshot(),
+            CacheUsageSnapshot::Ready {
+                used_bytes: 0,
+                capacity_bytes: None,
+            }
+        );
+
+        let bounded = FsCacheStorage::new(
+            temp_dir.path().to_path_buf(),
+            Some(1024),
+            None,
+            Arc::new(CachedObjectStoreStats::new(&recorder)),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+            10,
+        );
+        assert_eq!(
+            bounded.usage_snapshot(),
+            CacheUsageSnapshot::Initializing {
+                capacity_bytes: Some(1024),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn unbounded_usage_tracks_successful_write_overwrite_and_delete() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("objstore_cache_usage_updates_")
+            .tempdir()
+            .unwrap();
+        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let storage = FsCacheStorage::new(
+            temp_dir.path().to_path_buf(),
+            None,
+            None,
+            Arc::new(CachedObjectStoreStats::new(&recorder)),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+            10,
+        );
+        storage.start_evictor().await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !matches!(
+                storage.usage_snapshot(),
+                CacheUsageSnapshot::Ready { used_bytes: 0, .. }
+            ) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let entry = storage.entry(&Path::from("cached/object"), 1024);
+        entry.save_part(0, Bytes::from(vec![1; 17])).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !matches!(
+                storage.usage_snapshot(),
+                CacheUsageSnapshot::Ready { used_bytes: 17, .. }
+            ) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        entry.save_part(0, Bytes::from(vec![2; 29])).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !matches!(
+                storage.usage_snapshot(),
+                CacheUsageSnapshot::Ready { used_bytes: 29, .. }
+            ) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        entry.delete().await;
+        assert_eq!(
+            storage.usage_snapshot(),
+            CacheUsageSnapshot::Ready {
+                used_bytes: 0,
+                capacity_bytes: None,
+            }
+        );
     }
 
     #[rstest::rstest]

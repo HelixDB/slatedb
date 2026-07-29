@@ -71,21 +71,236 @@
 //!
 
 use crate::{
-    db_cache::{CacheLoader, CachedEntry, CachedKey, DbCache},
+    db_cache::{
+        CacheLoader, CacheUsageSnapshot, CachedEntry, CachedKey, DbCache, DbCacheUsageSnapshot,
+    },
     error::SlateDBError,
     utils::format_bytes_si,
 };
 use async_trait::async_trait;
 use log::info;
-use std::sync::Arc;
+use mixtrics::{
+    metrics::{
+        BoxedCounterVec, BoxedGauge, BoxedGaugeVec, BoxedHistogramVec, GaugeOps, GaugeVecOps,
+        RegistryOps,
+    },
+    registry::noop::NoopMetricsRegistry,
+};
+use std::{
+    borrow::Cow,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
+
+const FOYER_BLOCK_GAUGE: &str = "foyer_storage_block_engine_block";
+const FOYER_BLOCK_SIZE_GAUGE: &str = "foyer_storage_block_engine_block_size_bytes";
+
+#[derive(Debug, Default)]
+struct FoyerHybridCacheMetricValues {
+    clean_blocks: AtomicU64,
+    writing_blocks: AtomicU64,
+    evictable_blocks: AtomicU64,
+    reclaiming_blocks: AtomicU64,
+    block_size_bytes: AtomicU64,
+}
+
+/// Retained Foyer block-engine gauges used for synchronous cache accounting.
+///
+/// Install [`Self::registry`] on the same `HybridCacheBuilder` whose cache is
+/// passed to [`FoyerHybridCache::new_with_cache_and_metrics`].
+#[derive(Clone, Debug, Default)]
+pub struct FoyerHybridCacheMetrics {
+    values: Arc<FoyerHybridCacheMetricValues>,
+}
+
+impl FoyerHybridCacheMetrics {
+    /// Build an empty metrics handle.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Build the registry passed to `HybridCacheBuilder::with_metrics_registry`.
+    pub fn registry(&self) -> mixtrics::metrics::BoxedRegistry {
+        Box::new(FoyerCacheMetricsRegistry {
+            values: Arc::clone(&self.values),
+        })
+    }
+
+    fn disk_usage_snapshot(&self) -> CacheUsageSnapshot {
+        let block_size_bytes = self.values.block_size_bytes.load(Ordering::Relaxed);
+        if block_size_bytes == 0 {
+            return CacheUsageSnapshot::Unavailable;
+        }
+        let clean_blocks = self.values.clean_blocks.load(Ordering::Relaxed);
+        let writing_blocks = self.values.writing_blocks.load(Ordering::Relaxed);
+        let evictable_blocks = self.values.evictable_blocks.load(Ordering::Relaxed);
+        let reclaiming_blocks = self.values.reclaiming_blocks.load(Ordering::Relaxed);
+        let used_blocks = writing_blocks
+            .saturating_add(evictable_blocks)
+            .saturating_add(reclaiming_blocks);
+        let total_blocks = clean_blocks.saturating_add(used_blocks);
+        CacheUsageSnapshot::Ready {
+            used_bytes: used_blocks.saturating_mul(block_size_bytes),
+            capacity_bytes: Some(total_blocks.saturating_mul(block_size_bytes)),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FoyerCacheMetricsRegistry {
+    values: Arc<FoyerHybridCacheMetricValues>,
+}
+
+impl RegistryOps for FoyerCacheMetricsRegistry {
+    fn register_counter_vec(
+        &self,
+        _name: Cow<'static, str>,
+        _desc: Cow<'static, str>,
+        _label_names: &'static [&'static str],
+    ) -> BoxedCounterVec {
+        Box::new(NoopMetricsRegistry)
+    }
+
+    fn register_gauge_vec(
+        &self,
+        name: Cow<'static, str>,
+        _desc: Cow<'static, str>,
+        _label_names: &'static [&'static str],
+    ) -> BoxedGaugeVec {
+        let kind = match name.as_ref() {
+            FOYER_BLOCK_GAUGE => TrackedGaugeKind::BlockState,
+            FOYER_BLOCK_SIZE_GAUGE => TrackedGaugeKind::BlockSize,
+            _ => return Box::new(NoopMetricsRegistry),
+        };
+        Box::new(FoyerTrackedGaugeVec {
+            kind,
+            values: Arc::clone(&self.values),
+        })
+    }
+
+    fn register_histogram_vec(
+        &self,
+        _name: Cow<'static, str>,
+        _desc: Cow<'static, str>,
+        _label_names: &'static [&'static str],
+    ) -> BoxedHistogramVec {
+        Box::new(NoopMetricsRegistry)
+    }
+
+    fn register_histogram_vec_with_buckets(
+        &self,
+        _name: Cow<'static, str>,
+        _desc: Cow<'static, str>,
+        _label_names: &'static [&'static str],
+        _buckets: Vec<f64>,
+    ) -> BoxedHistogramVec {
+        Box::new(NoopMetricsRegistry)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TrackedGaugeKind {
+    BlockState,
+    BlockSize,
+}
+
+#[derive(Debug)]
+struct FoyerTrackedGaugeVec {
+    kind: TrackedGaugeKind,
+    values: Arc<FoyerHybridCacheMetricValues>,
+}
+
+impl GaugeVecOps for FoyerTrackedGaugeVec {
+    fn gauge(&self, labels: &[Cow<'static, str>]) -> BoxedGauge {
+        Box::new(AtomicGauge {
+            value: Arc::clone(&self.values),
+            field: match self.kind {
+                TrackedGaugeKind::BlockSize => AtomicGaugeField::BlockSize,
+                TrackedGaugeKind::BlockState => match labels.get(1).map(Cow::as_ref) {
+                    Some("clean") => AtomicGaugeField::Clean,
+                    Some("writing") => AtomicGaugeField::Writing,
+                    Some("evictable") => AtomicGaugeField::Evictable,
+                    Some("reclaiming") => AtomicGaugeField::Reclaiming,
+                    _ => return Box::new(NoopMetricsRegistry),
+                },
+            },
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AtomicGaugeField {
+    Clean,
+    Writing,
+    Evictable,
+    Reclaiming,
+    BlockSize,
+}
+
+#[derive(Debug)]
+struct AtomicGauge {
+    value: Arc<FoyerHybridCacheMetricValues>,
+    field: AtomicGaugeField,
+}
+
+impl AtomicGauge {
+    fn atomic(&self) -> &AtomicU64 {
+        match self.field {
+            AtomicGaugeField::Clean => &self.value.clean_blocks,
+            AtomicGaugeField::Writing => &self.value.writing_blocks,
+            AtomicGaugeField::Evictable => &self.value.evictable_blocks,
+            AtomicGaugeField::Reclaiming => &self.value.reclaiming_blocks,
+            AtomicGaugeField::BlockSize => &self.value.block_size_bytes,
+        }
+    }
+}
+
+impl GaugeOps for AtomicGauge {
+    fn increase(&self, value: u64) {
+        let _ = self
+            .atomic()
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(value))
+            });
+    }
+
+    fn decrease(&self, value: u64) {
+        let _ = self
+            .atomic()
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(value))
+            });
+    }
+
+    fn absolute(&self, value: u64) {
+        self.atomic().store(value, Ordering::Relaxed);
+    }
+}
 
 pub struct FoyerHybridCache {
     inner: foyer::HybridCache<CachedKey, CachedEntry>,
+    metrics: Option<FoyerHybridCacheMetrics>,
 }
 
 impl FoyerHybridCache {
     pub fn new_with_cache(cache: foyer::HybridCache<CachedKey, CachedEntry>) -> Self {
-        Self { inner: cache }
+        Self {
+            inner: cache,
+            metrics: None,
+        }
+    }
+
+    /// Build a hybrid cache with retained block-engine accounting.
+    pub fn new_with_cache_and_metrics(
+        cache: foyer::HybridCache<CachedKey, CachedEntry>,
+        metrics: FoyerHybridCacheMetrics,
+    ) -> Self {
+        Self {
+            inner: cache,
+            metrics: Some(metrics),
+        }
     }
 }
 
@@ -128,6 +343,21 @@ impl DbCache for FoyerHybridCache {
     fn entry_count(&self) -> u64 {
         // foyer cache doesn't support an entry count estimate
         0
+    }
+
+    fn usage_snapshot(&self) -> DbCacheUsageSnapshot {
+        DbCacheUsageSnapshot {
+            memory: CacheUsageSnapshot::Ready {
+                used_bytes: self.inner.memory().usage() as u64,
+                capacity_bytes: Some(self.inner.memory().capacity() as u64),
+            },
+            disk: self
+                .metrics
+                .as_ref()
+                .map_or(CacheUsageSnapshot::Unavailable, |metrics| {
+                    metrics.disk_usage_snapshot()
+                }),
+        }
     }
 
     async fn close(&self) -> Result<(), crate::Error> {
@@ -203,8 +433,11 @@ impl FoyerHybridCache {
 
 #[cfg(test)]
 mod tests {
-    use crate::db_cache::foyer_hybrid::FoyerHybridCache;
-    use crate::db_cache::{CachedEntry, CachedKey, DbCache};
+    use super::{
+        FoyerCacheMetricsRegistry, FoyerHybridCache, FoyerHybridCacheMetrics, FOYER_BLOCK_GAUGE,
+        FOYER_BLOCK_SIZE_GAUGE,
+    };
+    use crate::db_cache::{CacheUsageSnapshot, CachedEntry, CachedKey, DbCache};
     use crate::db_state::SsTableId;
     use crate::format::sst::BlockBuilder;
     use foyer::{
@@ -216,6 +449,50 @@ mod tests {
     use tempfile::{tempdir, TempDir};
 
     const SST_ID: SsTableId = SsTableId::Wal(123);
+
+    #[test]
+    fn tracks_pinned_foyer_block_metrics() {
+        use mixtrics::metrics::RegistryOps;
+        use std::borrow::Cow;
+
+        let metrics = FoyerHybridCacheMetrics::new();
+        let registry = FoyerCacheMetricsRegistry {
+            values: Arc::clone(&metrics.values),
+        };
+        let block_states = registry.register_gauge_vec(
+            Cow::Borrowed(FOYER_BLOCK_GAUGE),
+            Cow::Borrowed(""),
+            &["name", "type"],
+        );
+        block_states
+            .gauge(&[Cow::Borrowed("test"), Cow::Borrowed("clean")])
+            .absolute(5);
+        block_states
+            .gauge(&[Cow::Borrowed("test"), Cow::Borrowed("writing")])
+            .absolute(1);
+        block_states
+            .gauge(&[Cow::Borrowed("test"), Cow::Borrowed("evictable")])
+            .absolute(2);
+        block_states
+            .gauge(&[Cow::Borrowed("test"), Cow::Borrowed("reclaiming")])
+            .absolute(1);
+        registry
+            .register_gauge_vec(
+                Cow::Borrowed(FOYER_BLOCK_SIZE_GAUGE),
+                Cow::Borrowed(""),
+                &["name"],
+            )
+            .gauge(&[Cow::Borrowed("test")])
+            .absolute(4096);
+
+        assert_eq!(
+            metrics.disk_usage_snapshot(),
+            CacheUsageSnapshot::Ready {
+                used_bytes: 4 * 4096,
+                capacity_bytes: Some(9 * 4096),
+            }
+        );
+    }
 
     #[tokio::test]
     async fn test_hybrid_cache() {

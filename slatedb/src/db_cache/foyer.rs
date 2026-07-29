@@ -31,7 +31,10 @@
 //! ```
 //!
 
-use crate::db_cache::{CacheLoader, CachedEntry, CachedKey, DbCache, DEFAULT_MAX_CAPACITY};
+use crate::db_cache::{
+    CacheLoader, CacheUsageSnapshot, CachedEntry, CachedKey, DbCache, DbCacheUsageSnapshot,
+    DEFAULT_MAX_CAPACITY,
+};
 use crate::error::SlateDBError;
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -125,6 +128,16 @@ impl DbCache for FoyerCache {
     fn entry_count(&self) -> u64 {
         // foyer cache doesn't support an entry count estimate
         0
+    }
+
+    fn usage_snapshot(&self) -> DbCacheUsageSnapshot {
+        DbCacheUsageSnapshot {
+            memory: CacheUsageSnapshot::Ready {
+                used_bytes: self.inner.usage() as u64,
+                capacity_bytes: Some(self.inner.capacity() as u64),
+            },
+            disk: CacheUsageSnapshot::Unavailable,
+        }
     }
 
     async fn fetch_block(
