@@ -23,6 +23,7 @@ use std::{ops::Range, sync::Arc};
 use crate::single_flight::SingleFlight;
 
 use crate::cached_object_store::storage::{LocalCacheStorage, PartID};
+use crate::db_cache::CacheUsageSnapshot;
 use crate::error::SlateDBError;
 use crate::utils::build_concurrent;
 use log::warn;
@@ -73,6 +74,10 @@ pub struct CachedObjectStore {
 }
 
 impl CachedObjectStore {
+    pub(crate) fn usage_snapshot(&self) -> CacheUsageSnapshot {
+        self.cache_storage.usage_snapshot()
+    }
+
     pub(crate) fn new(
         object_store: Arc<dyn ObjectStore>,
         cache_storage: Arc<dyn LocalCacheStorage>,

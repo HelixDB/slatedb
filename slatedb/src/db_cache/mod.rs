@@ -45,6 +45,93 @@ pub const DEFAULT_MAX_CAPACITY: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_BLOCK_CACHE_CAPACITY: u64 = 512 * 1024 * 1024;
 pub const DEFAULT_META_CACHE_CAPACITY: u64 = 128 * 1024 * 1024;
 
+/// Point-in-time byte accounting for one cache tier.
+///
+/// `Unavailable` is deliberately distinct from an empty ready cache. Callers
+/// must not turn an unavailable measurement into zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CacheUsageSnapshot {
+    /// The cache tier is not configured.
+    Disabled,
+    /// This cache implementation cannot currently provide byte accounting.
+    #[default]
+    Unavailable,
+    /// The cache is discovering its current contents.
+    Initializing {
+        /// Configured capacity, if the cache is bounded.
+        capacity_bytes: Option<u64>,
+    },
+    /// The cache has a usable byte measurement.
+    Ready {
+        /// Bytes charged by the cache implementation.
+        used_bytes: u64,
+        /// Configured or usable capacity, absent for an unbounded cache.
+        capacity_bytes: Option<u64>,
+    },
+}
+
+impl CacheUsageSnapshot {
+    fn sum_enabled<'a>(
+        snapshots: impl Iterator<Item = &'a CacheUsageSnapshot>,
+    ) -> CacheUsageSnapshot {
+        let mut found_enabled = false;
+        let mut initializing = false;
+        let mut used_bytes = 0_u64;
+        let mut capacity_bytes = Some(0_u64);
+        for snapshot in snapshots {
+            let (child_used, child_capacity) = match snapshot {
+                Self::Disabled => continue,
+                Self::Unavailable => return Self::Unavailable,
+                Self::Initializing { capacity_bytes } => {
+                    found_enabled = true;
+                    initializing = true;
+                    (0, capacity_bytes)
+                }
+                Self::Ready {
+                    used_bytes,
+                    capacity_bytes,
+                } => {
+                    found_enabled = true;
+                    (*used_bytes, capacity_bytes)
+                }
+            };
+            used_bytes = used_bytes.saturating_add(child_used);
+            capacity_bytes = match (capacity_bytes, child_capacity) {
+                (Some(total), Some(child)) => Some(total.saturating_add(*child)),
+                _ => None,
+            };
+        }
+        if !found_enabled {
+            Self::Disabled
+        } else if initializing {
+            Self::Initializing { capacity_bytes }
+        } else {
+            Self::Ready {
+                used_bytes,
+                capacity_bytes,
+            }
+        }
+    }
+}
+
+/// Point-in-time accounting for SlateDB's memory and optional disk cache tiers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DbCacheUsageSnapshot {
+    /// Cache-accounted resident memory.
+    pub memory: CacheUsageSnapshot,
+    /// Cache-accounted local disk.
+    pub disk: CacheUsageSnapshot,
+}
+
+/// Point-in-time accounting for all cache tiers owned by one SlateDB handle.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SlateDbCacheUsageSnapshot {
+    /// Block and metadata cache accounting.
+    pub db_cache: DbCacheUsageSnapshot,
+    /// Optional local object-store file cache accounting.
+    pub object_store: CacheUsageSnapshot,
+}
+
 /// Atomic counter to generate unique scope IDs for `DbCacheWrapper` instances.
 /// Scope `0` belongs exclusively to cache keys serialized before scoping was
 /// introduced, so live wrappers start at `1` and can never alias those entries.
@@ -170,6 +257,11 @@ pub trait DbCache: Send + Sync {
     async fn remove(&self, key: &CachedKey);
     #[allow(dead_code)]
     fn entry_count(&self) -> u64;
+
+    /// Return current cache byte accounting without performing I/O.
+    fn usage_snapshot(&self) -> DbCacheUsageSnapshot {
+        DbCacheUsageSnapshot::default()
+    }
 
     /// Gracefully close the cache, flushing any in-memory state to disk.
     ///
@@ -577,6 +669,20 @@ impl DbCache for SplitCache {
             + self.meta_cache.as_ref().map_or(0, |c| c.entry_count())
     }
 
+    fn usage_snapshot(&self) -> DbCacheUsageSnapshot {
+        let snapshots = [self.block_cache.as_ref(), self.meta_cache.as_ref()]
+            .into_iter()
+            .flatten()
+            .map(|cache| cache.usage_snapshot())
+            .collect::<Vec<_>>();
+        DbCacheUsageSnapshot {
+            memory: CacheUsageSnapshot::sum_enabled(
+                snapshots.iter().map(|snapshot| &snapshot.memory),
+            ),
+            disk: CacheUsageSnapshot::sum_enabled(snapshots.iter().map(|snapshot| &snapshot.disk)),
+        }
+    }
+
     async fn close(&self) -> Result<(), crate::Error> {
         if let Some(ref cache) = self.block_cache {
             cache.close().await?;
@@ -830,6 +936,10 @@ impl DbCache for DbCacheWrapper {
         self.cache.entry_count()
     }
 
+    fn usage_snapshot(&self) -> DbCacheUsageSnapshot {
+        self.cache.usage_snapshot()
+    }
+
     async fn close(&self) -> Result<(), crate::Error> {
         self.cache.close().await
     }
@@ -931,6 +1041,10 @@ impl DbCache for UnownedDbCache {
 
     fn entry_count(&self) -> u64 {
         self.inner.entry_count()
+    }
+
+    fn usage_snapshot(&self) -> DbCacheUsageSnapshot {
+        self.inner.usage_snapshot()
     }
 
     /// The point of this type: never propagate close to a cache we don't own.
@@ -1190,7 +1304,9 @@ pub(crate) mod test_utils {
 #[cfg(test)]
 mod tests {
 
-    use crate::db_cache::{CachedEntry, CachedKey, DbCache, DbCacheWrapper, SplitCache};
+    use crate::db_cache::{
+        CacheUsageSnapshot, CachedEntry, CachedKey, DbCache, DbCacheWrapper, SplitCache,
+    };
     use crate::db_state::SsTableId;
     use crate::filter_policy::{BloomFilterPolicy, FilterPolicy, NamedFilter};
     use crate::format::sst::BlockBuilder;
@@ -1199,6 +1315,58 @@ mod tests {
     use crate::flatbuffer_types::test_utils::assert_index_clamped;
 
     use crate::db_cache::test_utils::TestCache;
+
+    #[test]
+    fn usage_snapshot_sum_preserves_typed_states() {
+        let snapshots = [
+            CacheUsageSnapshot::Disabled,
+            CacheUsageSnapshot::Ready {
+                used_bytes: 7,
+                capacity_bytes: Some(10),
+            },
+            CacheUsageSnapshot::Initializing {
+                capacity_bytes: Some(20),
+            },
+        ];
+        assert_eq!(
+            CacheUsageSnapshot::sum_enabled(snapshots.iter()),
+            CacheUsageSnapshot::Initializing {
+                capacity_bytes: Some(30),
+            }
+        );
+        assert_eq!(
+            CacheUsageSnapshot::sum_enabled(
+                [
+                    CacheUsageSnapshot::Ready {
+                        used_bytes: 12,
+                        capacity_bytes: None,
+                    },
+                    CacheUsageSnapshot::Ready {
+                        used_bytes: 4,
+                        capacity_bytes: Some(8),
+                    },
+                ]
+                .iter()
+            ),
+            CacheUsageSnapshot::Ready {
+                used_bytes: 16,
+                capacity_bytes: None,
+            }
+        );
+        assert_eq!(
+            CacheUsageSnapshot::sum_enabled(
+                [
+                    CacheUsageSnapshot::Ready {
+                        used_bytes: 1,
+                        capacity_bytes: Some(1),
+                    },
+                    CacheUsageSnapshot::Unavailable,
+                ]
+                .iter()
+            ),
+            CacheUsageSnapshot::Unavailable
+        );
+    }
     use crate::format::sst::{EncodedSsTable, SsTableFormat};
     use crate::test_utils::build_test_sst;
     use crate::types::{RowEntry, ValueDeletable};
