@@ -56,6 +56,7 @@ pub(crate) const DB_READER_TASK_NAME: &str = "manifest_poller";
 pub struct DbReader {
     inner: Arc<DbReaderInner>,
     task_executor: MessageHandlerExecutor,
+    pub(crate) object_store_cache: Option<Arc<CachedObjectStore>>,
 }
 
 pub(crate) struct DbReaderInner {
@@ -1341,7 +1342,32 @@ impl DbReader {
         Ok(Self {
             inner,
             task_executor,
+            object_store_cache: None,
         })
+    }
+
+    /// Returns a synchronous point-in-time cache accounting snapshot.
+    ///
+    /// This method reads only in-memory counters and never performs object-store
+    /// or filesystem I/O.
+    pub fn cache_usage_snapshot(&self) -> crate::db_cache::SlateDbCacheUsageSnapshot {
+        let db_cache = self.inner.table_store.cache().map_or_else(
+            || crate::db_cache::DbCacheUsageSnapshot {
+                memory: crate::db_cache::CacheUsageSnapshot::Disabled,
+                disk: crate::db_cache::CacheUsageSnapshot::Disabled,
+            },
+            |cache| cache.usage_snapshot(),
+        );
+        let object_store = self
+            .object_store_cache
+            .as_ref()
+            .map_or(crate::db_cache::CacheUsageSnapshot::Disabled, |cache| {
+                cache.usage_snapshot()
+            });
+        crate::db_cache::SlateDbCacheUsageSnapshot {
+            db_cache,
+            object_store,
+        }
     }
 
     /// Get a value from the database with default read options.

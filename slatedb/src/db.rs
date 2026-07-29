@@ -641,9 +641,34 @@ impl DbInner {
 pub struct Db {
     pub(crate) inner: Arc<DbInner>,
     task_executor: Arc<MessageHandlerExecutor>,
+    pub(crate) object_store_cache: Option<Arc<CachedObjectStore>>,
 }
 
 impl Db {
+    /// Returns a synchronous point-in-time cache accounting snapshot.
+    ///
+    /// This method reads only in-memory counters and never performs object-store
+    /// or filesystem I/O.
+    pub fn cache_usage_snapshot(&self) -> crate::db_cache::SlateDbCacheUsageSnapshot {
+        let db_cache = self.inner.table_store.cache().map_or_else(
+            || crate::db_cache::DbCacheUsageSnapshot {
+                memory: crate::db_cache::CacheUsageSnapshot::Disabled,
+                disk: crate::db_cache::CacheUsageSnapshot::Disabled,
+            },
+            |cache| cache.usage_snapshot(),
+        );
+        let object_store = self
+            .object_store_cache
+            .as_ref()
+            .map_or(crate::db_cache::CacheUsageSnapshot::Disabled, |cache| {
+                cache.usage_snapshot()
+            });
+        crate::db_cache::SlateDbCacheUsageSnapshot {
+            db_cache,
+            object_store,
+        }
+    }
+
     /// Open a new database with default options.
     ///
     /// ## Arguments
