@@ -236,18 +236,17 @@ pub(crate) struct FsCacheEntry {
 impl FsCacheEntry {
     async fn atomic_write(&self, path: std::path::PathBuf, buf: Bytes) -> object_store::Result<()> {
         let tmp_path = path.with_extension(format!("_tmp{}", self.make_rand_suffix()));
+        let bytes = buf.len();
 
-        // try triggering evict before writing
-        if let Some(evictor) = &self.evictor {
+        let Some(write_reservation) = (if let Some(evictor) = &self.evictor {
             // If the evictor is backpressured, skip this cache write to avoid
             // stalling foreground PUTs. Cache writes are best-effort.
-            if !evictor
-                .track_entry_accessed(path.clone(), EntryAccess::Write(buf.len()))
-                .await
-            {
-                return Ok(());
-            }
-        }
+            evictor.reserve_entry_access()
+        } else {
+            Some(WriteReservation::Untracked)
+        }) else {
+            return Ok(());
+        };
 
         // Spawn a blocking task and do synchronous I/O rather than use the tokio async apis.
         // Under the hood, on linux systems , tokio itself spawns a blocking task for each call to
@@ -276,6 +275,10 @@ impl FsCacheEntry {
         })
         .await?
         .map_err(wrap_io_err)?;
+
+        if let WriteReservation::Reserved(permit) = write_reservation {
+            permit.send((invalidate_path.clone(), EntryAccess::Write(bytes)));
+        }
 
         // The rename replaced the file at `path`, so any previously cached
         // handle now points to the old (unlinked) inode. Invalidate it so
@@ -523,9 +526,13 @@ impl LocalCacheEntry for FsCacheEntry {
         };
 
         if let Some(evictor) = &self.evictor {
-            evictor
-                .track_entry_accessed(path, EntryAccess::Delete)
-                .await;
+            if evictor.max_cache_size_bytes.is_some() {
+                evictor
+                    .track_entry_accessed(path, EntryAccess::Delete)
+                    .await;
+            } else {
+                evictor.inner.delete_entry(path).await;
+            }
         } else {
             delete_cache_entry(path, self.file_handle_cache.clone()).await;
         }
@@ -539,6 +546,11 @@ enum EntryAccess {
 }
 
 type FsCacheEvictorWork = (std::path::PathBuf, EntryAccess);
+
+enum WriteReservation<'a> {
+    Untracked,
+    Reserved(tokio::sync::mpsc::Permit<'a, FsCacheEvictorWork>),
+}
 // Minimum time between aggregated "evictor queue is full" warnings.
 const QUEUE_FULL_LOG_INTERVAL_MS: i64 = 30_000;
 
@@ -547,7 +559,6 @@ const QUEUE_FULL_LOG_INTERVAL_MS: i64 = 30_000;
 /// is added.
 #[derive(Debug)]
 struct FsCacheEvictor {
-    root_folder: std::path::PathBuf,
     max_cache_size_bytes: Option<usize>,
     scan_interval: Option<Duration>,
     tx: tokio::sync::mpsc::Sender<FsCacheEvictorWork>,
@@ -557,12 +568,10 @@ struct FsCacheEvictor {
     last_queue_full_log_ms: AtomicI64,
     background_evict_handle: OnceCell<tokio::task::JoinHandle<()>>,
     background_scan_handle: OnceCell<tokio::task::JoinHandle<()>>,
-    stats: Arc<CachedObjectStoreStats>,
     system_clock: Arc<dyn SystemClock>,
-    rand: Arc<DbRand>,
-    file_handle_cache: FileHandleCache,
     usage: Arc<FsCacheUsage>,
     reconcile_notify: Arc<Notify>,
+    inner: Arc<FsCacheEvictorInner>,
 }
 
 #[derive(Debug)]
@@ -597,8 +606,20 @@ impl FsCacheEvictor {
         file_handle_cache: FileHandleCache,
     ) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(100);
+        let usage = Arc::new(FsCacheUsage {
+            initialized: AtomicBool::new(false),
+            used_bytes: AtomicU64::new(0),
+            capacity_bytes: max_cache_size_bytes.map(|bytes| bytes as u64),
+        });
+        let inner = Arc::new(FsCacheEvictorInner::new_with_usage(
+            root_folder.clone(),
+            max_cache_size_bytes,
+            stats.clone(),
+            rand.clone(),
+            file_handle_cache.clone(),
+            usage.clone(),
+        ));
         Self {
-            root_folder,
             scan_interval,
             max_cache_size_bytes,
             tx,
@@ -608,28 +629,15 @@ impl FsCacheEvictor {
             last_queue_full_log_ms: AtomicI64::new(i64::MIN),
             background_evict_handle: OnceCell::new(),
             background_scan_handle: OnceCell::new(),
-            stats,
             system_clock,
-            rand,
-            file_handle_cache,
-            usage: Arc::new(FsCacheUsage {
-                initialized: AtomicBool::new(false),
-                used_bytes: AtomicU64::new(0),
-                capacity_bytes: max_cache_size_bytes.map(|bytes| bytes as u64),
-            }),
+            usage,
             reconcile_notify: Arc::new(Notify::new()),
+            inner,
         }
     }
 
     async fn start(&self) {
-        let inner = Arc::new(FsCacheEvictorInner::new_with_usage(
-            self.root_folder.clone(),
-            self.max_cache_size_bytes,
-            self.stats.clone(),
-            self.rand.clone(),
-            self.file_handle_cache.clone(),
-            self.usage.clone(),
-        ));
+        let inner = self.inner.clone();
 
         let guard = self.rx.lock();
         let rx = guard.await.take().expect("evictor already started");
@@ -663,6 +671,49 @@ impl FsCacheEvictor {
 
     fn usage_snapshot(&self) -> CacheUsageSnapshot {
         self.usage.snapshot()
+    }
+
+    fn reserve_entry_access(&self) -> Option<WriteReservation<'_>> {
+        if !self.started() {
+            return Some(WriteReservation::Untracked);
+        }
+        match self.tx.try_reserve() {
+            Ok(permit) => Some(WriteReservation::Reserved(permit)),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                self.mark_accounting_dirty();
+                self.record_queue_full();
+                None
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.mark_accounting_dirty();
+                None
+            }
+        }
+    }
+
+    fn mark_accounting_dirty(&self) {
+        self.usage.initialized.store(false, Ordering::Release);
+        self.reconcile_notify.notify_one();
+    }
+
+    fn record_queue_full(&self) {
+        self.queue_full_count.fetch_add(1, Ordering::AcqRel);
+        let now_ms = self.system_clock.now().timestamp_millis();
+        let last_log_ms = self.last_queue_full_log_ms.load(Ordering::Acquire);
+        if now_ms.saturating_sub(last_log_ms) < QUEUE_FULL_LOG_INTERVAL_MS {
+            return;
+        }
+        if self
+            .last_queue_full_log_ms
+            .compare_exchange(last_log_ms, now_ms, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let queue_full_count = self.queue_full_count.swap(0, Ordering::AcqRel);
+            warn!(
+                "evictor queue skipped cache write/access event because it was full {} times in the last 30s",
+                queue_full_count,
+            );
+        }
     }
 
     async fn background_evict(
@@ -726,28 +777,12 @@ impl FsCacheEvictor {
         match self.tx.try_send((path, access)) {
             Ok(()) => true,
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                self.usage.initialized.store(false, Ordering::Release);
-                self.reconcile_notify.notify_one();
-                self.queue_full_count.fetch_add(1, Ordering::AcqRel);
-                let now_ms = self.system_clock.now().timestamp_millis();
-                let last_log_ms = self.last_queue_full_log_ms.load(Ordering::Acquire);
-                if now_ms.saturating_sub(last_log_ms) >= QUEUE_FULL_LOG_INTERVAL_MS
-                    && self
-                        .last_queue_full_log_ms
-                        .compare_exchange(last_log_ms, now_ms, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
-                {
-                    let queue_full_count = self.queue_full_count.swap(0, Ordering::AcqRel);
-                    warn!(
-                        "evictor queue skipped cache write/access event because it was full {} times in the last 30s",
-                        queue_full_count,
-                    );
-                }
+                self.mark_accounting_dirty();
+                self.record_queue_full();
                 false
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                self.usage.initialized.store(false, Ordering::Release);
-                self.reconcile_notify.notify_one();
+                self.mark_accounting_dirty();
                 false
             }
         }
@@ -1375,6 +1410,15 @@ mod tests {
             assert!(accepted);
         }
 
+        evictor.usage.initialized.store(true, Ordering::Release);
+        assert!(evictor.reserve_entry_access().is_none());
+        assert_eq!(
+            evictor.usage_snapshot(),
+            CacheUsageSnapshot::Initializing {
+                capacity_bytes: Some(1024),
+            }
+        );
+
         let accepted = evictor
             .track_entry_accessed(std::path::PathBuf::from("overflow"), EntryAccess::Write(1))
             .await;
@@ -1510,6 +1554,69 @@ mod tests {
             bounded.usage_snapshot(),
             CacheUsageSnapshot::Initializing {
                 capacity_bytes: Some(1024),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn unbounded_usage_tracks_successful_write_overwrite_and_delete() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("objstore_cache_usage_updates_")
+            .tempdir()
+            .unwrap();
+        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let storage = FsCacheStorage::new(
+            temp_dir.path().to_path_buf(),
+            None,
+            None,
+            Arc::new(CachedObjectStoreStats::new(&recorder)),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+            10,
+        );
+        storage.start_evictor().await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !matches!(
+                storage.usage_snapshot(),
+                CacheUsageSnapshot::Ready { used_bytes: 0, .. }
+            ) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let entry = storage.entry(&Path::from("cached/object"), 1024);
+        entry.save_part(0, Bytes::from(vec![1; 17])).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !matches!(
+                storage.usage_snapshot(),
+                CacheUsageSnapshot::Ready { used_bytes: 17, .. }
+            ) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        entry.save_part(0, Bytes::from(vec![2; 29])).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !matches!(
+                storage.usage_snapshot(),
+                CacheUsageSnapshot::Ready { used_bytes: 29, .. }
+            ) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        entry.delete().await;
+        assert_eq!(
+            storage.usage_snapshot(),
+            CacheUsageSnapshot::Ready {
+                used_bytes: 0,
+                capacity_bytes: None,
             }
         );
     }
