@@ -4,6 +4,8 @@ use object_store::{path::Path, Attribute, Attributes, ObjectMeta};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fmt::Display, ops::Range};
 
+use crate::db_cache::CacheUsageSnapshot;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalCacheHead {
     pub location: String,
@@ -74,6 +76,10 @@ pub trait LocalCacheStorage: Send + Sync + std::fmt::Debug + Display + 'static {
     fn entry(&self, location: &Path, part_size: usize) -> Box<dyn LocalCacheEntry>;
 
     async fn start_evictor(&self);
+
+    fn usage_snapshot(&self) -> CacheUsageSnapshot {
+        CacheUsageSnapshot::Unavailable
+    }
 }
 
 #[async_trait]

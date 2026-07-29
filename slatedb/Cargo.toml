@@ -34,6 +34,7 @@ log = { workspace = true }
 lru = { workspace = true }
 lz4_flex = { workspace = true, optional = true }
 moka = { workspace = true, features = ["future"], optional = true }
+mixtrics = { workspace = true, optional = true }
 object_store = { workspace = true }
 ouroboros = { workspace = true }
 parking_lot = { workspace = true }
@@ -101,7 +102,7 @@ lz4 = ["dep:lz4_flex"]
 zstd = ["dep:zstd"]
 wal_disable = []
 moka = ["dep:moka"]
-foyer = ["dep:foyer"]
+foyer = ["dep:foyer", "dep:mixtrics"]
 bench-internal = []
 test-util = [
     "tokio/test-util",
