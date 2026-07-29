@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::bytes_range::BytesRange;
 use crate::error::SlateDBError::{
-    LatestTransactionalObjectVersionMissing, TransactionalObjectVersionExists,
+    DatabaseMissing, LatestTransactionalObjectVersionMissing, TransactionalObjectVersionExists,
 };
 use crate::merge_operator::MergeOperatorError;
 use slatedb_txn_obj::TransactionalObjectError;
@@ -54,6 +54,9 @@ pub(crate) enum SlateDBError {
 
     #[error("failed to find latest transactional object (e.g. manifest) version")]
     LatestTransactionalObjectVersionMissing,
+
+    #[error("database does not exist")]
+    DatabaseMissing,
 
     #[error("generic transactional object (e.g. manifest) error {0:?}")]
     TransactionalObjectError(#[from] Arc<TransactionalObjectError>),
@@ -496,6 +499,15 @@ pub enum ErrorKind {
     Internal,
 }
 
+/// Stable machine-readable detail for public errors that require more precise
+/// handling than [`ErrorKind`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorCode {
+    /// A reader cannot open because no database manifest exists.
+    DatabaseMissing,
+}
+
 impl From<ErrorKind> for CloseReason {
     fn from(kind: ErrorKind) -> Self {
         match kind {
@@ -548,6 +560,7 @@ pub enum RetryReason {
 pub struct Error {
     msg: String,
     kind: ErrorKind,
+    code: Option<ErrorCode>,
     source: Option<BoxError>,
 }
 
@@ -575,6 +588,7 @@ impl Error {
         Self {
             msg,
             kind: ErrorKind::Transaction,
+            code: None,
             source: None,
         }
     }
@@ -584,6 +598,7 @@ impl Error {
         Self {
             msg,
             kind: ErrorKind::Closed(reason),
+            code: None,
             source: None,
         }
     }
@@ -593,6 +608,7 @@ impl Error {
         Self {
             msg,
             kind: ErrorKind::Unavailable,
+            code: None,
             source: None,
         }
     }
@@ -602,6 +618,7 @@ impl Error {
         Self {
             msg,
             kind: ErrorKind::Invalid,
+            code: None,
             source: None,
         }
     }
@@ -611,6 +628,7 @@ impl Error {
         Self {
             msg,
             kind: ErrorKind::Data,
+            code: None,
             source: None,
         }
     }
@@ -620,6 +638,7 @@ impl Error {
         Self {
             msg,
             kind: ErrorKind::Internal,
+            code: None,
             source: None,
         }
     }
@@ -630,9 +649,19 @@ impl Error {
         self
     }
 
+    fn with_code(mut self, code: ErrorCode) -> Self {
+        self.code = Some(code);
+        self
+    }
+
     /// Returns the error kind.
     pub fn kind(&self) -> ErrorKind {
         self.kind
+    }
+
+    /// Returns stable machine-readable detail when one is available.
+    pub fn code(&self) -> Option<ErrorCode> {
+        self.code
     }
 }
 
@@ -727,6 +756,7 @@ impl From<SlateDBError> for Error {
             SlateDBError::InvalidVersion { .. } => Error::data(msg),
             SlateDBError::ManifestMissing(_) => Error::data(msg),
             LatestTransactionalObjectVersionMissing => Error::data(msg),
+            DatabaseMissing => Error::data(msg).with_code(ErrorCode::DatabaseMissing),
             TransactionalObjectVersionExists => Error::data(msg),
             SlateDBError::InvalidTransactionalObjectState => Error::data(msg),
             SlateDBError::EmptyManifest => Error::data(msg),
@@ -794,5 +824,26 @@ mod tests {
         let public_err = Error::from(err);
 
         assert_eq!(public_err.kind(), ErrorKind::Unavailable);
+    }
+
+    #[test]
+    fn database_missing_has_stable_code_without_changing_broad_kind() {
+        let public_err = Error::from(SlateDBError::DatabaseMissing);
+
+        assert_eq!(public_err.kind(), ErrorKind::Data);
+        assert_eq!(public_err.code(), Some(ErrorCode::DatabaseMissing));
+    }
+
+    #[test]
+    fn other_data_errors_do_not_claim_database_is_missing() {
+        for err in [
+            SlateDBError::LatestTransactionalObjectVersionMissing,
+            SlateDBError::ManifestMissing(7),
+            SlateDBError::InvalidDBState,
+        ] {
+            let public_err = Error::from(err);
+            assert_eq!(public_err.kind(), ErrorKind::Data);
+            assert_eq!(public_err.code(), None);
+        }
     }
 }
