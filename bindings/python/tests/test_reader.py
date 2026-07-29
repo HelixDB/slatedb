@@ -52,7 +52,7 @@ async def test_reader_build_fails_when_database_is_missing() -> None:
 
     with pytest.raises(Error.Data) as exc:
         await builder.build()
-    assert "failed to find latest transactional object" in exc.value.message
+    assert "database does not exist" in exc.value.message
 
 
 @pytest.mark.asyncio
