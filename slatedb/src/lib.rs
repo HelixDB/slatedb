@@ -54,7 +54,7 @@ pub use db_iter::{DbIterator, DbRecencyIterator};
 pub use db_reader::{DbReader, DbReaderMode};
 pub use db_snapshot::DbSnapshot;
 pub use db_transaction::DbTransaction;
-pub use error::{CloseReason, Error, ErrorKind};
+pub use error::{CloseReason, Error, ErrorCode, ErrorKind};
 pub use filter::BloomFilter;
 pub use filter_policy::{
     BloomFilterPolicy, Filter, FilterBuilder, FilterContext, FilterPolicy, FilterQuery,
