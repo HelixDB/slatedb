@@ -1302,7 +1302,13 @@ impl DbReader {
         Self::validate_options(&options)?;
 
         let manifest =
-            StoredManifest::load(Arc::clone(&manifest_store), system_clock.clone()).await?;
+            match StoredManifest::load(Arc::clone(&manifest_store), system_clock.clone()).await {
+                Ok(manifest) => manifest,
+                Err(SlateDBError::LatestTransactionalObjectVersionMissing) => {
+                    return Err(SlateDBError::DatabaseMissing);
+                }
+                Err(error) => return Err(error),
+            };
         if !manifest.db_state().initialized {
             return Err(SlateDBError::InvalidDBState);
         }
@@ -1908,6 +1914,25 @@ mod tests {
             reader.get(key).await.unwrap(),
             Some(Bytes::from_static(value))
         );
+    }
+
+    #[tokio::test]
+    async fn empty_database_reader_returns_typed_database_missing() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let error = match DbReader::open(
+            "/tmp/test_reader_database_missing",
+            object_store,
+            None,
+            DbReaderOptions::default(),
+        )
+        .await
+        {
+            Ok(_) => panic!("empty object store must not open a reader"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), crate::ErrorKind::Data);
+        assert_eq!(error.code(), Some(crate::ErrorCode::DatabaseMissing));
     }
 
     #[tokio::test]
