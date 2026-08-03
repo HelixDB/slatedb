@@ -749,6 +749,20 @@ mod tests {
 
     #[test]
     fn test_mixed_write_kinds_are_exclusive_in_either_order() {
+        let mut repeated_commutative = TransactionState {
+            started_seq: 0,
+            committed_seq: None,
+            writes: HashMap::new(),
+            read_keys: HashSet::new(),
+            read_ranges: Vec::new(),
+        };
+        repeated_commutative.track_writes(commutative_writes(["key"]));
+        repeated_commutative.track_writes(commutative_writes(["key"]));
+        assert_eq!(
+            repeated_commutative.writes.get(b"key".as_slice()),
+            Some(&TransactionWriteKind::CommutativeMerge)
+        );
+
         let mut commutative_then_exclusive = TransactionState {
             started_seq: 0,
             committed_seq: None,
