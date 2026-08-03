@@ -56,8 +56,15 @@ pub struct WriteBatch {
     /// Keys whose surviving operations are exclusively commutative merges.
     ///
     /// This is transaction conflict metadata only. It is never encoded into a
-    /// [`RowEntry`] or persisted by the WAL, memtable, or compaction paths.
-    commutative_merge_keys: HashSet<Bytes>,
+    /// [`RowEntry`] or persisted by the WAL, memtable, or compaction paths. The
+    /// set is boxed and allocated lazily so ordinary write batches retain their
+    /// existing inline size and pay no allocation for this opt-in metadata.
+    commutative_merge_keys: Option<Box<CommutativeMergeKeys>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CommutativeMergeKeys {
+    keys: HashSet<Bytes>,
 }
 
 impl Default for WriteBatch {
@@ -151,7 +158,7 @@ impl WriteBatch {
             ops: BTreeMap::new(),
             op_count: 0,
             has_merge_ops: false,
-            commutative_merge_keys: HashSet::new(),
+            commutative_merge_keys: None,
         }
     }
 
@@ -230,7 +237,7 @@ impl WriteBatch {
     /// - if the value size is larger than u32::MAX
     pub fn put_bytes_with_options(&mut self, key: Bytes, value: Bytes, options: &PutOptions) {
         self.assert_kv(&key, &value);
-        self.commutative_merge_keys.remove(&key);
+        self.remove_commutative_merge_key(&key);
 
         // put will overwrite the existing key so we can safely
         // remove all previous entries.
@@ -289,13 +296,19 @@ impl WriteBatch {
         let key = Bytes::copy_from_slice(key.as_ref());
         let value = value.as_ref();
         let op = WriteOp::Merge(Bytes::copy_from_slice(value), options.clone());
-        let existing_operations_are_commutative =
-            self.ops.contains_key(&key) && self.commutative_merge_keys.contains(&key);
+        let existing_operations_are_commutative = self.ops.contains_key(&key)
+            && self
+                .commutative_merge_keys
+                .as_ref()
+                .is_some_and(|keys| keys.keys.contains(&key));
         let is_first_operation = !self.ops.contains_key(&key);
         if commutative && (is_first_operation || existing_operations_are_commutative) {
-            self.commutative_merge_keys.insert(key.clone());
+            self.commutative_merge_keys
+                .get_or_insert_default()
+                .keys
+                .insert(key.clone());
         } else {
-            self.commutative_merge_keys.remove(&key);
+            self.remove_commutative_merge_key(&key);
         }
 
         if let Some(ops) = self.ops.get_mut(&key) {
@@ -313,7 +326,7 @@ impl WriteBatch {
         self.assert_kv(&key, &[]);
 
         let key = Bytes::copy_from_slice(key.as_ref());
-        self.commutative_merge_keys.remove(&key);
+        self.remove_commutative_merge_key(&key);
 
         // delete will overwrite the existing key so we can safely
         // remove all previous entries.
@@ -351,7 +364,19 @@ impl WriteBatch {
 
     /// Returns whether every surviving operation for `key` is a commutative merge.
     pub(crate) fn is_commutative_merge_key(&self, key: &[u8]) -> bool {
-        self.commutative_merge_keys.contains(key)
+        self.commutative_merge_keys
+            .as_ref()
+            .is_some_and(|keys| keys.keys.contains(key))
+    }
+
+    fn remove_commutative_merge_key(&mut self, key: &[u8]) {
+        let Some(keys) = self.commutative_merge_keys.as_mut() else {
+            return;
+        };
+        keys.keys.remove(key);
+        if keys.keys.is_empty() {
+            self.commutative_merge_keys = None;
+        }
     }
 
     /// Converts a WriteBatch into a vector of RowEntry objects with
@@ -918,11 +943,13 @@ mod tests {
         only_commutative.merge_commutative(b"key", b"first");
         only_commutative.merge_commutative(b"key", b"second");
         assert!(only_commutative.is_commutative_merge_key(b"key"));
+        assert!(only_commutative.commutative_merge_keys.is_some());
 
         let mut commutative_then_ordinary = WriteBatch::new();
         commutative_then_ordinary.merge_commutative(b"key", b"first");
         commutative_then_ordinary.merge(b"key", b"second");
         assert!(!commutative_then_ordinary.is_commutative_merge_key(b"key"));
+        assert!(commutative_then_ordinary.commutative_merge_keys.is_none());
 
         let mut ordinary_then_commutative = WriteBatch::new();
         ordinary_then_commutative.merge(b"key", b"first");
