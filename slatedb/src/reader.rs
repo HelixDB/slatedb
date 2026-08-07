@@ -1154,9 +1154,7 @@ mod tests {
             self.memtable.clone()
         }
 
-        fn imm_memtables(
-            &self,
-        ) -> Box<dyn Iterator<Item = Arc<ImmutableMemtable>> + Send + '_> {
+        fn imm_memtables(&self) -> Box<dyn Iterator<Item = Arc<ImmutableMemtable>> + Send + '_> {
             Box::new(self.imm_memtable.iter().cloned())
         }
 

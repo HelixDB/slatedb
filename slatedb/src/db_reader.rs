@@ -180,11 +180,7 @@ impl Drop for ReaderGenerationPermit {
 }
 
 impl ReaderGeneration {
-    fn new(
-        manifest_id: u64,
-        checkpoint: Option<Checkpoint>,
-        manifest: Manifest,
-    ) -> Arc<Self> {
+    fn new(manifest_id: u64, checkpoint: Option<Checkpoint>, manifest: Manifest) -> Arc<Self> {
         Arc::new(Self {
             manifest_id,
             checkpoint: checkpoint.map(RwLock::new),
@@ -195,7 +191,9 @@ impl ReaderGeneration {
     }
 
     fn checkpoint(&self) -> Option<Checkpoint> {
-        self.checkpoint.as_ref().map(|checkpoint| checkpoint.read().clone())
+        self.checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.read().clone())
     }
 
     fn managed_checkpoint(&self) -> &RwLock<Checkpoint> {
@@ -585,9 +583,7 @@ impl DbReaderInner {
             .await
     }
 
-    pub(crate) async fn snapshot_multi_get_key_value_with_options<
-        K: AsRef<[u8]> + Send + Sync,
-    >(
+    pub(crate) async fn snapshot_multi_get_key_value_with_options<K: AsRef<[u8]> + Send + Sync>(
         &self,
         state: Arc<ReaderState>,
         max_seq: u64,
@@ -1124,10 +1120,7 @@ impl ManifestPoller {
                 .id;
             generations.insert(checkpoint_id, Arc::downgrade(&generation));
         }
-        let poller = Self {
-            inner,
-            generations,
-        };
+        let poller = Self { inner, generations };
         poller.report_active_checkpoints();
         poller
     }
@@ -2251,7 +2244,7 @@ mod tests {
         let error = match DbReader::open(
             "/tmp/test_reader_database_missing",
             object_store,
-            None,
+            DbReaderMode::ManagedCheckpoint,
             DbReaderOptions::default(),
         )
         .await
@@ -2990,13 +2983,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let reader_checkpoint_id = inner
-            .state
-            .read()
-            .generation
-            .checkpoint()
-            .unwrap()
-            .id;
+        let reader_checkpoint_id = inner.state.read().generation.checkpoint().unwrap().id;
 
         // Simulate the writer's GC reaping the expired checkpoint.
         let mut stored_manifest = StoredManifest::load(Arc::clone(&manifest_store), clock.clone())
@@ -3018,13 +3005,7 @@ mod tests {
             .unwrap();
 
         // The reader should have replaced the reaped checkpoint with a new one.
-        let new_checkpoint_id = inner
-            .state
-            .read()
-            .generation
-            .checkpoint()
-            .unwrap()
-            .id;
+        let new_checkpoint_id = inner.state.read().generation.checkpoint().unwrap().id;
         assert_ne!(reader_checkpoint_id, new_checkpoint_id);
         let latest_manifest = manifest_store.read_latest_manifest().await.unwrap();
         let checkpoints = &latest_manifest.manifest.core.checkpoints;
