@@ -83,31 +83,6 @@ impl DbTransaction {
         tx.merge(key, operand).map_err(Into::into)
     }
 
-    /// Buffers a merge operand that is compatible with concurrent
-    /// commutative merges for the same key.
-    ///
-    /// The caller must guarantee that applying any concurrent operands in
-    /// either order produces the same value. SlateDB cannot validate this
-    /// application-defined algebraic property. This method is appropriate for
-    /// operations such as additive deltas and set union, but not ordered
-    /// appends, replacements, compare-and-set, or racing additions/removals.
-    ///
-    /// The key remains tracked for point and range read conflicts. SlateDB
-    /// omits a write/write conflict only when both transactions' surviving
-    /// operations for the key are exclusively commutative merges. Any put,
-    /// delete, ordinary merge, or mixed operation restores exclusive conflict
-    /// behavior. Atomicity, durability, visibility, and persisted encoding are
-    /// identical to an ordinary transactional merge.
-    ///
-    /// Misuse cannot cause undefined behavior, but it can violate the caller's
-    /// application-level ordering or consistency invariants.
-    pub async fn merge_commutative(&self, key: Vec<u8>, operand: Vec<u8>) -> Result<(), Error> {
-        validate_key_value(&key, &operand)?;
-        let guard = self.inner.lock().await;
-        let tx = guard.as_ref().ok_or(SlateDbError::TransactionCompleted)?;
-        tx.merge_commutative(key, operand).map_err(Into::into)
-    }
-
     /// Buffers a merge operand inside the transaction using custom merge options.
     pub async fn merge_with_options(
         &self,
