@@ -21,6 +21,16 @@ pub enum IsolationLevel {
     SerializableSnapshot,
 }
 
+/// Conflict behavior for a transaction's final operations on one key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TransactionWriteKind {
+    /// The key conflicts with every concurrent write to the same key.
+    Exclusive,
+    /// The key is merge-only and may coexist with another merge-only,
+    /// commutative write to the same key.
+    CommutativeMerge,
+}
+
 #[derive(Debug)]
 pub(crate) struct TransactionState {
     /// The sequence number when the transaction started. This is used to establish
@@ -30,9 +40,9 @@ pub(crate) struct TransactionState {
     /// a transaction is committed and is used to check conflicts with recent committed
     /// transactions.
     committed_seq: Option<u64>,
-    /// The write keys of the transaction for write-write conflict detection.
+    /// The transaction's final per-key write behavior for conflict detection.
     /// Used in both Snapshot Isolation and Serializable Snapshot Isolation.
-    write_keys: HashSet<Bytes>,
+    writes: HashMap<Bytes, TransactionWriteKind>,
     /// The read keys of the transaction for read-write conflict detection.
     /// Only used in Serializable Snapshot Isolation mode.
     read_keys: HashSet<Bytes>,
@@ -42,9 +52,29 @@ pub(crate) struct TransactionState {
 }
 
 impl TransactionState {
-    /// Add write keys to this transaction's write set for conflict detection.
+    /// Add writes to this transaction's write set for conflict detection.
+    ///
+    /// Exclusive behavior dominates when a key is tracked more than once so a
+    /// mixed operation sequence cannot accidentally become compatible.
+    fn track_writes(&mut self, writes: impl IntoIterator<Item = (Bytes, TransactionWriteKind)>) {
+        for (key, kind) in writes {
+            self.writes
+                .entry(key)
+                .and_modify(|existing| {
+                    if *existing != kind {
+                        *existing = TransactionWriteKind::Exclusive;
+                    }
+                })
+                .or_insert(kind);
+        }
+    }
+
+    #[cfg(test)]
     fn track_write_keys(&mut self, keys: impl IntoIterator<Item = Bytes>) {
-        self.write_keys.extend(keys);
+        self.track_writes(
+            keys.into_iter()
+                .map(|key| (key, TransactionWriteKind::Exclusive)),
+        );
     }
 
     /// Add read keys to this transaction's read set for SSI conflict detection.
@@ -120,7 +150,7 @@ impl TransactionManager {
             TransactionState {
                 started_seq: seq,
                 committed_seq: None,
-                write_keys: HashSet::new(),
+                writes: HashMap::new(),
                 read_keys: HashSet::new(),
                 read_ranges: Vec::new(),
             },
@@ -134,7 +164,7 @@ impl TransactionManager {
         let txn_state = TransactionState {
             started_seq: seq,
             committed_seq: None,
-            write_keys: HashSet::new(),
+            writes: HashMap::new(),
             read_keys: HashSet::new(),
             read_ranges: Vec::new(),
         };
@@ -158,13 +188,27 @@ impl TransactionManager {
         inner.recycle_recent_committed_txns();
     }
 
-    /// Track write keys for a transaction. This is used for conflict detection.
-    /// Keys should be tracked before calling commit-related methods.
-    pub(crate) fn track_write_keys(&self, txn_id: &Uuid, write_keys: &HashSet<Bytes>) {
+    /// Track writes for a transaction. This is used for conflict detection.
+    /// Writes should be tracked before calling commit-related methods.
+    pub(crate) fn track_writes(
+        &self,
+        txn_id: &Uuid,
+        writes: &HashMap<Bytes, TransactionWriteKind>,
+    ) {
         let mut inner = self.inner.write();
         if let Some(txn_state) = inner.active_txns.get_mut(txn_id) {
-            txn_state.track_write_keys(write_keys.iter().cloned());
+            txn_state.track_writes(writes.iter().map(|(key, kind)| (key.clone(), *kind)));
         }
+    }
+
+    #[cfg(test)]
+    fn track_write_keys(&self, txn_id: &Uuid, write_keys: &HashSet<Bytes>) {
+        let writes = write_keys
+            .iter()
+            .cloned()
+            .map(|key| (key, TransactionWriteKind::Exclusive))
+            .collect();
+        self.track_writes(txn_id, &writes);
     }
 
     /// Track a key read operation (for SSI)
@@ -200,8 +244,7 @@ impl TransactionManager {
         };
 
         // both SI and SSI need to check write-write conflicts
-        let ww_conflict =
-            inner.has_write_write_conflict(&txn_state.write_keys, txn_state.started_seq);
+        let ww_conflict = inner.has_write_write_conflict(&txn_state.writes, txn_state.started_seq);
         if ww_conflict {
             return true;
         }
@@ -249,7 +292,11 @@ impl TransactionManager {
         inner.track_recent_committed_state(TransactionState {
             started_seq: committed_seq,
             committed_seq: Some(committed_seq),
-            write_keys: keys.clone(),
+            writes: keys
+                .iter()
+                .cloned()
+                .map(|key| (key, TransactionWriteKind::Exclusive))
+                .collect(),
             read_keys: HashSet::new(),
             read_ranges: Vec::new(),
         });
@@ -319,9 +366,13 @@ impl TransactionManagerInner {
         }
     }
 
-    fn has_write_write_conflict(&self, write_keys: &HashSet<Bytes>, started_seq: u64) -> bool {
+    fn has_write_write_conflict(
+        &self,
+        writes: &HashMap<Bytes, TransactionWriteKind>,
+        started_seq: u64,
+    ) -> bool {
         // If the current transaction has no write operations, there's no write-write conflict
-        if write_keys.is_empty() {
+        if writes.is_empty() {
             return false;
         }
 
@@ -331,12 +382,21 @@ impl TransactionManagerInner {
                 "all txns in recent_committed_txns should be committed with committed_seq set",
             );
 
-            // if another transaction committed after the current transaction started,
-            // and they have overlapping write keys, then there's a conflict.
-            if other_committed_seq > started_seq
-                && !write_keys.is_disjoint(&committed_txn.write_keys)
-            {
-                return true;
+            if other_committed_seq > started_seq {
+                for (key, kind) in writes {
+                    let Some(other_kind) = committed_txn.writes.get(key) else {
+                        continue;
+                    };
+                    if !matches!(
+                        (kind, other_kind),
+                        (
+                            TransactionWriteKind::CommutativeMerge,
+                            TransactionWriteKind::CommutativeMerge
+                        )
+                    ) {
+                        return true;
+                    }
+                }
             }
         }
 
@@ -368,7 +428,10 @@ impl TransactionManagerInner {
             if other_committed_seq > started_seq {
                 // Check if any of the current transaction's read keys were written by
                 // the committed transaction.
-                if !read_keys.is_disjoint(&committed_txn.write_keys) {
+                if read_keys
+                    .iter()
+                    .any(|read_key| committed_txn.writes.contains_key(read_key))
+                {
                     return true;
                 }
 
@@ -376,8 +439,8 @@ impl TransactionManagerInner {
                 // committed transaction write keys.
                 for read_range in &read_ranges {
                     if committed_txn
-                        .write_keys
-                        .iter()
+                        .writes
+                        .keys()
                         .any(|write_key| read_range.contains(write_key))
                     {
                         return true;
@@ -399,6 +462,22 @@ mod tests {
     use rstest::rstest;
     use slatedb_common::DbRand;
     use std::collections::HashSet;
+
+    fn exclusive_writes(
+        keys: impl IntoIterator<Item = &'static str>,
+    ) -> HashMap<Bytes, TransactionWriteKind> {
+        keys.into_iter()
+            .map(|key| (Bytes::from(key), TransactionWriteKind::Exclusive))
+            .collect()
+    }
+
+    fn commutative_writes(
+        keys: impl IntoIterator<Item = &'static str>,
+    ) -> HashMap<Bytes, TransactionWriteKind> {
+        keys.into_iter()
+            .map(|key| (Bytes::from(key), TransactionWriteKind::CommutativeMerge))
+            .collect()
+    }
 
     struct CheckConflictTestCase {
         name: &'static str,
@@ -495,7 +574,7 @@ mod tests {
         recent_committed_txns: vec![TransactionState {
             started_seq: 50,
             committed_seq: Some(80),
-            write_keys: ["key1", "key2"].into_iter().map(Bytes::from).collect(),
+            writes: exclusive_writes(["key1", "key2"]),
             read_keys: HashSet::new(),
             read_ranges: Vec::new(),
         }],
@@ -508,7 +587,7 @@ mod tests {
         recent_committed_txns: vec![TransactionState {
             started_seq: 50,
             committed_seq: Some(150),
-            write_keys: ["key1"].into_iter().map(Bytes::from).collect(),
+            writes: exclusive_writes(["key1"]),
             read_keys: HashSet::new(),
             read_ranges: Vec::new(),
         }],
@@ -522,14 +601,14 @@ mod tests {
             TransactionState {
                 started_seq: 30,
                 committed_seq: Some(50),
-                write_keys: ["key1"].into_iter().map(Bytes::from).collect(),
+                writes: exclusive_writes(["key1"]),
                 read_keys: HashSet::new(),
                 read_ranges: Vec::new(),
             },
             TransactionState {
                 started_seq: 80,
                 committed_seq: Some(150),
-                write_keys: ["key2"].into_iter().map(Bytes::from).collect(),
+                writes: exclusive_writes(["key2"]),
                 read_keys: HashSet::new(),
                 read_ranges: Vec::new(),
             },
@@ -543,7 +622,7 @@ mod tests {
         recent_committed_txns: vec![TransactionState {
             started_seq: 30,
             committed_seq: Some(50),
-            write_keys: ["key1"].into_iter().map(Bytes::from).collect(),
+            writes: exclusive_writes(["key1"]),
             read_keys: HashSet::new(),
             read_ranges: Vec::new(),
         }],
@@ -556,7 +635,7 @@ mod tests {
         recent_committed_txns: vec![TransactionState {
             started_seq: 100,
             committed_seq: Some(100),
-            write_keys: ["key1"].into_iter().map(Bytes::from).collect(),
+            writes: exclusive_writes(["key1"]),
             read_keys: HashSet::new(),
             read_ranges: Vec::new(),
         }],
@@ -569,10 +648,7 @@ mod tests {
         recent_committed_txns: vec![TransactionState {
             started_seq: 80,
             committed_seq: Some(150),
-            write_keys: ["key1", "key2", "key3"]
-                .into_iter()
-                .map(Bytes::from)
-                .collect(),
+            writes: exclusive_writes(["key1", "key2", "key3"]),
             read_keys: HashSet::new(),
             read_ranges: Vec::new(),
         }],
@@ -585,7 +661,7 @@ mod tests {
         recent_committed_txns: vec![TransactionState {
             started_seq: u64::MAX - 1,
             committed_seq: Some(u64::MAX),
-            write_keys: ["key1"].into_iter().map(Bytes::from).collect(),
+            writes: exclusive_writes(["key1"]),
             read_keys: HashSet::new(),
             read_ranges: Vec::new(),
         }],
@@ -603,15 +679,12 @@ mod tests {
         }
 
         // Convert current transaction write keys
-        let conflict_keys: HashSet<Bytes> = case
-            .current_write_keys
-            .into_iter()
-            .map(Bytes::from)
-            .collect();
+        let conflict_writes = exclusive_writes(case.current_write_keys);
 
         // Call the method under test
         let inner = txn_manager.inner.read();
-        let has_conflict = inner.has_write_write_conflict(&conflict_keys, case.current_started_seq);
+        let has_conflict =
+            inner.has_write_write_conflict(&conflict_writes, case.current_started_seq);
 
         // Verify result
         assert_eq!(
@@ -619,6 +692,131 @@ mod tests {
             "Test case '{}' failed",
             case.name
         );
+    }
+
+    #[rstest]
+    #[case::commutative_with_commutative(
+        TransactionWriteKind::CommutativeMerge,
+        TransactionWriteKind::CommutativeMerge,
+        false
+    )]
+    #[case::commutative_with_exclusive(
+        TransactionWriteKind::CommutativeMerge,
+        TransactionWriteKind::Exclusive,
+        true
+    )]
+    #[case::exclusive_with_commutative(
+        TransactionWriteKind::Exclusive,
+        TransactionWriteKind::CommutativeMerge,
+        true
+    )]
+    #[case::exclusive_with_exclusive(
+        TransactionWriteKind::Exclusive,
+        TransactionWriteKind::Exclusive,
+        true
+    )]
+    fn test_write_write_conflict_respects_write_kind(
+        #[case] current_kind: TransactionWriteKind,
+        #[case] committed_kind: TransactionWriteKind,
+        #[case] expected_conflict: bool,
+    ) {
+        let txn_manager = create_transaction_manager();
+        txn_manager
+            .inner
+            .write()
+            .recent_committed_txns
+            .push_back(TransactionState {
+                started_seq: 50,
+                committed_seq: Some(150),
+                writes: [(Bytes::from_static(b"key"), committed_kind)]
+                    .into_iter()
+                    .collect(),
+                read_keys: HashSet::new(),
+                read_ranges: Vec::new(),
+            });
+        let writes = [(Bytes::from_static(b"key"), current_kind)]
+            .into_iter()
+            .collect();
+
+        assert_eq!(
+            txn_manager
+                .inner
+                .read()
+                .has_write_write_conflict(&writes, 100),
+            expected_conflict
+        );
+    }
+
+    #[test]
+    fn test_mixed_write_kinds_are_exclusive_in_either_order() {
+        let mut repeated_commutative = TransactionState {
+            started_seq: 0,
+            committed_seq: None,
+            writes: HashMap::new(),
+            read_keys: HashSet::new(),
+            read_ranges: Vec::new(),
+        };
+        repeated_commutative.track_writes(commutative_writes(["key"]));
+        repeated_commutative.track_writes(commutative_writes(["key"]));
+        assert_eq!(
+            repeated_commutative.writes.get(b"key".as_slice()),
+            Some(&TransactionWriteKind::CommutativeMerge)
+        );
+
+        let mut commutative_then_exclusive = TransactionState {
+            started_seq: 0,
+            committed_seq: None,
+            writes: HashMap::new(),
+            read_keys: HashSet::new(),
+            read_ranges: Vec::new(),
+        };
+        commutative_then_exclusive.track_writes(commutative_writes(["key"]));
+        commutative_then_exclusive.track_writes(exclusive_writes(["key"]));
+        assert_eq!(
+            commutative_then_exclusive.writes.get(b"key".as_slice()),
+            Some(&TransactionWriteKind::Exclusive)
+        );
+
+        let mut exclusive_then_commutative = TransactionState {
+            started_seq: 0,
+            committed_seq: None,
+            writes: HashMap::new(),
+            read_keys: HashSet::new(),
+            read_ranges: Vec::new(),
+        };
+        exclusive_then_commutative.track_writes(exclusive_writes(["key"]));
+        exclusive_then_commutative.track_writes(commutative_writes(["key"]));
+        assert_eq!(
+            exclusive_then_commutative.writes.get(b"key".as_slice()),
+            Some(&TransactionWriteKind::Exclusive)
+        );
+    }
+
+    #[test]
+    fn test_commutative_writes_remain_visible_to_point_and_range_read_conflicts() {
+        let txn_manager = create_transaction_manager();
+        txn_manager
+            .inner
+            .write()
+            .recent_committed_txns
+            .push_back(TransactionState {
+                started_seq: 50,
+                committed_seq: Some(150),
+                writes: commutative_writes(["foo5"]),
+                read_keys: HashSet::new(),
+                read_ranges: Vec::new(),
+            });
+        let read_keys = [Bytes::from_static(b"foo5")].into_iter().collect();
+
+        let inner = txn_manager.inner.read();
+        assert!(inner.has_read_write_conflict(&read_keys, Vec::new(), 100));
+        assert!(inner.has_read_write_conflict(
+            &HashSet::new(),
+            vec![BytesRange::from(
+                Bytes::from_static(b"foo0")..=Bytes::from_static(b"foo9")
+            )],
+            100
+        ));
     }
 
     #[derive(Debug)]
@@ -686,7 +884,7 @@ mod tests {
         expected_recent_committed_txn: Some(TransactionState {
             started_seq: 100,
             committed_seq: Some(150),
-            write_keys: ["key1", "key2"].into_iter().map(Bytes::from).collect(),
+            writes: exclusive_writes(["key1", "key2"]),
             read_keys: HashSet::new(),
             read_ranges: Vec::new(),
         }),
@@ -720,7 +918,7 @@ mod tests {
         expected_recent_committed_txn: Some(TransactionState {
             started_seq: 100,
             committed_seq: Some(100),
-            write_keys: ["key1", "key2"].into_iter().map(Bytes::from).collect(),
+            writes: exclusive_writes(["key1", "key2"]),
             read_keys: HashSet::new(),
             read_ranges: Vec::new(),
         }),
@@ -751,7 +949,7 @@ mod tests {
         expected_recent_committed_txn: Some(TransactionState {
             started_seq: 100,
             committed_seq: Some(150),
-            write_keys: ["existing_key", "key1", "key2"].into_iter().map(Bytes::from).collect(),
+            writes: exclusive_writes(["existing_key", "key1", "key2"]),
             read_keys: HashSet::new(),
             read_ranges: Vec::new(),
         }),
@@ -806,9 +1004,9 @@ mod tests {
                 test_case.name, expected_txn.committed_seq, actual_txn.committed_seq
             );
             assert_eq!(
-                actual_txn.write_keys, expected_txn.write_keys,
-                "Test case '{}' failed: expected write_keys {:?}, got {:?}",
-                test_case.name, expected_txn.write_keys, actual_txn.write_keys
+                actual_txn.writes, expected_txn.writes,
+                "Test case '{}' failed: expected writes {:?}, got {:?}",
+                test_case.name, expected_txn.writes, actual_txn.writes
             );
         }
     }
@@ -919,7 +1117,7 @@ mod tests {
             inner.recent_committed_txns.push_back(TransactionState {
                 started_seq: 50,
                 committed_seq: None, // This should not happen in practice but let's test
-                write_keys: HashSet::new(),
+                writes: HashMap::new(),
                 read_keys: HashSet::new(),
                 read_ranges: Vec::new(),
             });
@@ -1403,13 +1601,16 @@ mod tests {
                         }
 
                         // Direct read-write conflict on keys
-                        let direct_conflict = !txn.read_keys.is_disjoint(&committed.write_keys);
+                        let direct_conflict = txn
+                            .read_keys
+                            .iter()
+                            .any(|read_key| committed.writes.contains_key(read_key));
 
                         // Phantom conflict via range containment
                         let mut phantom_conflict = false;
-                        if !txn.read_ranges.is_empty() && !committed.write_keys.is_empty() {
+                        if !txn.read_ranges.is_empty() && !committed.writes.is_empty() {
                             'outer: for range in txn.read_ranges.iter() {
-                                for w in committed.write_keys.iter() {
+                                for w in committed.writes.keys() {
                                     if range.contains(w) {
                                         phantom_conflict = true;
                                         break 'outer;
