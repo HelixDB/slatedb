@@ -519,6 +519,25 @@ pub trait DbTransactionOps: DbReadOps {
         self.merge_with_options(key, value, &MergeOptions::default())
     }
 
+    /// Buffers a merge operand that is compatible with concurrent
+    /// commutative merges for the same key.
+    ///
+    /// See [`DbTransaction::merge_commutative`](crate::DbTransaction::merge_commutative)
+    /// for the algebraic caller contract and the precise conflict, isolation,
+    /// atomicity, and persistence guarantees.
+    ///
+    /// The default implementation conservatively delegates to [`Self::merge`]
+    /// so third-party transaction implementations remain source-compatible and
+    /// retain ordinary write/write conflicts unless they explicitly override
+    /// this method.
+    fn merge_commutative<K, V>(&self, key: K, operand: V) -> Result<(), crate::Error>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        self.merge(key, operand)
+    }
+
     /// Merge a key-value pair into the transaction with custom `MergeOptions`.
     ///
     /// ## Errors
