@@ -78,6 +78,12 @@ pub enum DbReaderMode {
     FollowLatest,
 }
 
+impl From<Option<Uuid>> for DbReaderMode {
+    fn from(checkpoint: Option<Uuid>) -> Self {
+        checkpoint.map_or(Self::ManagedCheckpoint, Self::Checkpoint)
+    }
+}
+
 /// Where a reader stops replaying the WAL when it builds its state.
 ///
 /// This is only reached when replay is wanted at all; a reader configured with
@@ -1386,16 +1392,16 @@ impl DbReader {
     /// pinned to a supplied checkpoint, or follows the latest manifest without GC protection.
     /// Managed readers retain each generation's checkpoint until all snapshots, iterators, and
     /// in-flight reads using that generation are gone.
-    pub async fn open<P: Into<Path>>(
+    pub async fn open<P: Into<Path>, M: Into<DbReaderMode>>(
         path: P,
         object_store: Arc<dyn ObjectStore>,
-        mode: DbReaderMode,
+        mode: M,
         options: DbReaderOptions,
     ) -> Result<Self, crate::Error> {
         // Use the builder API internally
         Self::builder(path, object_store)
             .with_options(options)
-            .with_reader_mode(mode)
+            .with_reader_mode(mode.into())
             .build()
             .await
     }
@@ -2155,6 +2161,17 @@ mod tests {
             self.last_wal_file_id_calls.fetch_add(1, Ordering::Relaxed);
             Ok(10)
         }
+    }
+
+    #[test]
+    fn legacy_checkpoint_options_convert_to_reader_modes() {
+        let checkpoint_id = Uuid::new_v4();
+
+        assert_eq!(DbReaderMode::from(None), DbReaderMode::ManagedCheckpoint);
+        assert_eq!(
+            DbReaderMode::from(Some(checkpoint_id)),
+            DbReaderMode::Checkpoint(checkpoint_id)
+        );
     }
 
     async fn wait_for_reader_generation_change(reader: &DbReader, previous: Uuid) {
