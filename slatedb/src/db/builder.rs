@@ -102,6 +102,7 @@
 //! ```
 //!
 use std::collections::{BTreeSet, HashMap};
+use std::num::NonZeroU64;
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
@@ -190,6 +191,7 @@ pub struct DbBuilder<P: Into<Path>> {
     filter_policies: Vec<Arc<dyn FilterPolicy>>,
     metrics_recorder: Arc<dyn MetricsRecorder>,
     segment_extractor: Option<Arc<dyn crate::prefix_extractor::PrefixExtractor>>,
+    writer_epoch: Option<NonZeroU64>,
 }
 
 impl<P: Into<Path>> DbBuilder<P> {
@@ -213,7 +215,20 @@ impl<P: Into<Path>> DbBuilder<P> {
             filter_policies: default_filter_policies(),
             metrics_recorder: Arc::new(NoopMetricsRecorder::new()),
             segment_extractor: None,
+            writer_epoch: None,
         }
+    }
+
+    /// Requires this writer open to claim exactly `writer_epoch`.
+    ///
+    /// SlateDB rejects the open before publishing its WAL fence when the
+    /// stored writer epoch is greater than or equal to this value. Managed
+    /// control planes can therefore persist a monotonic epoch before opening
+    /// a writer and safely reject delayed stale opens. Builders that do not
+    /// set this value retain the embedded last-open-wins behavior.
+    pub fn with_writer_epoch(mut self, writer_epoch: NonZeroU64) -> Self {
+        self.writer_epoch = Some(writer_epoch);
+        self
     }
 
     /// Set the segment extractor (RFC-0024). When configured, every
@@ -574,7 +589,7 @@ impl<P: Into<Path>> DbBuilder<P> {
         let WriterFenceResult {
             manifest,
             replay_range,
-        } = fencer.fence(stored_manifest).await?;
+        } = fencer.fence(stored_manifest, self.writer_epoch).await?;
 
         let manifest_dirty = manifest.prepare_dirty()?;
 
