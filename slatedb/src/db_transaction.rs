@@ -642,16 +642,6 @@ impl DbTransaction {
     /// transactions using this method for the same key may both commit. Both
     /// operands are retained and applied by the configured [`crate::MergeOperator`].
     ///
-    /// # Why this exists
-    ///
-    /// Ordinary merge operations participate in the same write/write conflict
-    /// checks as puts and deletes. That is conservative for merge operators such
-    /// as counters and set unions, where retaining and applying both operands is
-    /// equivalent to serially executing the transactions in either order.
-    ///
-    /// This method allows callers to state that stronger algebraic property
-    /// explicitly, avoiding unnecessary transaction retries on hot keys.
-    ///
     /// # Required algebraic contract
     ///
     /// Let `apply(base, operand)` represent the configured merge operator. For
@@ -665,19 +655,12 @@ impl DbTransaction {
     /// The existing associativity requirements of [`crate::MergeOperator`] and
     /// [`crate::MergeOperator::merge_batch`] also continue to apply. SlateDB
     /// cannot inspect an application-defined merge operator or prove this
-    /// property.
-    ///
-    /// Idempotence is not required: additive counter deltas are valid even
-    /// though applying the same delta twice changes the result. Set insertion
-    /// and bitmap union are both commutative and idempotent.
-    ///
-    /// Do not use this method for order-sensitive appends, replacements,
-    /// compare-and-set operations, removals that race with additions, or any
-    /// operand whose meaning depends on which transaction commits first.
+    /// property. Idempotence is not required, so additive counter deltas are
+    /// valid. Do not use this method for order-sensitive operations.
     ///
     /// # Conflict and isolation guarantees
     ///
-    /// This remains a tracked write. It does not have the broad semantics of
+    /// This remains a tracked write and does not have the broad semantics of
     /// [`Self::unmark_write`].
     ///
     /// - A write/write conflict is omitted only when both transactions classify
@@ -687,25 +670,12 @@ impl DbTransaction {
     /// - Serializable point-read and range-read dependencies continue to see
     ///   this key as written and can still cause the transaction to abort.
     /// - Reading the key before calling this method does not suppress that read
-    ///   dependency.
-    /// - Conflicts involving other keys in the transaction are unaffected.
-    /// - Calling [`Self::unmark_write`] separately still removes the key from
-    ///   conflict tracking according to that method's broader contract.
-    ///
-    /// Consequently, this method does not guarantee that a transaction will
-    /// commit; it only makes compatible same-key merges cease being a
-    /// write/write conflict.
-    ///
-    /// # Atomicity and persistence guarantees
+    ///   dependency, and conflicts involving other keys are unaffected.
     ///
     /// The operand remains part of the transaction's ordinary atomic write
     /// batch. Commit ordering, durability, snapshot visibility, merge-operator
     /// execution, and error propagation are unchanged. The commutative marker
     /// is transaction conflict metadata only and is not stored on disk.
-    ///
-    /// This is a safe Rust API and cannot cause undefined behavior. Violating
-    /// the algebraic contract can, however, admit executions that violate the
-    /// caller's application-level ordering or consistency invariants.
     ///
     /// Custom [`MergeOptions`] are intentionally unsupported because TTL or
     /// other order-sensitive options would require a separate compatibility
@@ -719,10 +689,8 @@ impl DbTransaction {
     /// # Panics
     ///
     /// Panics under the same input constraints as other write operations:
-    ///
-    /// - the key is empty;
-    /// - the key exceeds `u16::MAX` bytes;
-    /// - the operand exceeds `u32::MAX` bytes.
+    /// the key must be non-empty and no larger than `u16::MAX` bytes, and the
+    /// operand must be no larger than `u32::MAX` bytes.
     ///
     /// # Example
     ///
@@ -731,9 +699,7 @@ impl DbTransaction {
     ///
     /// use bytes::Bytes;
     /// use slatedb::object_store::{memory::InMemory, ObjectStore};
-    /// use slatedb::{
-    ///     Db, Error, IsolationLevel, MergeOperator, MergeOperatorError,
-    /// };
+    /// use slatedb::{Db, Error, IsolationLevel, MergeOperator, MergeOperatorError};
     ///
     /// struct Counter;
     ///
@@ -745,40 +711,32 @@ impl DbTransaction {
     ///         operand: Bytes,
     ///     ) -> Result<Bytes, MergeOperatorError> {
     ///         let current = existing
-    ///             .map(|value| {
-    ///                 u64::from_le_bytes(value.as_ref().try_into().unwrap())
-    ///             })
+    ///             .map(|value| u64::from_le_bytes(value.as_ref().try_into().unwrap()))
     ///             .unwrap_or(0);
-    ///         let delta =
-    ///             u64::from_le_bytes(operand.as_ref().try_into().unwrap());
+    ///         let delta = u64::from_le_bytes(operand.as_ref().try_into().unwrap());
     ///         Ok(Bytes::copy_from_slice(&(current + delta).to_le_bytes()))
     ///     }
     /// }
     ///
-    /// #[tokio::main]
-    /// async fn main() -> Result<(), Error> {
-    ///     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    ///     let db = Db::builder("commutative-merge-example", store)
-    ///         .with_merge_operator(Arc::new(Counter))
-    ///         .build()
-    ///         .await?;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Error> {
+    /// let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    /// let db = Db::builder("commutative-merge-example", store)
+    ///     .with_merge_operator(Arc::new(Counter))
+    ///     .build()
+    ///     .await?;
     ///
-    ///     let first = db.begin(IsolationLevel::SerializableSnapshot).await?;
-    ///     let second = db.begin(IsolationLevel::SerializableSnapshot).await?;
+    /// let first = db.begin(IsolationLevel::SerializableSnapshot).await?;
+    /// let second = db.begin(IsolationLevel::SerializableSnapshot).await?;
+    /// first.merge_commutative(b"counter", 1_u64.to_le_bytes())?;
+    /// second.merge_commutative(b"counter", 1_u64.to_le_bytes())?;
+    /// first.commit().await?;
+    /// second.commit().await?;
     ///
-    ///     first.merge_commutative(b"counter", 1_u64.to_le_bytes())?;
-    ///     second.merge_commutative(b"counter", 1_u64.to_le_bytes())?;
-    ///
-    ///     first.commit().await?;
-    ///     second.commit().await?;
-    ///
-    ///     let value = db.get(b"counter").await?.unwrap();
-    ///     assert_eq!(
-    ///         u64::from_le_bytes(value.as_ref().try_into().unwrap()),
-    ///         2,
-    ///     );
-    ///     Ok(())
-    /// }
+    /// let value = db.get(b"counter").await?.unwrap();
+    /// assert_eq!(u64::from_le_bytes(value.as_ref().try_into().unwrap()), 2);
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn merge_commutative<K, V>(&self, key: K, operand: V) -> Result<(), crate::Error>
     where
@@ -1319,6 +1277,64 @@ mod tests {
 
         txn1.put(b"k2", b"txn1_write").unwrap();
         assert!(txn1.commit().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_txn_multi_get_reads_commutative_merge_overlay() {
+        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = crate::Db::builder("test_txn_multi_get_commutative_overlay", object_store)
+            .with_merge_operator(Arc::new(CounterMergeOperator))
+            .build()
+            .await
+            .unwrap();
+        db.put(b"counter", 10_u64.to_le_bytes()).await.unwrap();
+
+        let txn = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        txn.merge_commutative(b"counter", 2_u64.to_le_bytes())
+            .unwrap();
+
+        let values = txn
+            .multi_get(&[b"counter".as_ref(), b"counter".as_ref()])
+            .await
+            .unwrap();
+        for value in values {
+            let value = value.unwrap();
+            assert_eq!(u64::from_le_bytes(value.as_ref().try_into().unwrap()), 12);
+        }
+
+        txn.commit().await.unwrap();
+        let value = db.get(b"counter").await.unwrap().unwrap();
+        assert_eq!(u64::from_le_bytes(value.as_ref().try_into().unwrap()), 12);
+    }
+
+    #[tokio::test]
+    async fn test_txn_multi_get_read_conflicts_with_commutative_merge() {
+        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = crate::Db::builder("test_txn_multi_get_commutative_conflict", object_store)
+            .with_merge_operator(Arc::new(CounterMergeOperator))
+            .build()
+            .await
+            .unwrap();
+        db.put(b"counter", 0_u64.to_le_bytes()).await.unwrap();
+
+        let reader = db
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await
+            .unwrap();
+        let values = reader.multi_get(&[b"counter"]).await.unwrap();
+        assert_eq!(
+            u64::from_le_bytes(values[0].as_ref().unwrap().as_ref().try_into().unwrap()),
+            0
+        );
+
+        let writer = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        writer
+            .merge_commutative(b"counter", 1_u64.to_le_bytes())
+            .unwrap();
+        writer.commit().await.unwrap();
+
+        reader.put(b"reader-write", b"value").unwrap();
+        assert!(reader.commit().await.is_err());
     }
 
     #[tokio::test]
@@ -2735,6 +2751,7 @@ mod tests {
             garbage_collector_options: None,
             metric_level: MetricLevel::default(),
             default_ttl: None,
+            object_store_max_retries: None,
             block_format: None,
         }
     }

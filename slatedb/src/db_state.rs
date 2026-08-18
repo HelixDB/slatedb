@@ -4,7 +4,6 @@ use crate::error::SlateDBError;
 use crate::manifest::{Manifest, ManifestCore};
 use crate::mem_table::{ImmutableMemtable, KVTable, WritableKVTable};
 use crate::reader::DbStateReader;
-use crate::wal_id::WalIdStore;
 use bytes::Bytes;
 use serde::Serialize;
 use slatedb_txn_obj::DirtyObject;
@@ -101,16 +100,10 @@ impl SsTableView {
 
     /// Create a new view with no visible_range projection.
     pub(crate) fn new(id: Ulid, sst: SsTableHandle) -> Self {
-        let effective_range = match sst.info.first_entry.clone() {
-            Some(physical_first_entry) => {
-                let end_bound = match sst.info.last_entry.clone() {
-                    Some(physical_last_entry) => Included(physical_last_entry),
-                    None => Unbounded,
-                };
-                BytesRange::new(Included(physical_first_entry), end_bound)
-            }
-            None => BytesRange::new_empty(),
-        };
+        let effective_range = sst
+            .info
+            .physical_range()
+            .unwrap_or_else(BytesRange::new_empty);
 
         SsTableView {
             id,
@@ -126,18 +119,10 @@ impl SsTableView {
         sst: SsTableHandle,
         visible_range: Option<BytesRange>,
     ) -> Self {
-        let mut effective_range = match sst.info.first_entry.clone() {
-            Some(physical_first_entry) => {
-                let end_bound = match sst.info.last_entry.clone() {
-                    Some(physical_last_entry) => Included(physical_last_entry),
-                    None => Unbounded,
-                };
-                BytesRange::new(Included(physical_first_entry), end_bound)
-            }
-            None => {
-                unreachable!("SST always has a first entry.")
-            }
-        };
+        let mut effective_range = sst
+            .info
+            .physical_range()
+            .expect("SST always has a first entry.");
         if let Some(visible_range) = &visible_range {
             assert!(
                 visible_range.is_start_bound_included_or_unbounded(),
@@ -164,16 +149,10 @@ impl SsTableView {
     /// the range that [`Self::new_projected`] intersects a visible range
     /// against.
     fn physical_range(&self) -> BytesRange {
-        match self.sst.info.first_entry.clone() {
-            Some(physical_first_entry) => {
-                let end_bound = match self.sst.info.last_entry.clone() {
-                    Some(physical_last_entry) => Included(physical_last_entry),
-                    None => Unbounded,
-                };
-                BytesRange::new(Included(physical_first_entry), end_bound)
-            }
-            None => unreachable!("SST always has a first entry."),
-        }
+        self.sst
+            .info
+            .physical_range()
+            .expect("SST always has a first entry.")
     }
 
     /// Like [`Self::with_visible_range`], but returns `None` instead of
@@ -478,6 +457,18 @@ pub struct SsTableInfo {
     pub filter_format: FilterFormat,
 }
 
+impl SsTableInfo {
+    pub(crate) fn physical_range(&self) -> Option<BytesRange> {
+        self.first_entry.clone().map(|first_entry| {
+            let end_bound = match self.last_entry.clone() {
+                Some(last_entry) => Included(last_entry),
+                None => Unbounded,
+            };
+            BytesRange::new(Included(first_entry), end_bound)
+        })
+    }
+}
+
 pub(crate) trait SsTableInfoCodec: Send + Sync {
     fn encode(&self, manifest: &SsTableInfo) -> Bytes;
 
@@ -771,6 +762,13 @@ impl DbState {
         });
     }
 
+    pub(crate) fn set_next_wal_id(&mut self, next_wal_id: u64) {
+        self.modify(|modifier| {
+            assert!(next_wal_id >= modifier.state.manifest.value.core.next_wal_sst_id);
+            modifier.state.manifest.value.core.next_wal_sst_id = next_wal_id;
+        })
+    }
+
     pub(crate) fn replace_memtable(&mut self, memtable: WritableKVTable) {
         assert!(self.memtable.is_empty());
         let _ = std::mem::replace(&mut self.memtable, memtable);
@@ -824,27 +822,12 @@ impl<'a> StateModifier<'a> {
             checkpoints: remote_manifest.value.core.checkpoints,
             wal_object_store_uri: my_db_state.wal_object_store_uri.clone(),
         };
+        remote_manifest.value.prune_external_sst_ids();
         self.state.manifest = remote_manifest;
     }
 
     fn finish(self) {
         self.db_state.state = Arc::new(self.state);
-    }
-}
-
-impl WalIdStore for parking_lot::RwLock<DbState> {
-    /// increment the next wal id, and return the previous value.
-    fn next_wal_id(&self) -> u64 {
-        let mut state = self.write();
-
-        // not sure why, but it doesn't compile without the return
-        // statement -- probably some generic inference bug
-        #[allow(clippy::needless_return)]
-        return state.modify(|modifier| {
-            let next_wal_id = modifier.state.manifest.value.core.next_wal_sst_id;
-            modifier.state.manifest.value.core.next_wal_sst_id += 1;
-            next_wal_id
-        });
     }
 }
 
@@ -895,6 +878,29 @@ mod tests {
 
         // then:
         assert_eq!(vec![checkpoint], db_state.state.core().checkpoints);
+    }
+
+    #[test]
+    fn test_merge_remote_manifest_reestablishes_external_sst_invariant() {
+        let mut db_state = DbState::new(new_dirty_manifest());
+        let stale_id = SsTableId::Compacted(ulid::Ulid::new());
+        let mut remote = new_dirty_manifest();
+        remote.value.external_dbs = vec![crate::manifest::ExternalDb {
+            path: "/parent/db".to_string(),
+            source_checkpoint_id: uuid::Uuid::new_v4(),
+            final_checkpoint_id: Some(uuid::Uuid::new_v4()),
+            sst_ids: vec![stale_id],
+        }];
+
+        db_state.merge_remote_manifest(remote);
+
+        let external = &db_state.state.manifest.value.external_dbs;
+        assert_eq!(external.len(), 1, "detach metadata must be retained");
+        assert!(
+            external[0].sst_ids.is_empty(),
+            "IDs absent from the merged tree must not be resurrected"
+        );
+        assert!(external[0].final_checkpoint_id.is_some());
     }
 
     #[test]

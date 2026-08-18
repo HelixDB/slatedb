@@ -935,6 +935,10 @@ impl VersionedManifest {
         &self.manifest.core
     }
 
+    pub(crate) fn external_ssts(&self) -> HashMap<SsTableId, object_store::path::Path> {
+        self.manifest.external_ssts()
+    }
+
     /// The named segments configured in this manifest (RFC-0024), in prefix
     /// order. Empty when no segment extractor is configured. The unsegmented
     /// default tree is accessed via [`Self::l0`] / [`Self::compacted`] /
@@ -1067,13 +1071,8 @@ impl Manifest {
         }
         projected.core.segments = kept;
 
-        // Drop unused external_dbs based on the surviving SST set across
-        // every tree (unsegmented + segments).
-        let used_sst_ids: HashSet<SsTableId> =
-            projected.core.all_sst_views().map(|v| v.sst.id).collect();
-        projected
-            .external_dbs
-            .retain(|e| e.sst_ids.iter().any(|id| used_sst_ids.contains(id)));
+        projected.prune_external_sst_ids();
+        projected.external_dbs.retain(|e| !e.sst_ids.is_empty());
         Ok(projected)
     }
 
@@ -3156,6 +3155,10 @@ mod tests {
 
         assert_eq!(projected.external_dbs.len(), 1);
         assert_eq!(projected.external_dbs[0].path, "/path/to/db1");
+        // The retained entry must have its out-of-range ID (sst_id_2) trimmed.
+        // Carrying it forward would keep the parent SST pinned in detach GC even
+        // though the projected tree no longer references it.
+        assert_eq!(projected.external_dbs[0].sst_ids, vec![sst_id_1]);
     }
 
     #[test]

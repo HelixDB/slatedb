@@ -59,6 +59,7 @@
 //! [compactor_options]
 //! poll_interval = "5s"
 //! max_concurrent_compactions = 4
+//! enable_trivial_move = false
 //!
 //! [compactor_options.worker]
 //! max_sst_size = 1073741824
@@ -110,6 +111,7 @@
 //!  "compactor_options": {
 //!    "poll_interval": "5s",
 //!    "max_concurrent_compactions": 4,
+//!    "enable_trivial_move": false,
 //!    "worker": {
 //!      "max_sst_size": 1073741824
 //!    },
@@ -165,6 +167,7 @@
 //! compactor_options:
 //!   poll_interval: '5s'
 //!   max_concurrent_compactions: 4
+//!   enable_trivial_move: false
 //!   worker:
 //!     max_sst_size: 1073741824
 //!   scheduler_options:
@@ -209,6 +212,10 @@ pub use slatedb_common::metrics::MetricLevel;
 use crate::error::SlateDBError;
 
 use crate::garbage_collector::{DEFAULT_INTERVAL, DEFAULT_MIN_AGE};
+
+fn default_true() -> bool {
+    true
+}
 
 /// Enum representing different levels of cache preloading on startup
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
@@ -738,7 +745,14 @@ pub struct Settings {
     /// The compression algorithm to use for SSTables.
     pub compression_codec: Option<CompressionCodec>,
 
-    /// The object store cache options.
+    /// The object store cache options. When `root_folder` is set, the database
+    /// wraps its main object store in a
+    /// [`CachedObjectStore`](crate::cached_object_store::CachedObjectStore)
+    /// built from these options. To construct and share the cache yourself,
+    /// build one with
+    /// [`CachedObjectStore::builder`](crate::cached_object_store::CachedObjectStore::builder)
+    /// and pass it to [`Db::builder`](crate::Db::builder) instead, leaving
+    /// these options unset.
     pub object_store_cache_options: ObjectStoreCacheOptions,
 
     /// Configuration options for the garbage collector.
@@ -756,6 +770,16 @@ pub struct Settings {
     ///
     /// Default: no TTL (insertions will remain until deleted)
     pub default_ttl: Option<u64>,
+
+    /// Maximum number of wrapper-level retries for a single object-store
+    /// operation, on top of the `object_store` client's own HTTP retries.
+    /// Applies to both foreground (user API) and background-task operations,
+    /// since both share the same retrying object store.
+    ///
+    /// * `None` (default): retry transient errors indefinitely (historical behavior).
+    /// * `Some(n)`: give up after `n` retries and return the underlying error.
+    #[serde(default)]
+    pub object_store_max_retries: Option<u32>,
 
     /// The block format for SST files. This is only available in tests
     /// to verify backward compatibility between V1 and V2 formats.
@@ -804,6 +828,39 @@ impl Settings {
     /// Converts the Settings to a JSON string representation
     pub fn to_json_string(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(self)
+    }
+
+    /// Validates that the settings are internally consistent, rejecting field
+    /// combinations that would deadlock or fail at runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`crate::Error`] with [`crate::ErrorKind::Invalid`] describing
+    /// the first invalid setting or combination encountered.
+    pub fn validate(&self) -> Result<(), crate::Error> {
+        if self.l0_flush_parallelism == 0 {
+            return Err(SlateDBError::InvalidConfiguration(
+                "l0_flush_parallelism must be at least 1".into(),
+            )
+            .into());
+        }
+        if self.max_wal_flushes_before_l0_flush < 4096 {
+            return Err(SlateDBError::InvalidConfiguration(
+                "max_wal_flushes_before_l0_flush must be at least 4096".into(),
+            )
+            .into());
+        }
+        // `max_unflushed_bytes` (the backpressure threshold) must exceed
+        // `l0_sst_size_bytes` (the memtable freeze threshold) so that memory can
+        // hold a memtable up to the freeze point before backpressure kicks in.
+        if self.max_unflushed_bytes <= self.l0_sst_size_bytes {
+            return Err(SlateDBError::InvalidConfiguration(format!(
+                "max_unflushed_bytes ({}) must be greater than l0_sst_size_bytes ({})",
+                self.max_unflushed_bytes, self.l0_sst_size_bytes,
+            ))
+            .into());
+        }
+        Ok(())
     }
 
     /// Loads Settings from a file.
@@ -993,6 +1050,7 @@ impl Default for Settings {
             garbage_collector_options: Some(GarbageCollectorOptions::default()),
             metric_level: MetricLevel::default(),
             default_ttl: None,
+            object_store_max_retries: None,
             #[cfg(test)]
             block_format: None,
         }
@@ -1003,14 +1061,14 @@ impl Default for Settings {
 pub struct DbReaderOptions {
     /// How frequently to poll for new manifest files and WAL data. Refreshing the manifest
     /// file allows readers to detect newly compacted data. The reader will also look for
-    /// new writes to the WAL at this poll interval. If the reader is using an explicit checkpoint,
-    /// then the manifest and WAL will not be polled.
+    /// new writes to the WAL at this poll interval. Readers using
+    /// [`crate::DbReaderMode::Checkpoint`] do not poll the manifest or WAL.
     pub manifest_poll_interval: Duration,
 
-    /// For readers that do not provide an explicit checkpoint, the client will
-    /// maintain its own checkpoint against the latest database state. The checkpoint's
-    /// expire time will be set to the current time plus this value. This lifetime
-    /// must always be greater than manifest_poll_interval x 2.
+    /// For readers using [`crate::DbReaderMode::ManagedCheckpoint`], the client maintains a
+    /// checkpoint against the latest database state. The checkpoint's expire time is set to the
+    /// current time plus this value. This lifetime must always be greater than
+    /// `manifest_poll_interval * 2`. This option is ignored by other reader modes.
     pub checkpoint_lifetime: Duration,
 
     /// The max size of a single in-memory table used to buffer WAL entries
@@ -1027,10 +1085,10 @@ pub struct DbReaderOptions {
     /// don't need to see the most recent uncommitted writes and want to minimize the
     /// cost of opening many readers.
     ///
-    /// WAL replay is also skipped when the reader is opened from a checkpoint.
+    /// WAL replay is also skipped in [`crate::DbReaderMode::Checkpoint`] mode.
     ///
-    /// When combined with manifest polling (no explicit checkpoint), the reader will
-    /// still see newly compacted data as manifests are updated.
+    /// When combined with a reader mode that polls manifests, the reader will still see newly
+    /// compacted data as manifests are updated.
     ///
     /// Defaults to false.
     pub skip_wal_replay: bool,
@@ -1038,6 +1096,11 @@ pub struct DbReaderOptions {
     /// Optional metrics reporting level for standalone readers. Defaults to
     /// [`MetricLevel::default`] when unset.
     pub metric_level: Option<MetricLevel>,
+
+    /// Controls wrapper-level retries for this reader's object-store operations.
+    /// Defaults to unbounded retries.
+    #[serde(default)]
+    pub object_store_max_retries: Option<u32>,
 }
 
 impl Default for DbReaderOptions {
@@ -1049,6 +1112,7 @@ impl Default for DbReaderOptions {
             object_store_cache_options: ObjectStoreCacheOptions::default(),
             skip_wal_replay: false,
             metric_level: None,
+            object_store_max_retries: None,
         }
     }
 }
@@ -1106,6 +1170,16 @@ pub struct CompactorOptions {
     /// The maximum number of concurrent compactions to execute at once
     pub max_concurrent_compactions: usize,
 
+    /// Whether the coordinator may complete compactions with non-overlapping
+    /// input SSTs by moving them directly into the destination sorted run,
+    /// without dispatching a worker job. Because a trivial move does not rewrite
+    /// rows, it does not remove tombstones, apply compaction filters, or process
+    /// merges during that compaction. It also preserves the input SST sizes,
+    /// which can increase manifest size and read amplification compared with
+    /// rewriting inputs into larger output SSTs. Defaults to false.
+    #[serde(default)]
+    pub enable_trivial_move: bool,
+
     /// Scheduler-specific options expressed as string key/value pairs.
     #[serde(default)]
     pub scheduler_options: HashMap<String, String>,
@@ -1141,6 +1215,11 @@ pub struct CompactorOptions {
     #[serde(deserialize_with = "deserialize_duration")]
     #[serde(serialize_with = "serialize_duration")]
     pub worker_heartbeat_timeout: Duration,
+
+    /// Controls wrapper-level retries for this compactor's object-store
+    /// operations. Defaults to unbounded retries.
+    #[serde(default)]
+    pub object_store_max_retries: Option<u32>,
 }
 
 /// Default options for the compactor. Currently, only a
@@ -1153,11 +1232,13 @@ impl Default for CompactorOptions {
             poll_interval: Duration::from_secs(5),
             manifest_update_timeout: Duration::from_secs(300),
             max_concurrent_compactions: 4,
+            enable_trivial_move: false,
             scheduler_options: HashMap::new(),
             worker: Some(CompactionWorkerOptions::default()),
             metric_level: None,
             commit_compacted_interval: Duration::from_secs(1),
             worker_heartbeat_timeout: Duration::from_secs(30),
+            object_store_max_retries: None,
         }
     }
 }
@@ -1172,11 +1253,13 @@ impl std::fmt::Debug for CompactorOptions {
                 "max_concurrent_compactions",
                 &self.max_concurrent_compactions,
             )
+            .field("enable_trivial_move", &self.enable_trivial_move)
             .field("scheduler_options", &self.scheduler_options)
             .field("worker", &self.worker)
             .field("metric_level", &self.metric_level)
             .field("commit_compacted_interval", &self.commit_compacted_interval)
             .field("worker_heartbeat_timeout", &self.worker_heartbeat_timeout)
+            .field("object_store_max_retries", &self.object_store_max_retries)
             .finish()
     }
 }
@@ -1261,7 +1344,7 @@ impl Default for CompactionWorkerOptions {
         Self {
             max_concurrent_compactions: 4,
             compactions_poll_interval: Duration::from_secs(5),
-            heartbeat_interval: Duration::from_secs(5),
+            heartbeat_interval: Duration::from_secs(10),
             max_sst_size: 256 * 1024 * 1024,
             max_fetch_tasks: 4,
             bytes_to_fetch: 2 * 1024 * 1024,
@@ -1431,6 +1514,23 @@ pub struct GarbageCollectorOptions {
     /// a garbage collector is owned by a [`Settings`] configured DB, unset means
     /// inherit [`Settings::metric_level`].
     pub metric_level: Option<MetricLevel>,
+
+    /// Whether manifest and compactions boundary files are advanced before deletion.
+    ///
+    /// Disable this only for object stores that do not support conditional overwrites (`If-Match`).
+    /// Without boundary advancement, a SlateDB client or compactor can begin updating a manifest or
+    /// compactions file, stop making progress (for example, because its process or host is
+    /// suspended), then resume after the garbage collector's `min_age`. It can then recreate a
+    /// deleted metadata ID and incorrectly report its stale update as successful. Set `min_age`
+    /// longer than the maximum lifetime of a stale process, and use the same setting for every
+    /// garbage collector operating on the database.
+    #[serde(default = "default_true")]
+    pub boundary_files_enabled: bool,
+
+    /// Controls wrapper-level retries for this garbage collector's object-store
+    /// operations. Defaults to unbounded retries.
+    #[serde(default)]
+    pub object_store_max_retries: Option<u32>,
 }
 
 impl GarbageCollectorOptions {
@@ -1531,6 +1631,8 @@ impl Default for GarbageCollectorOptions {
             compactions_options: Some(GarbageCollectorDirectoryOptions::default()),
             detach_options: Some(GarbageCollectorScheduleOptions::default()),
             metric_level: None,
+            boundary_files_enabled: true,
+            object_store_max_retries: None,
         }
     }
 }
@@ -1555,8 +1657,10 @@ pub struct ObjectStoreCacheOptions {
     /// its default value is 4mb.
     pub part_size_bytes: usize,
 
-    /// Whether to cache PUT operations to disk. When enabled, data written via PUT operations
-    /// will be cached locally for faster subsequent reads. Default is false.
+    /// Whether to cache compacted SSTs produced by memtable flushes or
+    /// compaction to the local disk cache, for faster subsequent reads.
+    ///
+    /// WAL writes are never cached. Default is false.
     pub cache_puts: bool,
 
     /// Whether to preload SST files into cache during database startup. When enabled,
@@ -1630,10 +1734,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use std::collections::HashMap;
     use std::path::PathBuf;
-
-    use super::*;
 
     #[test]
     fn test_db_options_load_from_env() {
@@ -1651,7 +1754,6 @@ mod tests {
                 Some(PathBuf::from("/tmp/slatedb-root")),
                 options.object_store_cache_options.root_folder
             );
-
             Ok(())
         });
     }
@@ -1695,6 +1797,24 @@ mod tests {
     }
 
     #[test]
+    fn test_gc_boundary_files_are_enabled_by_default_when_omitted() {
+        fn without_boundary_setting<T: Serialize>(value: T) -> serde_json::Value {
+            let mut value = serde_json::to_value(value).unwrap();
+            value
+                .as_object_mut()
+                .unwrap()
+                .remove("boundary_files_enabled");
+            value
+        }
+
+        let gc: GarbageCollectorOptions =
+            serde_json::from_value(without_boundary_setting(GarbageCollectorOptions::default()))
+                .unwrap();
+
+        assert!(gc.boundary_files_enabled);
+    }
+
+    #[test]
     fn test_db_options_load_from_json_file() {
         figment::Jail::expect_with(|jail| {
             jail.create_file(
@@ -1703,7 +1823,7 @@ mod tests {
 {
     "flush_interval": "1s",
     "metric_level": "Debug",
-    "object_store_cache_options": {
+     "object_store_cache_options": {
         "root_folder": "/tmp/slatedb-root"
     }
 }
@@ -1932,5 +2052,59 @@ object_store_cache_options:
         assert_eq!(ts1, Some(99999));
         assert_eq!(ts2, Some(99999));
         assert_eq!(ts3, Some(99999));
+    }
+
+    #[test]
+    fn test_validate_accepts_default_settings() {
+        assert!(Settings::default().validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_l0_flush_parallelism() {
+        let settings = Settings {
+            l0_flush_parallelism: 0,
+            ..Settings::default()
+        };
+        let err = settings.validate().expect_err("expected invalid settings");
+        assert!(err.to_string().contains("l0_flush_parallelism"));
+    }
+
+    #[test]
+    fn test_validate_rejects_low_max_wal_flushes_before_l0_flush() {
+        let settings = Settings {
+            max_wal_flushes_before_l0_flush: 4095,
+            ..Settings::default()
+        };
+        let err = settings.validate().expect_err("expected invalid settings");
+        assert!(err.to_string().contains("max_wal_flushes_before_l0_flush"));
+    }
+
+    #[test]
+    fn test_validate_rejects_max_unflushed_bytes_not_greater_than_l0_sst_size() {
+        // Equal is invalid: must be strictly greater.
+        let equal = Settings {
+            l0_sst_size_bytes: 64 * 1024 * 1024,
+            max_unflushed_bytes: 64 * 1024 * 1024,
+            ..Settings::default()
+        };
+        let err = equal.validate().expect_err("expected invalid settings");
+        assert!(err.to_string().contains("max_unflushed_bytes"));
+
+        let smaller = Settings {
+            l0_sst_size_bytes: 64 * 1024 * 1024,
+            max_unflushed_bytes: 32 * 1024 * 1024,
+            ..Settings::default()
+        };
+        assert!(smaller.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_accepts_max_unflushed_bytes_greater_than_l0_sst_size() {
+        let settings = Settings {
+            l0_sst_size_bytes: 64 * 1024 * 1024,
+            max_unflushed_bytes: 64 * 1024 * 1024 + 1,
+            ..Settings::default()
+        };
+        assert!(settings.validate().is_ok());
     }
 }

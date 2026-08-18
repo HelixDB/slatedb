@@ -26,7 +26,7 @@ use slatedb::config::{
     Settings, WriteOptions,
 };
 use slatedb::instrumented_object_store_stats;
-use slatedb::{Db, DbReader, DbSnapshot, PrefixExtractor, PrefixTarget};
+use slatedb::{Db, DbReader, DbReaderMode, DbSnapshot, PrefixExtractor, PrefixTarget};
 use slatedb_common::metrics::{lookup_metric, lookup_metric_with_labels, DefaultMetricsRecorder};
 use slatedb_common::{MockSystemClock, SystemClock};
 use tokio::sync::Barrier;
@@ -1151,7 +1151,7 @@ async fn benchmark_fixed_reader_open(scales: &[usize], full: bool) {
             let object_store: Arc<dyn ObjectStore> = store.clone();
             let start = Instant::now();
             let reader = DbReader::builder(path.as_str(), object_store)
-                .with_checkpoint_id(checkpoint.id)
+                .with_reader_mode(DbReaderMode::Checkpoint(checkpoint.id))
                 .with_options(quiet_reader_options(1))
                 .with_metrics_recorder(recorder.clone())
                 .with_db_cache_disabled()

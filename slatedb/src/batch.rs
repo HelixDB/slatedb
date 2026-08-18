@@ -918,26 +918,6 @@ mod tests {
     }
 
     #[test]
-    fn should_create_merge_operation_with_default_options() {
-        // Given: an empty WriteBatch
-        let mut batch = WriteBatch::new();
-
-        // When: adding a merge operation
-        batch.merge(b"key1", b"value1");
-
-        // Then: the batch should contain one merge operation with default options
-        assert_eq!(batch.ops.len(), 1);
-        let op = only_op(&batch, b"key1");
-        match op {
-            WriteOp::Merge(value, options) => {
-                assert_eq!(value.as_ref(), b"value1");
-                assert_eq!(options, &MergeOptions::default());
-            }
-            _ => panic!("Expected Merge operation"),
-        }
-    }
-
-    #[test]
     fn commutative_merge_classification_requires_only_commutative_operations() {
         let mut only_commutative = WriteBatch::new();
         only_commutative.merge_commutative(b"key", b"first");
@@ -978,6 +958,39 @@ mod tests {
         merge_after_delete.delete(b"key");
         merge_after_delete.merge_commutative(b"key", b"merge");
         assert!(!merge_after_delete.is_commutative_merge_key(b"key"));
+    }
+
+    #[test]
+    fn commutative_merge_metadata_does_not_change_write_operations() {
+        let mut ordinary = WriteBatch::new();
+        ordinary.merge(b"key", b"operand");
+
+        let mut commutative = WriteBatch::new();
+        commutative.merge_commutative(b"key", b"operand");
+
+        assert_eq!(ordinary.ops, commutative.ops);
+        assert!(!ordinary.is_commutative_merge_key(b"key"));
+        assert!(commutative.is_commutative_merge_key(b"key"));
+    }
+
+    #[test]
+    fn should_create_merge_operation_with_default_options() {
+        // Given: an empty WriteBatch
+        let mut batch = WriteBatch::new();
+
+        // When: adding a merge operation
+        batch.merge(b"key1", b"value1");
+
+        // Then: the batch should contain one merge operation with default options
+        assert_eq!(batch.ops.len(), 1);
+        let op = only_op(&batch, b"key1");
+        match op {
+            WriteOp::Merge(value, options) => {
+                assert_eq!(value.as_ref(), b"value1");
+                assert_eq!(options, &MergeOptions::default());
+            }
+            _ => panic!("Expected Merge operation"),
+        }
     }
 
     #[test]
