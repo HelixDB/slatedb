@@ -635,8 +635,15 @@ impl CompactorEventHandler {
             .active_compactions()
             .filter(|c| c.status() != CompactionStatus::Compacted)
         {
-            let estimated_source_bytes =
-                Self::calculate_estimated_source_bytes(compaction, db_state);
+            let Some(estimated_source_bytes) =
+                Self::calculate_estimated_source_bytes(compaction, db_state)
+            else {
+                warn!(
+                    "skipping progress metrics for compaction {} because its source state is no longer present in the manifest",
+                    compaction.id()
+                );
+                continue;
+            };
             total_estimated_bytes += estimated_source_bytes;
             total_bytes_processed += compaction.bytes_processed();
 
@@ -690,10 +697,11 @@ impl CompactorEventHandler {
     }
 
     /// Calculates the estimated total source bytes for a compaction.
-    fn calculate_estimated_source_bytes(compaction: &Compaction, db_state: &ManifestCore) -> u64 {
-        let tree = db_state
-            .tree_for_segment(compaction.spec().segment())
-            .expect("compaction target segment missing from manifest");
+    fn calculate_estimated_source_bytes(
+        compaction: &Compaction,
+        db_state: &ManifestCore,
+    ) -> Option<u64> {
+        let tree = db_state.tree_for_segment(compaction.spec().segment())?;
 
         let views_by_id: HashMap<Ulid, &SsTableView> =
             tree.l0.iter().map(|view| (view.id, view)).collect();
@@ -704,17 +712,13 @@ impl CompactorEventHandler {
             .spec()
             .sources()
             .iter()
-            .map(|source| match source {
-                SourceId::SstView(id) => views_by_id
-                    .get(id)
-                    .expect("compaction source view not found in L0")
-                    .estimate_size(),
-                SourceId::SortedRun(id) => srs_by_id
-                    .get(id)
-                    .expect("compaction source sorted run not found")
-                    .estimate_size(),
+            .try_fold(0_u64, |total, source| {
+                let source_bytes = match source {
+                    SourceId::SstView(id) => views_by_id.get(id)?.estimate_size(),
+                    SourceId::SortedRun(id) => srs_by_id.get(id)?.estimate_size(),
+                };
+                Some(total + source_bytes)
             })
-            .sum()
     }
 
     /// Handles a polling tick by refreshing compactions and the manifest, then possibly scheduling compactions.
@@ -3923,7 +3927,20 @@ mod tests {
 
         let expected = segment_l0.estimate_size() + segment_sr.estimate_size();
         let actual = CompactorEventHandler::calculate_estimated_source_bytes(&compaction, &core);
-        assert_eq!(actual, expected);
+        assert_eq!(actual, Some(expected));
+    }
+
+    #[test]
+    fn test_calculate_estimated_source_bytes_tolerates_stale_sources() {
+        let missing_source = Ulid::new();
+        let core = ManifestCore::new();
+        let compaction = Compaction::new(
+            Ulid::new(),
+            CompactionSpec::new(vec![SourceId::SstView(missing_source)], 1),
+        );
+
+        let actual = CompactorEventHandler::calculate_estimated_source_bytes(&compaction, &core);
+        assert_eq!(actual, None);
     }
 
     #[tokio::test]
