@@ -682,7 +682,7 @@ func uniffiCheckChecksums() {
 		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_slatedb_uniffi_checksum_method_dbbuilder_with_segment_extractor()
 		})
-		if checksum != 14261 {
+		if checksum != 12566 {
 			// If this happens try cleaning and rebuilding your project
 			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_dbbuilder_with_segment_extractor: UniFFI API checksum mismatch")
 		}
@@ -725,15 +725,6 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_slatedb_uniffi_checksum_method_dbreaderbuilder_with_checkpoint_id()
-		})
-		if checksum != 41016 {
-			// If this happens try cleaning and rebuilding your project
-			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_dbreaderbuilder_with_checkpoint_id: UniFFI API checksum mismatch")
-		}
-	}
-	{
-		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_slatedb_uniffi_checksum_method_dbreaderbuilder_with_filter_policies()
 		})
 		if checksum != 12871 {
@@ -766,6 +757,15 @@ func uniffiCheckChecksums() {
 		if checksum != 46155 {
 			// If this happens try cleaning and rebuilding your project
 			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_dbreaderbuilder_with_options: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_slatedb_uniffi_checksum_method_dbreaderbuilder_with_reader_mode()
+		})
+		if checksum != 45455 {
+			// If this happens try cleaning and rebuilding your project
+			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_dbreaderbuilder_with_reader_mode: UniFFI API checksum mismatch")
 		}
 	}
 	{
@@ -1396,6 +1396,15 @@ func uniffiCheckChecksums() {
 		if checksum != 1225 {
 			// If this happens try cleaning and rebuilding your project
 			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_dbiterator_next: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_slatedb_uniffi_checksum_method_dbiterator_next_batch()
+		})
+		if checksum != 61234 {
+			// If this happens try cleaning and rebuilding your project
+			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_dbiterator_next_batch: UniFFI API checksum mismatch")
 		}
 	}
 	{
@@ -4225,7 +4234,10 @@ type DbBuilderInterface interface {
 	// Sets the segment extractor (RFC-0024). When configured, every write is
 	// routed through the extractor and the database tracks per-segment LSM
 	// state. The extractor must be configured at database creation time and
-	// cannot be changed thereafter.
+	// remain configured thereafter. Its name must remain stable; its
+	// implementation may evolve only if it preserves routing for all existing
+	// key schemas and keeps segment prefixes across schema versions an
+	// antichain (no prefix may be a proper prefix of another).
 	WithSegmentExtractor(extractor PrefixExtractor) error
 	// Applies a [`crate::Settings`] object to the builder.
 	WithSettings(settings *Settings) error
@@ -4361,7 +4373,10 @@ func (_self *DbBuilder) WithSeed(seed uint64) error {
 // Sets the segment extractor (RFC-0024). When configured, every write is
 // routed through the extractor and the database tracks per-segment LSM
 // state. The extractor must be configured at database creation time and
-// cannot be changed thereafter.
+// remain configured thereafter. Its name must remain stable; its
+// implementation may evolve only if it preserves routing for all existing
+// key schemas and keeps segment prefixes across schema versions an
+// antichain (no prefix may be a proper prefix of another).
 func (_self *DbBuilder) WithSegmentExtractor(extractor PrefixExtractor) error {
 	_pointer := _self.ffiObject.incrementPointer("*DbBuilder")
 	defer _self.ffiObject.decrementPointer()
@@ -4572,6 +4587,16 @@ func (_ FfiDestroyerDbCache) Destroy(value *DbCache) {
 type DbIteratorInterface interface {
 	// Returns the next key/value pair from the iterator.
 	Next() (*KeyValue, error)
+	// Returns up to `max` key/value pairs from the iterator in one call.
+	//
+	// Locks the iterator once and pulls rows until it yields `max` items or the
+	// iterator is exhausted. A returned vector shorter than `max` (including an
+	// empty vector) means the iterator is exhausted. `max == 0` returns an empty
+	// vector without advancing.
+	//
+	// This exists so that callers crossing a foreign-function boundary can drain
+	// a scan with one call per batch instead of one call per row.
+	NextBatch(max uint32) ([]KeyValue, error)
 	// Seeks the iterator to the first entry at or after `key`.
 	Seek(key []byte) error
 }
@@ -4600,6 +4625,50 @@ func (_self *DbIterator) Next() (*KeyValue, error) {
 		},
 		C.uniffi_slatedb_uniffi_fn_method_dbiterator_next(
 			_pointer),
+		// pollFn
+		func(handle C.uint64_t, continuation C.UniffiRustFutureContinuationCallback, data C.uint64_t) {
+			C.ffi_slatedb_uniffi_rust_future_poll_rust_buffer(handle, continuation, data)
+		},
+		// freeFn
+		func(handle C.uint64_t) {
+			C.ffi_slatedb_uniffi_rust_future_free_rust_buffer(handle)
+		},
+	)
+
+	if err == nil {
+		return res, nil
+	}
+
+	return res, err
+}
+
+// Returns up to `max` key/value pairs from the iterator in one call.
+//
+// Locks the iterator once and pulls rows until it yields `max` items or the
+// iterator is exhausted. A returned vector shorter than `max` (including an
+// empty vector) means the iterator is exhausted. `max == 0` returns an empty
+// vector without advancing.
+//
+// This exists so that callers crossing a foreign-function boundary can drain
+// a scan with one call per batch instead of one call per row.
+func (_self *DbIterator) NextBatch(max uint32) ([]KeyValue, error) {
+	_pointer := _self.ffiObject.incrementPointer("*DbIterator")
+	defer _self.ffiObject.decrementPointer()
+	res, err := uniffiRustCallAsync[*Error](
+		FfiConverterErrorINSTANCE,
+		// completeFn
+		func(handle C.uint64_t, status *C.RustCallStatus) RustBufferI {
+			res := C.ffi_slatedb_uniffi_rust_future_complete_rust_buffer(handle, status)
+			return GoRustBuffer{
+				inner: res,
+			}
+		},
+		// liftFn
+		func(ffi RustBufferI) []KeyValue {
+			return FfiConverterSequenceKeyValueINSTANCE.Lift(ffi)
+		},
+		C.uniffi_slatedb_uniffi_fn_method_dbiterator_next_batch(
+			_pointer, FfiConverterUint32INSTANCE.Lower(max)),
 		// pollFn
 		func(handle C.uint64_t, continuation C.UniffiRustFutureContinuationCallback, data C.uint64_t) {
 			C.ffi_slatedb_uniffi_rust_future_poll_rust_buffer(handle, continuation, data)
@@ -5200,8 +5269,6 @@ func (_ FfiDestroyerDbReader) Destroy(value *DbReader) {
 type DbReaderBuilderInterface interface {
 	// Opens the reader and consumes this builder.
 	Build() (*DbReader, error)
-	// Pins the reader to an existing checkpoint UUID string.
-	WithCheckpointId(checkpointId string) error
 	// Sets the filter policies used when decoding SST filter blocks.
 	//
 	// Must match (or be a superset of) the writer's policies so SST filter
@@ -5214,6 +5281,8 @@ type DbReaderBuilderInterface interface {
 	WithMetricsRecorder(metricsRecorder MetricsRecorder) error
 	// Applies custom reader options.
 	WithOptions(options ReaderOptions) error
+	// Sets how the reader chooses and refreshes database state.
+	WithReaderMode(mode ReaderMode) error
 	// Sets the segment extractor (RFC-0024). A reader opening a segmented
 	// database must configure an extractor matching the one the database
 	// was created with.
@@ -5270,18 +5339,6 @@ func (_self *DbReaderBuilder) Build() (*DbReader, error) {
 	return res, err
 }
 
-// Pins the reader to an existing checkpoint UUID string.
-func (_self *DbReaderBuilder) WithCheckpointId(checkpointId string) error {
-	_pointer := _self.ffiObject.incrementPointer("*DbReaderBuilder")
-	defer _self.ffiObject.decrementPointer()
-	_, _uniffiErr := rustCallWithError[*Error](FfiConverterError{}, func(_uniffiStatus *C.RustCallStatus) bool {
-		C.uniffi_slatedb_uniffi_fn_method_dbreaderbuilder_with_checkpoint_id(
-			_pointer, FfiConverterStringINSTANCE.Lower(checkpointId), _uniffiStatus)
-		return false
-	})
-	return _uniffiErr.AsError()
-}
-
 // Sets the filter policies used when decoding SST filter blocks.
 //
 // Must match (or be a superset of) the writer's policies so SST filter
@@ -5329,6 +5386,18 @@ func (_self *DbReaderBuilder) WithOptions(options ReaderOptions) error {
 	_, _uniffiErr := rustCallWithError[*Error](FfiConverterError{}, func(_uniffiStatus *C.RustCallStatus) bool {
 		C.uniffi_slatedb_uniffi_fn_method_dbreaderbuilder_with_options(
 			_pointer, FfiConverterReaderOptionsINSTANCE.Lower(options), _uniffiStatus)
+		return false
+	})
+	return _uniffiErr.AsError()
+}
+
+// Sets how the reader chooses and refreshes database state.
+func (_self *DbReaderBuilder) WithReaderMode(mode ReaderMode) error {
+	_pointer := _self.ffiObject.incrementPointer("*DbReaderBuilder")
+	defer _self.ffiObject.decrementPointer()
+	_, _uniffiErr := rustCallWithError[*Error](FfiConverterError{}, func(_uniffiStatus *C.RustCallStatus) bool {
+		C.uniffi_slatedb_uniffi_fn_method_dbreaderbuilder_with_reader_mode(
+			_pointer, FfiConverterReaderModeINSTANCE.Lower(mode), _uniffiStatus)
 		return false
 	})
 	return _uniffiErr.AsError()
@@ -7730,7 +7799,7 @@ func (_ FfiDestroyerObjectStore) Destroy(value *ObjectStore) {
 }
 
 // Application-provided prefix extractor used to configure prefix-based
-// bloom filters.
+// bloom filters and segmented compaction.
 type PrefixExtractor interface {
 	// Stable identifier for this extractor's configuration. Included in the
 	// bloom filter policy name so filters built with different extractors
@@ -7742,7 +7811,7 @@ type PrefixExtractor interface {
 }
 
 // Application-provided prefix extractor used to configure prefix-based
-// bloom filters.
+// bloom filters and segmented compaction.
 type PrefixExtractorImpl struct {
 	ffiObject FfiObject
 }
@@ -9457,6 +9526,19 @@ type GarbageCollectorOptions struct {
 	CompactionsOptions *GarbageCollectorDirectoryOptions
 	// Options for detaching clone references. `None` disables detach garbage collection.
 	DetachOptions *GarbageCollectorScheduleOptions
+	// Whether GC should delete eligible manifest/compactions metadata without advancing boundary
+	// files. This supports object stores without conditional overwrites (`If-Match`), but allows a
+	// SlateDB client or compactor to begin updating a manifest or compactions file, stop making
+	// progress (for example, because its process or host is suspended), then resume after GC's
+	// `min_age`. It can then recreate a deleted metadata ID and incorrectly report its stale update
+	// as successful. Set `min_age` longer than the maximum lifetime of a stale process, and use the
+	// same setting for every GC operating on the database.
+	DisableBoundaryFiles bool
+	// Maximum number of wrapper-level retries for a single object-store
+	// operation, on top of the `object_store` client's own HTTP retries.
+	// `None` (default) retries transient errors indefinitely; `Some(n)` gives
+	// up after `n` retries and surfaces the underlying error.
+	ObjectStoreMaxRetries *uint32
 }
 
 func (r *GarbageCollectorOptions) Destroy() {
@@ -9466,6 +9548,8 @@ func (r *GarbageCollectorOptions) Destroy() {
 	FfiDestroyerOptionalGarbageCollectorDirectoryOptions{}.Destroy(r.CompactedOptions)
 	FfiDestroyerOptionalGarbageCollectorDirectoryOptions{}.Destroy(r.CompactionsOptions)
 	FfiDestroyerOptionalGarbageCollectorScheduleOptions{}.Destroy(r.DetachOptions)
+	FfiDestroyerBool{}.Destroy(r.DisableBoundaryFiles)
+	FfiDestroyerOptionalUint32{}.Destroy(r.ObjectStoreMaxRetries)
 }
 
 type FfiConverterGarbageCollectorOptions struct{}
@@ -9484,6 +9568,8 @@ func (c FfiConverterGarbageCollectorOptions) Read(reader io.Reader) GarbageColle
 		FfiConverterOptionalGarbageCollectorDirectoryOptionsINSTANCE.Read(reader),
 		FfiConverterOptionalGarbageCollectorDirectoryOptionsINSTANCE.Read(reader),
 		FfiConverterOptionalGarbageCollectorScheduleOptionsINSTANCE.Read(reader),
+		FfiConverterBoolINSTANCE.Read(reader),
+		FfiConverterOptionalUint32INSTANCE.Read(reader),
 	}
 }
 
@@ -9502,6 +9588,8 @@ func (c FfiConverterGarbageCollectorOptions) Write(writer io.Writer, value Garba
 	FfiConverterOptionalGarbageCollectorDirectoryOptionsINSTANCE.Write(writer, value.CompactedOptions)
 	FfiConverterOptionalGarbageCollectorDirectoryOptionsINSTANCE.Write(writer, value.CompactionsOptions)
 	FfiConverterOptionalGarbageCollectorScheduleOptionsINSTANCE.Write(writer, value.DetachOptions)
+	FfiConverterBoolINSTANCE.Write(writer, value.DisableBoundaryFiles)
+	FfiConverterOptionalUint32INSTANCE.Write(writer, value.ObjectStoreMaxRetries)
 }
 
 type FfiDestroyerGarbageCollectorOptions struct{}
@@ -10227,6 +10315,11 @@ type ReaderOptions struct {
 	MaxMemtableBytes uint64
 	// Whether WAL replay should be skipped entirely.
 	SkipWalReplay bool
+	// Maximum number of wrapper-level retries for a single object-store
+	// operation, on top of the `object_store` client's own HTTP retries.
+	// `None` (default) retries transient errors indefinitely; `Some(n)` gives
+	// up after `n` retries and surfaces the underlying error.
+	ObjectStoreMaxRetries *uint32
 }
 
 func (r *ReaderOptions) Destroy() {
@@ -10234,6 +10327,7 @@ func (r *ReaderOptions) Destroy() {
 	FfiDestroyerUint64{}.Destroy(r.CheckpointLifetimeMs)
 	FfiDestroyerUint64{}.Destroy(r.MaxMemtableBytes)
 	FfiDestroyerBool{}.Destroy(r.SkipWalReplay)
+	FfiDestroyerOptionalUint32{}.Destroy(r.ObjectStoreMaxRetries)
 }
 
 type FfiConverterReaderOptions struct{}
@@ -10250,6 +10344,7 @@ func (c FfiConverterReaderOptions) Read(reader io.Reader) ReaderOptions {
 		FfiConverterUint64INSTANCE.Read(reader),
 		FfiConverterUint64INSTANCE.Read(reader),
 		FfiConverterBoolINSTANCE.Read(reader),
+		FfiConverterOptionalUint32INSTANCE.Read(reader),
 	}
 }
 
@@ -10266,6 +10361,7 @@ func (c FfiConverterReaderOptions) Write(writer io.Writer, value ReaderOptions) 
 	FfiConverterUint64INSTANCE.Write(writer, value.CheckpointLifetimeMs)
 	FfiConverterUint64INSTANCE.Write(writer, value.MaxMemtableBytes)
 	FfiConverterBoolINSTANCE.Write(writer, value.SkipWalReplay)
+	FfiConverterOptionalUint32INSTANCE.Write(writer, value.ObjectStoreMaxRetries)
 }
 
 type FfiDestroyerReaderOptions struct{}
@@ -12244,6 +12340,86 @@ func (_ FfiDestroyerPrefixTarget) Destroy(value PrefixTarget) {
 	value.Destroy()
 }
 
+// Determines how a [`crate::DbReader`] chooses and refreshes database state.
+type ReaderMode interface {
+	Destroy()
+}
+
+// Create and maintain checkpoints while following the latest database state.
+type ReaderModeManagedCheckpoint struct {
+}
+
+func (e ReaderModeManagedCheckpoint) Destroy() {
+}
+
+// Remain pinned to the database state referenced by the supplied checkpoint UUID string.
+type ReaderModeCheckpoint struct {
+	Field0 string
+}
+
+func (e ReaderModeCheckpoint) Destroy() {
+	FfiDestroyerString{}.Destroy(e.Field0)
+}
+
+// Follow the latest manifest without creating or maintaining a checkpoint.
+type ReaderModeFollowLatest struct {
+}
+
+func (e ReaderModeFollowLatest) Destroy() {
+}
+
+type FfiConverterReaderMode struct{}
+
+var FfiConverterReaderModeINSTANCE = FfiConverterReaderMode{}
+
+func (c FfiConverterReaderMode) Lift(rb RustBufferI) ReaderMode {
+	return LiftFromRustBuffer[ReaderMode](c, rb)
+}
+
+func (c FfiConverterReaderMode) Lower(value ReaderMode) C.RustBuffer {
+	return LowerIntoRustBuffer[ReaderMode](c, value)
+}
+
+func (c FfiConverterReaderMode) LowerExternal(value ReaderMode) ExternalCRustBuffer {
+	return RustBufferFromC(LowerIntoRustBuffer[ReaderMode](c, value))
+}
+func (FfiConverterReaderMode) Read(reader io.Reader) ReaderMode {
+	id := readInt32(reader)
+	switch id {
+	case 1:
+		return ReaderModeManagedCheckpoint{}
+	case 2:
+		return ReaderModeCheckpoint{
+			FfiConverterStringINSTANCE.Read(reader),
+		}
+	case 3:
+		return ReaderModeFollowLatest{}
+	default:
+		panic(fmt.Sprintf("invalid enum value %v in FfiConverterReaderMode.Read()", id))
+	}
+}
+
+func (FfiConverterReaderMode) Write(writer io.Writer, value ReaderMode) {
+	switch variant_value := value.(type) {
+	case ReaderModeManagedCheckpoint:
+		writeInt32(writer, 1)
+	case ReaderModeCheckpoint:
+		writeInt32(writer, 2)
+		FfiConverterStringINSTANCE.Write(writer, variant_value.Field0)
+	case ReaderModeFollowLatest:
+		writeInt32(writer, 3)
+	default:
+		_ = variant_value
+		panic(fmt.Sprintf("invalid enum value `%v` in FfiConverterReaderMode.Write", value))
+	}
+}
+
+type FfiDestroyerReaderMode struct{}
+
+func (_ FfiDestroyerReaderMode) Destroy(value ReaderMode) {
+	value.Destroy()
+}
+
 // Kind of row entry stored in WAL iteration results.
 type RowEntryKind uint
 
@@ -13890,6 +14066,53 @@ type FfiDestroyerSequenceExternalDb struct{}
 func (FfiDestroyerSequenceExternalDb) Destroy(sequence []ExternalDb) {
 	for _, value := range sequence {
 		FfiDestroyerExternalDb{}.Destroy(value)
+	}
+}
+
+type FfiConverterSequenceKeyValue struct{}
+
+var FfiConverterSequenceKeyValueINSTANCE = FfiConverterSequenceKeyValue{}
+
+func (c FfiConverterSequenceKeyValue) Lift(rb RustBufferI) []KeyValue {
+	return LiftFromRustBuffer[[]KeyValue](c, rb)
+}
+
+func (c FfiConverterSequenceKeyValue) Read(reader io.Reader) []KeyValue {
+	length := readInt32(reader)
+	if length == 0 {
+		return nil
+	}
+	result := make([]KeyValue, 0, length)
+	for i := int32(0); i < length; i++ {
+		result = append(result, FfiConverterKeyValueINSTANCE.Read(reader))
+	}
+	return result
+}
+
+func (c FfiConverterSequenceKeyValue) Lower(value []KeyValue) C.RustBuffer {
+	return LowerIntoRustBuffer[[]KeyValue](c, value)
+}
+
+func (c FfiConverterSequenceKeyValue) LowerExternal(value []KeyValue) ExternalCRustBuffer {
+	return RustBufferFromC(LowerIntoRustBuffer[[]KeyValue](c, value))
+}
+
+func (c FfiConverterSequenceKeyValue) Write(writer io.Writer, value []KeyValue) {
+	if len(value) > math.MaxInt32 {
+		panic("[]KeyValue is too large to fit into Int32")
+	}
+
+	writeInt32(writer, int32(len(value)))
+	for _, item := range value {
+		FfiConverterKeyValueINSTANCE.Write(writer, item)
+	}
+}
+
+type FfiDestroyerSequenceKeyValue struct{}
+
+func (FfiDestroyerSequenceKeyValue) Destroy(sequence []KeyValue) {
+	for _, value := range sequence {
+		FfiDestroyerKeyValue{}.Destroy(value)
 	}
 }
 

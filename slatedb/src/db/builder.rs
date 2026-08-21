@@ -118,6 +118,7 @@ use tokio::runtime::Handle;
 use crate::admin::Admin;
 use crate::batch_write::WriteBatchEventHandler;
 use crate::batch_write::WRITE_BATCH_TASK_NAME;
+use crate::block_cache_policy::BlockCachePolicy;
 use crate::cached_object_store::CachedObjectStore;
 use crate::clone::{SegmentFilterFn, SegmentProjectionFn};
 #[cfg(feature = "compaction_filters")]
@@ -140,7 +141,7 @@ use crate::db::Db;
 use crate::db::DbInner;
 use crate::db_cache::SplitCache;
 use crate::db_cache::{DbCache, DbCacheWrapper, UnownedDbCache};
-use crate::db_reader::DbReader;
+use crate::db_reader::{DbReader, DbReaderMode};
 use crate::db_status::{ClosedResultWriter, DbStatusManager};
 use crate::dispatcher::MessageHandlerExecutor;
 use crate::error::SlateDBError;
@@ -161,6 +162,8 @@ use crate::retrying_object_store::RetryingObjectStore;
 use crate::tablestore::{TableStore, TableStoreKind};
 use crate::utils::SafeSender;
 use crate::utils::WatchableOnceCell;
+use crate::wal::wal_disabled::DisabledWalObserver;
+use crate::wal::WalObserver;
 use slatedb_common::clock::DefaultSystemClock;
 use slatedb_common::clock::SystemClock;
 use slatedb_common::metrics::MetricsRecorder;
@@ -179,6 +182,7 @@ pub struct DbBuilder<P: Into<Path>> {
     main_object_store: Arc<dyn ObjectStore>,
     wal_object_store: Option<Arc<dyn ObjectStore>>,
     db_cache: Option<Arc<dyn DbCache>>,
+    block_cache_policy: BlockCachePolicy,
     system_clock: Option<Arc<dyn SystemClock>>,
     gc_runtime: Option<Handle>,
     compactor_builder: Option<CompactorBuilder<Path>>,
@@ -196,6 +200,11 @@ pub struct DbBuilder<P: Into<Path>> {
 
 impl<P: Into<Path>> DbBuilder<P> {
     /// Creates a new builder for a database at the given path.
+    ///
+    /// `main_object_store` may be any [`ObjectStore`], including a wrapper
+    /// like
+    /// [`CachedObjectStore`](crate::cached_object_store::CachedObjectStore)
+    /// built over the raw backend to serve SST reads from a local disk cache.
     pub fn new(path: P, main_object_store: Arc<dyn ObjectStore>) -> Self {
         Self {
             path,
@@ -203,6 +212,7 @@ impl<P: Into<Path>> DbBuilder<P> {
             settings: Settings::default(),
             wal_object_store: None,
             db_cache: default_db_cache(),
+            block_cache_policy: BlockCachePolicy::default(),
             system_clock: None,
             gc_runtime: None,
             compactor_builder: None,
@@ -234,7 +244,11 @@ impl<P: Into<Path>> DbBuilder<P> {
     /// Set the segment extractor (RFC-0024). When configured, every
     /// write is routed through the extractor and the database tracks
     /// per-segment LSM state. The extractor must be configured at
-    /// database creation time and cannot be changed thereafter.
+    /// database creation time and remain configured thereafter. Its name
+    /// must remain stable; its implementation may evolve only if it preserves
+    /// routing for all existing key schemas and keeps segment prefixes across
+    /// schema versions an antichain (no prefix may be a proper prefix of
+    /// another).
     pub fn with_segment_extractor(
         mut self,
         extractor: Arc<dyn crate::prefix_extractor::PrefixExtractor>,
@@ -283,6 +297,13 @@ impl<P: Into<Path>> DbBuilder<P> {
     /// Disables the sst block/metadata cache
     pub fn with_db_cache_disabled(mut self) -> Self {
         self.db_cache = None;
+        self
+    }
+
+    /// Sets the policy for inserting flush and compaction output into the
+    /// decoded block cache.
+    pub fn with_block_cache_policy(mut self, policy: BlockCachePolicy) -> Self {
+        self.block_cache_policy = policy;
         self
     }
 
@@ -419,17 +440,7 @@ impl<P: Into<Path>> DbBuilder<P> {
 
     /// Builds and opens the database.
     pub async fn build(self) -> Result<Db, crate::Error> {
-        if self.settings.l0_flush_parallelism == 0 {
-            return Err(crate::Error::invalid(
-                "invalid configuration: l0_flush_parallelism must be at least 1".into(),
-            ));
-        }
-        if self.settings.max_wal_flushes_before_l0_flush < 4096 {
-            return Err(crate::Error::invalid(
-                "invalid configuration: max_wal_flushes_before_l0_flush must be at least 4096"
-                    .into(),
-            ));
-        }
+        self.settings.validate()?;
 
         let path = self.path.into();
         // TODO: proper URI generation, for now it works just as a flag
@@ -443,25 +454,52 @@ impl<P: Into<Path>> DbBuilder<P> {
         let metrics_recorder = self.metrics_recorder.clone();
         let recorder =
             MetricsRecorderHelper::new(self.metrics_recorder, self.settings.metric_level);
-        let retrying_main_object_store = instrumented_retrying_object_store(
+        let max_retries = self.settings.object_store_max_retries;
+
+        // Wraps a store in a retry and instrumentation layer, recording I/O
+        // under the given component and store-type metric labels. Each
+        // component (db, compactor, gc) gets its own layer over the store its
+        // builder holds.
+        let wrap_object_store = |store: Arc<dyn ObjectStore>,
+                                 component: ObjectStoreComponent,
+                                 store_type: ObjectStoreType| {
+            instrumented_retrying_object_store(
+                store,
+                &recorder,
+                component,
+                store_type,
+                rand.clone(),
+                system_clock.clone(),
+                max_retries,
+            )
+        };
+        // Set up the object store with optional caching from the settings,
+        // producing the same layering as a caller-built
+        // [`CachedObjectStore`] passed to [`DbBuilder::new`]: the cache sits
+        // under the retry and instrumentation layers, so the same cache
+        // instance can be shared with the compactor and GC below while each
+        // component keeps its own layers.
+        let cached_object_store = CachedObjectStore::from_config(
             self.main_object_store.clone(),
+            &self.settings.object_store_cache_options,
             &recorder,
+            system_clock.clone(),
+            rand.clone(),
+        )
+        .await?;
+        let maybe_cached_main_object_store: Arc<dyn ObjectStore> = match &cached_object_store {
+            Some(cached_store) => cached_store.clone(),
+            None => self.main_object_store.clone(),
+        };
+
+        let retrying_main_object_store = wrap_object_store(
+            maybe_cached_main_object_store,
             ObjectStoreComponent::Db,
             ObjectStoreType::Main,
-            rand.clone(),
-            system_clock.clone(),
         );
-        let retrying_wal_object_store: Option<Arc<dyn ObjectStore>> =
-            self.wal_object_store.map(|s| {
-                instrumented_retrying_object_store(
-                    s,
-                    &recorder,
-                    ObjectStoreComponent::Db,
-                    ObjectStoreType::Wal,
-                    rand.clone(),
-                    system_clock.clone(),
-                )
-            });
+        let retrying_wal_object_store: Option<Arc<dyn ObjectStore>> = self
+            .wal_object_store
+            .map(|s| wrap_object_store(s, ObjectStoreComponent::Db, ObjectStoreType::Wal));
 
         // Log the database opening
         if let Ok(settings_json) = self.settings.to_json_string() {
@@ -495,21 +533,6 @@ impl<P: Into<Path>> DbBuilder<P> {
             block_transformer: self.block_transformer.clone(),
             block_format,
             ..SsTableFormat::default()
-        };
-
-        // Setup object store with optional caching
-        let cached_object_store = CachedObjectStore::from_config(
-            retrying_main_object_store.clone(),
-            &self.settings.object_store_cache_options,
-            &recorder,
-            system_clock.clone(),
-            rand.clone(),
-        )
-        .await?;
-
-        let maybe_cached_main_object_store: Arc<dyn ObjectStore> = match &cached_object_store {
-            Some(cached_store) => cached_store.clone(),
-            None => retrying_main_object_store.clone(),
         };
 
         // Setup the manifest store and load latest manifest
@@ -549,22 +572,24 @@ impl<P: Into<Path>> DbBuilder<P> {
 
         // Create path resolver and table store
         let path_resolver = PathResolver::new_with_external_ssts(path.clone(), external_ssts);
+        let db_cache = self.db_cache.as_ref().map(|cache| {
+            Arc::new(DbCacheWrapper::new(
+                cache.clone(),
+                &recorder,
+                system_clock.clone(),
+            )) as Arc<dyn DbCache>
+        });
         let table_store = Arc::new(TableStore::new_with_fp_registry(
             ObjectStores::new(
-                maybe_cached_main_object_store.clone(),
+                retrying_main_object_store.clone(),
                 retrying_wal_object_store.clone(),
             ),
             sst_format.clone(),
             path_resolver.clone(),
             self.fp_registry.clone(),
-            self.db_cache.as_ref().map(|c| {
-                Arc::new(DbCacheWrapper::new(
-                    c.clone(),
-                    &recorder,
-                    system_clock.clone(),
-                )) as Arc<dyn DbCache>
-            }),
+            db_cache.clone(),
             TableStoreKind::Main,
+            self.block_cache_policy.clone(),
         ));
 
         // Initialize the database
@@ -585,20 +610,50 @@ impl<P: Into<Path>> DbBuilder<P> {
             }
         };
 
-        let fencer = WriterFencer::new(table_store.clone(), &self.settings, system_clock.clone());
+        let manifest_dirty = stored_manifest.prepare_dirty()?;
+        let status_manager = Arc::new(DbStatusManager::new_with_initial_values(
+            manifest_dirty.value.core.last_l0_seq,
+            manifest_dirty.into(),
+            BTreeSet::new(),
+        ));
+
+        let task_executor = Arc::new(MessageHandlerExecutor::new(
+            status_manager.clone(),
+            system_clock.clone(),
+        ));
+
+        let fencer = WriterFencer::new(
+            status_manager.result_reader(),
+            recorder.clone(),
+            table_store.clone(),
+            &self.settings,
+            system_clock.clone(),
+            task_executor.clone(),
+        );
         let WriterFenceResult {
             manifest,
             replay_range,
+            mut wal_writer,
         } = fencer.fence(stored_manifest, self.writer_epoch).await?;
+        let (wal_writer, wal_observer) = if DbInner::wal_enabled_in_options(&self.settings) {
+            let wal_observer = wal_writer.observer();
+            (Some(wal_writer), wal_observer)
+        } else {
+            wal_writer.close().await.map_err(SlateDBError::from)?;
+            let Err(final_status) = wal_writer.status() else {
+                return Err(crate::Error::internal(
+                    "closed wal writer did not return terminal status".to_string(),
+                ));
+            };
+            let wal_observer =
+                Box::new(DisabledWalObserver::new(final_status)) as Box<dyn WalObserver>;
+            (None, wal_observer)
+        };
 
         let manifest_dirty = manifest.prepare_dirty()?;
-
-        // Shared lifecycle state — created before DbInner so it can be shared
-        // with the executor and future channel construction.
-        let status_manager = DbStatusManager::new_with_initial_values(
+        status_manager.report_fence_manifest(
             manifest_dirty.value.core.last_l0_seq,
             manifest_dirty.clone().into(),
-            BTreeSet::new(),
         );
 
         // Setup communication channels wired to the shared closed state.
@@ -606,7 +661,7 @@ impl<P: Into<Path>> DbBuilder<P> {
         let (write_tx, write_rx) = SafeSender::unbounded_channel(reader);
 
         // Create the database inner state
-        let memtable_flusher = Arc::new(MemtableFlusher::new(&status_manager));
+        let memtable_flusher = Arc::new(MemtableFlusher::new(status_manager.as_ref()));
         let inner = Arc::new(
             DbInner::new(
                 self.settings.clone(),
@@ -616,10 +671,11 @@ impl<P: Into<Path>> DbBuilder<P> {
                 manifest_dirty,
                 Arc::clone(&memtable_flusher),
                 write_tx,
+                wal_observer,
                 recorder.clone(),
                 self.fp_registry.clone(),
                 self.merge_operator.clone(),
-                status_manager.clone(),
+                status_manager,
                 self.segment_extractor.clone(),
             )
             .await?,
@@ -627,29 +683,33 @@ impl<P: Into<Path>> DbBuilder<P> {
 
         // Setup background tasks
         let tokio_handle = Handle::current();
-        let task_executor = Arc::new(MessageHandlerExecutor::new(
-            Arc::new(status_manager),
-            system_clock.clone(),
-        ));
-        if inner.wal_enabled {
-            inner.wal_buffer.init(task_executor.clone()).await?;
-        };
         task_executor.add_handler(
             WRITE_BATCH_TASK_NAME.to_string(),
-            Box::new(WriteBatchEventHandler::new(inner.clone())),
+            Box::new(WriteBatchEventHandler::new(inner.clone(), wal_writer)),
             write_rx,
             &tokio_handle,
         )?;
-        // The compactor and GC each get their own cacheless store (so background
-        // reads do not pollute the foreground cache), tagged with their kind.
+
+        // Selects the store a background component (compactor, GC) reads and
+        // writes through, before the component wraps it in its own retry and
+        // instrumentation layer.
         //
-        // The compactor reads/writes through whichever object store its builder
-        // holds: the DB's own store on the auto-from-settings path, or the one
-        // the caller supplied on their own `CompactorBuilder` (so a custom
-        // compaction read path — e.g. one that bypasses a prefetch wrapper used
-        // by the foreground read path — actually takes effect instead of being
-        // silently ignored). Either way it is wrapped in its own Compactor-tagged
-        // retry/instrumentation layer below.
+        // When the component runs against the DB's own store (the auto from
+        // settings path, or a caller-supplied builder holding a clone of the
+        // DB's store) and object store caching is configured, the DB's cache
+        // instance is shared. A different caller-supplied store is used as
+        // given (e.g. a custom compaction reader takes effect instead of being
+        // silently ignored) and stays cacheless.
+        let background_component_store = |raw_store: Arc<dyn ObjectStore>| -> Arc<dyn ObjectStore> {
+            match &cached_object_store {
+                Some(cached) if Arc::ptr_eq(&raw_store, &self.main_object_store) => cached.clone(),
+                _ => raw_store,
+            }
+        };
+
+        // The compactor reads/writes through the object store held by its
+        // builder: the DB's own store on the auto from settings path, or the
+        // store the caller passed to their own `CompactorBuilder`.
         let compactor_builder = self.compactor_builder.or_else(|| {
             self.settings.compactor_options.as_ref().map(|opts| {
                 CompactorBuilder::new(path.clone(), self.main_object_store.clone())
@@ -672,15 +732,10 @@ impl<P: Into<Path>> DbBuilder<P> {
             }
             builder = builder.with_fp_registry(self.fp_registry.clone());
 
-            // Wrap whatever object store the builder holds in the compactor's
-            // own cacheless, Compactor-tagged retry/instrumentation layer.
-            let compactor_main_object_store = instrumented_retrying_object_store(
-                builder.main_object_store.clone(),
-                &recorder,
+            let compactor_main_object_store = wrap_object_store(
+                background_component_store(builder.main_object_store.clone()),
                 ObjectStoreComponent::Compactor,
                 ObjectStoreType::Main,
-                rand.clone(),
-                system_clock.clone(),
             );
             let compactor_table_store = Arc::new(TableStore::new_with_fp_registry(
                 ObjectStores::new(
@@ -690,8 +745,9 @@ impl<P: Into<Path>> DbBuilder<P> {
                 sst_format.clone(),
                 path_resolver.clone(),
                 self.fp_registry.clone(),
-                None,
+                db_cache.clone(),
                 TableStoreKind::Compactor,
+                self.block_cache_policy.clone(),
             ));
             let compactor_handlers = builder
                 .build_handler(
@@ -716,12 +772,14 @@ impl<P: Into<Path>> DbBuilder<P> {
             }
         }
 
+        // Same store selection as the compactor above. Sharing the DB's cache
+        // also means an SST deleted by the GC has its cache entries evicted.
         let gc_builder = self.gc_builder.or_else(|| {
             self.settings
                 .garbage_collector_options
                 .filter(|opts| !opts.is_empty())
                 .map(|opts| {
-                    GarbageCollectorBuilder::new(path.clone(), retrying_main_object_store.clone())
+                    GarbageCollectorBuilder::new(path.clone(), self.main_object_store.clone())
                         .with_options(opts)
                 })
         });
@@ -731,16 +789,19 @@ impl<P: Into<Path>> DbBuilder<P> {
                 .options
                 .metric_level
                 .or(Some(self.settings.metric_level));
+            let gc_object_store = wrap_object_store(
+                background_component_store(gc_builder.main_object_store.clone()),
+                ObjectStoreComponent::Gc,
+                ObjectStoreType::Main,
+            );
             let gc_table_store = Arc::new(TableStore::new_with_fp_registry(
-                ObjectStores::new(
-                    retrying_main_object_store.clone(),
-                    retrying_wal_object_store.clone(),
-                ),
+                ObjectStores::new(gc_object_store.clone(), retrying_wal_object_store.clone()),
                 sst_format.clone(),
                 path_resolver.clone(),
                 self.fp_registry.clone(),
                 None,
                 TableStoreKind::GC,
+                BlockCachePolicy::default(),
             ));
             let gc = gc_builder
                 .with_system_clock(system_clock.clone())
@@ -750,7 +811,7 @@ impl<P: Into<Path>> DbBuilder<P> {
                     gc_table_store,
                     manifest_store.clone(),
                     compactions_store.clone(),
-                    retrying_main_object_store.clone(),
+                    gc_object_store,
                 );
             // Garbage collector only uses tickers, so pass in a dummy rx channel
             let (_, rx) = async_channel::unbounded();
@@ -765,7 +826,7 @@ impl<P: Into<Path>> DbBuilder<P> {
             manifest,
             &tokio_handle,
             &task_executor,
-            &inner.status_manager,
+            inner.status_manager.as_ref(),
         )?;
 
         // Monitor background tasks
@@ -799,6 +860,7 @@ pub struct AdminBuilder<P: Into<Path>> {
     wal_object_store: Option<Arc<dyn ObjectStore>>,
     system_clock: Arc<dyn SystemClock>,
     rand: Arc<DbRand>,
+    object_store_max_retries: Option<u32>,
     #[cfg(feature = "compaction_filters")]
     compaction_filter_supplier: Option<Arc<dyn CompactionFilterSupplier>>,
     merge_operator: Option<MergeOperatorType>,
@@ -813,6 +875,7 @@ impl<P: Into<Path>> AdminBuilder<P> {
             wal_object_store: None,
             system_clock: Arc::new(DefaultSystemClock::new()),
             rand: Arc::new(DbRand::default()),
+            object_store_max_retries: None,
             #[cfg(feature = "compaction_filters")]
             compaction_filter_supplier: None,
             merge_operator: None,
@@ -862,12 +925,17 @@ impl<P: Into<Path>> AdminBuilder<P> {
 
     /// Builds and returns an Admin instance.
     pub fn build(self) -> Admin {
-        // No retrying object stores here, since we don't want to retry admin operations
+        // Store the raw object stores here. Admin wraps them in a
+        // `RetryingObjectStore` per-operation (see `Admin::retrying_store`)
+        // rather than at build time, because several admin operations delegate
+        // to sub-builders (compactor/GC) that add their own retry layer, and
+        // wrapping here would double-wrap them.
         Admin {
             path: self.path.into(),
             object_stores: ObjectStores::new(self.main_object_store, self.wal_object_store),
             system_clock: self.system_clock,
             rand: self.rand,
+            object_store_max_retries: self.object_store_max_retries,
             #[cfg(feature = "compaction_filters")]
             compaction_filter_supplier: self.compaction_filter_supplier,
             merge_operator: self.merge_operator,
@@ -994,6 +1062,7 @@ impl<P: Into<Path>> GarbageCollectorBuilder<P> {
             ObjectStoreType::Main,
             self.rand.clone(),
             self.system_clock.clone(),
+            self.options.object_store_max_retries,
         );
         let retrying_wal_object_store = self.wal_object_store.map(|s| {
             instrumented_retrying_object_store(
@@ -1003,6 +1072,7 @@ impl<P: Into<Path>> GarbageCollectorBuilder<P> {
                 ObjectStoreType::Wal,
                 self.rand.clone(),
                 self.system_clock.clone(),
+                self.options.object_store_max_retries,
             )
         });
         let manifest_store = Arc::new(ManifestStore::new(
@@ -1022,6 +1092,7 @@ impl<P: Into<Path>> GarbageCollectorBuilder<P> {
             path,
             None, // no need for cache in GC
             TableStoreKind::GC,
+            BlockCachePolicy::default(),
         ));
         GarbageCollector::new(
             manifest_store,
@@ -1225,6 +1296,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             ObjectStoreType::Main,
             self.rand.clone(),
             self.system_clock.clone(),
+            self.options.object_store_max_retries,
         );
         let manifest_store = Arc::new(ManifestStore::new(
             &path,
@@ -1245,6 +1317,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             path,
             None,
             TableStoreKind::Compactor,
+            BlockCachePolicy::default(),
         ));
 
         let scheduler_supplier = self
@@ -1462,6 +1535,7 @@ impl<P: Into<Path>> CompactionWorkerBuilder<P> {
             path,
             None,
             TableStoreKind::Compactor,
+            BlockCachePolicy::default(),
         ));
         let recorder = MetricsRecorderHelper::new(
             self.metrics_recorder,
@@ -1559,7 +1633,7 @@ pub struct DbReaderBuilder<P: Into<Path>> {
     object_store: Arc<dyn ObjectStore>,
     wal_object_store: Option<Arc<dyn ObjectStore>>,
     db_cache: Option<Arc<dyn DbCache>>,
-    checkpoint_id: Option<uuid::Uuid>,
+    mode: DbReaderMode,
     merge_operator: Option<MergeOperatorType>,
     block_transformer: Option<Arc<dyn BlockTransformer>>,
     filter_policies: Vec<Arc<dyn FilterPolicy>>,
@@ -1578,7 +1652,7 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
             object_store,
             wal_object_store: None,
             db_cache: default_db_cache(),
-            checkpoint_id: None,
+            mode: DbReaderMode::default(),
             merge_operator: None,
             block_transformer: None,
             filter_policies: default_filter_policies(),
@@ -1590,10 +1664,9 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
         }
     }
 
-    /// Sets the checkpoint ID to use for the reader.
-    /// If not set, the reader will create and manage its own checkpoint.
-    pub fn with_checkpoint_id(mut self, checkpoint_id: uuid::Uuid) -> Self {
-        self.checkpoint_id = Some(checkpoint_id);
+    /// Sets how the reader chooses and refreshes database state.
+    pub fn with_reader_mode(mut self, mode: DbReaderMode) -> Self {
+        self.mode = mode;
         self
     }
 
@@ -1713,13 +1786,30 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
         );
         // TODO: proper URI generation, for now it works just as a flag
         let wal_object_store_uri = self.wal_object_store.as_ref().map(|_| String::new());
+        // Set up the object store with optional caching from the reader
+        // options, with the cache under the retry and instrumentation layers,
+        // matching a caller-built [`CachedObjectStore`] passed to the reader.
+        let maybe_cached = CachedObjectStore::from_config(
+            self.object_store.clone(),
+            &self.options.object_store_cache_options,
+            &recorder,
+            self.system_clock.clone(),
+            self.rand.clone(),
+        )
+        .await?;
+        let maybe_cached_object_store: Arc<dyn ObjectStore> = match &maybe_cached {
+            Some(cached) => Arc::clone(cached) as Arc<dyn ObjectStore>,
+            None => self.object_store,
+        };
+
         let retrying_object_store = instrumented_retrying_object_store(
-            self.object_store,
+            maybe_cached_object_store,
             &recorder,
             ObjectStoreComponent::Reader,
             ObjectStoreType::Main,
             self.rand.clone(),
             self.system_clock.clone(),
+            self.options.object_store_max_retries,
         );
 
         let retrying_wal_object_store: Option<Arc<dyn ObjectStore>> =
@@ -1731,26 +1821,12 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
                     ObjectStoreType::Wal,
                     self.rand.clone(),
                     self.system_clock.clone(),
+                    self.options.object_store_max_retries,
                 )
             });
 
-        // Setup object store with optional caching
-        let maybe_cached = CachedObjectStore::from_config(
-            retrying_object_store.clone(),
-            &self.options.object_store_cache_options,
-            &recorder,
-            self.system_clock.clone(),
-            self.rand.clone(),
-        )
-        .await?;
-
-        let object_store: Arc<dyn ObjectStore> = match &maybe_cached {
-            Some(cached) => Arc::clone(cached) as Arc<dyn ObjectStore>,
-            None => retrying_object_store.clone(),
-        };
-
         // Validate WAL object store configuration.
-        let manifest_store = Arc::new(ManifestStore::new(&path, retrying_object_store));
+        let manifest_store = Arc::new(ManifestStore::new(&path, retrying_object_store.clone()));
         let latest_manifest =
             StoredManifest::try_load(Arc::clone(&manifest_store), self.system_clock.clone())
                 .await?;
@@ -1764,8 +1840,8 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
         // read from: the pinned checkpoint's manifest when a checkpoint id is
         // given (compaction may have pruned re-localized external SSTs from
         // the latest manifest), and the latest manifest otherwise.
-        let external_ssts = match (&latest_manifest, self.checkpoint_id) {
-            (Some(latest_stored_manifest), Some(checkpoint_id)) => {
+        let external_ssts = match (&latest_manifest, self.mode) {
+            (Some(latest_stored_manifest), DbReaderMode::Checkpoint(checkpoint_id)) => {
                 let checkpoint = latest_stored_manifest
                     .db_state()
                     .find_checkpoint(checkpoint_id)
@@ -1775,9 +1851,7 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
                     .await?
                     .external_ssts()
             }
-            (Some(latest_stored_manifest), None) => {
-                latest_stored_manifest.manifest().external_ssts()
-            }
+            (Some(latest_stored_manifest), _) => latest_stored_manifest.manifest().external_ssts(),
             (None, _) => HashMap::new(),
         };
 
@@ -1796,18 +1870,19 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
         };
         let path_resolver = PathResolver::new_with_external_ssts(path.clone(), external_ssts);
         let table_store = Arc::new(TableStore::new_with_fp_registry(
-            ObjectStores::new(object_store, retrying_wal_object_store),
+            ObjectStores::new(retrying_object_store, retrying_wal_object_store),
             sst_format,
             path_resolver,
             Arc::new(FailPointRegistry::new()),
             wrapped_cache,
             TableStoreKind::Reader,
+            BlockCachePolicy::default(),
         ));
 
         let mut reader = DbReader::open_internal(
             manifest_store,
             table_store,
-            self.checkpoint_id,
+            self.mode,
             self.merge_operator,
             self.segment_extractor,
             self.options,
@@ -2020,6 +2095,7 @@ fn instrumented_retrying_object_store(
     store_type: ObjectStoreType,
     rand: Arc<DbRand>,
     system_clock: Arc<dyn SystemClock>,
+    max_retries: Option<u32>,
 ) -> Arc<dyn ObjectStore> {
     let instrumented: Arc<dyn ObjectStore> = Arc::new(InstrumentedObjectStore::new(
         object_store,
@@ -2027,7 +2103,12 @@ fn instrumented_retrying_object_store(
         component,
         store_type,
     ));
-    Arc::new(RetryingObjectStore::new(instrumented, rand, system_clock))
+    Arc::new(RetryingObjectStore::new(
+        instrumented,
+        rand,
+        system_clock,
+        max_retries,
+    ))
 }
 
 #[allow(unreachable_code)]
@@ -2080,6 +2161,7 @@ pub(crate) fn default_meta_cache() -> Option<Arc<dyn DbCache>> {
 
 #[cfg(test)]
 mod tests {
+    use crate::cached_object_store::CachedObjectStore;
     use crate::compactions_store::{CompactionsStore, StoredCompactions};
     use crate::config::{CompactorOptions, GarbageCollectorOptions, MetricLevel, Settings};
     use crate::error::ErrorKind;
@@ -2336,14 +2418,17 @@ mod tests {
             .tempdir()
             .expect("failed to create cache dir");
         let cache_path = cache_dir.path().to_path_buf();
-        let mut settings = Settings {
+        let settings = Settings {
             garbage_collector_options: None,
             ..Settings::default()
         };
-        settings.object_store_cache_options.root_folder = Some(cache_path.clone());
-        settings.object_store_cache_options.part_size_bytes = 1024;
+        let cached_store = CachedObjectStore::builder(cache_path.clone(), object_store)
+            .with_part_size_bytes(1024)
+            .build()
+            .await
+            .expect("failed to build cached store");
 
-        let db = crate::Db::builder(path.clone(), object_store)
+        let db = crate::Db::builder(path.clone(), cached_store)
             .with_settings(settings)
             .with_metrics_recorder(metrics_recorder.clone())
             .build()
@@ -2355,6 +2440,61 @@ mod tests {
         assert!(!cached_db_path.join("compactions").exists());
         assert!(!cached_db_path.join("gc").exists());
 
+        db.close().await.expect("failed to close db");
+    }
+
+    #[tokio::test]
+    async fn test_settings_configured_object_store_cache() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("test_settings_configured_object_store_cache");
+
+        // Seed an L0 SST without any cache configured.
+        let db = crate::Db::builder(path.clone(), object_store.clone())
+            .with_settings(Settings {
+                garbage_collector_options: None,
+                ..Settings::default()
+            })
+            .build()
+            .await
+            .expect("failed to build db");
+        db.put(b"k1", b"v1").await.expect("failed to put");
+        db.flush().await.expect("failed to flush");
+        db.close().await.expect("failed to close db");
+
+        // Reopen with the cache configured through Settings and preload on.
+        let cache_dir = tempfile::Builder::new()
+            .prefix("settings_cache_test_")
+            .tempdir()
+            .expect("failed to create cache dir");
+        let cache_path = cache_dir.path().to_path_buf();
+        let mut settings = Settings {
+            garbage_collector_options: None,
+            ..Settings::default()
+        };
+        settings.object_store_cache_options.root_folder = Some(cache_path.clone());
+        settings.object_store_cache_options.part_size_bytes = 1024;
+        settings
+            .object_store_cache_options
+            .preload_disk_cache_on_startup = Some(crate::config::PreloadLevel::AllSst);
+
+        let db = crate::Db::builder(path.clone(), object_store)
+            .with_settings(settings)
+            .build()
+            .await
+            .expect("failed to build db");
+
+        // The preload populated the cache with the compacted SST's parts.
+        let cached_db_path = cache_path.join(path.as_ref());
+        let cached_compacted = std::fs::read_dir(cached_db_path.join("compacted"))
+            .expect("expected cached compacted dir")
+            .count();
+        assert!(cached_compacted > 0);
+        assert!(!cached_db_path.join("manifest").exists());
+
+        assert_eq!(
+            db.get(b"k1").await.expect("failed to get").as_deref(),
+            Some(b"v1".as_ref())
+        );
         db.close().await.expect("failed to close db");
     }
 }

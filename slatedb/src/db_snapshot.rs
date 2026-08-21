@@ -8,7 +8,7 @@ use crate::db_iter::DbIterator;
 use crate::types::KeyValue;
 
 use crate::db::DbInner;
-use crate::db_reader::{CheckpointState, DbReaderInner};
+use crate::db_reader::{DbReaderInner, ReaderState};
 use crate::reader::ScanContext;
 use crate::DbReadOps;
 
@@ -30,7 +30,7 @@ enum DbSnapshotBackend {
     },
     Reader {
         inner: Arc<DbReaderInner>,
-        state: Arc<CheckpointState>,
+        state: Arc<ReaderState>,
     },
 }
 
@@ -47,7 +47,7 @@ impl DbSnapshot {
         })
     }
 
-    pub(crate) fn new_reader(inner: Arc<DbReaderInner>, state: Arc<CheckpointState>) -> Arc<Self> {
+    pub(crate) fn new_reader(inner: Arc<DbReaderInner>, state: Arc<ReaderState>) -> Arc<Self> {
         Arc::new(Self {
             started_seq: state.applied_seq(),
             backend: DbSnapshotBackend::Reader { inner, state },
@@ -430,7 +430,7 @@ mod tests {
                 scheduler_options: Default::default(),
                 ..Default::default()
             }),
-            max_unflushed_bytes: 16 * 1024,
+            max_unflushed_bytes: 8 * 4096,
             min_filter_keys: 0,
             l0_sst_size_bytes: 4 * 4096,
             ..Default::default()
@@ -868,7 +868,7 @@ mod tests {
                 scheduler_options: Default::default(),
                 ..Default::default()
             }),
-            max_unflushed_bytes: 16 * 1024,
+            max_unflushed_bytes: 8 * 4096,
             min_filter_keys: 0,
             l0_sst_size_bytes: 4 * 4096,
             ..Default::default()

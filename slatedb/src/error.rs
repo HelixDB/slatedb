@@ -80,6 +80,18 @@ pub(crate) enum SlateDBError {
     #[error("wal store reconfiguration unsupported")]
     WalStoreReconfigurationError,
 
+    #[error("wal truncated")]
+    WalTruncated,
+
+    #[error("wal unavailable")]
+    WalUnavailable(Arc<dyn std::error::Error + Sync + Send + 'static>),
+
+    #[error("wal internal error")]
+    WalInternalError(Arc<dyn std::error::Error + Sync + Send + 'static>),
+
+    #[error("wal data error")]
+    WalDataError(Arc<dyn std::error::Error + Sync + Send + 'static>),
+
     #[error("invalid compaction")]
     InvalidCompaction,
 
@@ -188,6 +200,9 @@ pub(crate) enum SlateDBError {
     #[error("reader checkpoint lease lost. checkpoint_id=`{0}`")]
     CheckpointLeaseLost(Uuid),
 
+    #[error("reader snapshots are unsupported in FollowLatest mode")]
+    DbReaderSnapshotUnsupportedInFollowLatest,
+
     #[error(
         "unsupported {format_name} format version. supported_versions=`{supported_versions:?}`, actual_version=`{actual_version}`"
     )]
@@ -241,6 +256,9 @@ pub(crate) enum SlateDBError {
 
     #[error("invalid sst batch size. size=`{0}`")]
     InvalidSSTBatchSize(usize),
+
+    #[error("invalid configuration: {0}")]
+    InvalidConfiguration(String),
 
     #[error("cannot seek to a key outside the iterator range. key=`{key:?}`, start_key=`{start_key:?}`, end_key=`{end_key:?}`")]
     SeekKeyOutOfKeyRange {
@@ -515,12 +533,18 @@ impl std::fmt::Display for ErrorKind {
 /// Why a recoverable SST read is being reissued (the reason it failed validation
 /// the first time).
 ///
-/// Carried on the reissued read's tag so a caching wrapper can try a different
-/// strategy on the retry.
+/// Carried on the reissued read's
+/// [`ObjectStoreCallTag`](crate::object_store_tag::ObjectStoreCallTag) so a
+/// caching wrapper can drop its local copy and refetch instead of serving the
+/// same bytes again.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RetryReason {
+pub enum RetryReason {
+    /// The read bytes failed a checksum validation.
     CrcMismatch,
+    /// The read bytes could not be decoded as a block.
     BlockDecodeError,
+    /// The read bytes could not be decompressed.
     #[cfg(any(
         feature = "snappy",
         feature = "zlib",
@@ -666,6 +690,7 @@ impl From<SlateDBError> for Error {
             #[cfg(feature = "foyer")]
             SlateDBError::FoyerError(err) => Error::unavailable(msg).with_source(Box::new(err)),
             SlateDBError::TransactionalObjectTimeout { .. } => Error::unavailable(msg),
+            SlateDBError::WalUnavailable(src) => Error::unavailable(msg).with_source(Box::new(src)),
             SlateDBError::CheckpointLeaseLost(_) => Error::unavailable(msg),
 
             // Invalid errors
@@ -681,9 +706,11 @@ impl From<SlateDBError> for Error {
             SlateDBError::InvalidObjectStorePath(_) => Error::invalid(msg),
             SlateDBError::UnknownConfigurationFormat(_) => Error::invalid(msg),
             SlateDBError::InvalidSSTBatchSize(_) => Error::invalid(msg),
+            SlateDBError::InvalidConfiguration(_) => Error::invalid(msg),
             SlateDBError::InvalidCheckpointLifetime(_) => Error::invalid(msg),
             SlateDBError::InvalidManifestPollInterval(_) => Error::invalid(msg),
             SlateDBError::CheckpointLifetimeTooShort { .. } => Error::invalid(msg),
+            SlateDBError::DbReaderSnapshotUnsupportedInFollowLatest => Error::invalid(msg),
             SlateDBError::SeekKeyOutOfRange { .. } => Error::invalid(msg),
             SlateDBError::SeekKeyLessThanLastReturnedKey => Error::invalid(msg),
             SlateDBError::IdenticalClonePaths { .. } => Error::invalid(msg),
@@ -742,6 +769,7 @@ impl From<SlateDBError> for Error {
             SlateDBError::CloneExternalDbMissing => Error::data(msg),
             SlateDBError::CloneIncorrectExternalDbCheckpoint { .. } => Error::data(msg),
             SlateDBError::CloneIncorrectFinalCheckpoint { .. } => Error::data(msg),
+            SlateDBError::WalDataError(src) => Error::data(msg).with_source(Box::new(src)),
 
             // Internal errors
             SlateDBError::CompactorExecutorFailed => Error::internal(msg),
@@ -756,6 +784,8 @@ impl From<SlateDBError> for Error {
             SlateDBError::TransactionalObjectError(err) => {
                 Error::internal(msg).with_source(Box::new(err))
             }
+            SlateDBError::WalTruncated => Error::internal(msg),
+            SlateDBError::WalInternalError(src) => Error::internal(msg).with_source(Box::new(src)),
         }
     }
 }

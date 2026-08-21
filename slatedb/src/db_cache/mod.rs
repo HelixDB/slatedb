@@ -11,10 +11,12 @@
 //!
 //! To use the cache, you need to configure the [DbOptions](crate::config::DbOptions) with the desired cache implementation.
 
+use std::ops::{Bound, RangeBounds};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::future::BoxFuture;
 use log::{debug, error, trace};
@@ -338,6 +340,41 @@ pub trait DbCache: Send + Sync {
         let entry = loader().await?;
         self.insert(key, entry.clone()).await;
         Ok(entry)
+    }
+}
+
+/// An SST component that can be inserted into the block cache, either by
+/// warming an existing SST via
+/// [`DbCacheManagerOps::warm_sst`](crate::DbCacheManagerOps::warm_sst) or as
+/// the SST is written via [`BlockCachePolicy`](crate::BlockCachePolicy).
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum CacheTarget {
+    /// All filter blocks on the SST, if any exist.
+    Filters,
+    /// The SST index.
+    Index,
+    /// The SST stats block, if one exists.
+    Stats,
+    /// Data blocks whose key span overlaps the supplied key range.
+    Data((Bound<Bytes>, Bound<Bytes>)),
+}
+
+impl CacheTarget {
+    /// Convenience constructor for [`CacheTarget::Data`] that accepts any
+    /// [`RangeBounds`], mirroring the `Db::scan` signature. Pass `..` to
+    /// select all data blocks.
+    pub fn data<K, T>(range: T) -> Self
+    where
+        K: AsRef<[u8]>,
+        T: RangeBounds<K>,
+    {
+        let start = range
+            .start_bound()
+            .map(|b| Bytes::copy_from_slice(b.as_ref()));
+        let end = range
+            .end_bound()
+            .map(|b| Bytes::copy_from_slice(b.as_ref()));
+        CacheTarget::Data((start, end))
     }
 }
 
@@ -1195,6 +1232,10 @@ pub(crate) mod test_utils {
                 misses: AtomicU64::new(0),
                 inserts: AtomicU64::new(0),
             }
+        }
+
+        pub(crate) fn keys(&self) -> Vec<CachedKey> {
+            self.items.lock().unwrap().keys().cloned().collect()
         }
 
         fn get(&self, key: &CachedKey) -> Option<CachedEntry> {

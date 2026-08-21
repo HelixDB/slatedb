@@ -274,6 +274,14 @@ impl CompactionStatus {
         )
     }
 
+    /// Returns whether this compaction still consumes scheduler capacity.
+    pub(crate) fn counts_against_max_concurrent(self) -> bool {
+        matches!(
+            self,
+            CompactionStatus::Submitted | CompactionStatus::Scheduled | CompactionStatus::Running
+        )
+    }
+
     fn finished(self) -> bool {
         matches!(self, CompactionStatus::Completed | CompactionStatus::Failed)
     }
@@ -509,6 +517,35 @@ impl Compaction {
             .filter_map(|s| s.maybe_unwrap_sst_view())
             .filter_map(|ulid| sst_views_by_id.get(&ulid).map(|t| (*t).clone()))
             .collect()
+    }
+
+    /// Builds the output run when all input SST views have disjoint effective
+    /// key ranges. Reusing the views avoids reading or rewriting SST data.
+    pub(crate) fn trivial_move_output(&self, db_state: &ManifestCore) -> Option<SortedRun> {
+        let destination = self.spec.destination()?;
+        let mut sst_views = self.get_l0_sst_views(db_state);
+        sst_views.extend(
+            self.get_sorted_runs(db_state)
+                .into_iter()
+                .flat_map(|sr| sr.sst_views),
+        );
+        sst_views.sort_by(|left, right| {
+            left.compacted_effective_range()
+                .comparable_start_bound()
+                .cmp(&right.compacted_effective_range().comparable_start_bound())
+        });
+
+        (!sst_views.is_empty()
+            && sst_views.windows(2).all(|pair| {
+                pair[0]
+                    .compacted_effective_range()
+                    .intersect(pair[1].compacted_effective_range())
+                    .is_none()
+            }))
+        .then_some(SortedRun {
+            id: destination,
+            sst_views,
+        })
     }
 
     /// The stable id (ULID) used to track this compaction across messages and attempts.
@@ -962,6 +999,7 @@ impl CompactorState {
             sequence_tracker: remote_manifest.value.core.sequence_tracker,
         };
         remote_manifest.value.core = merged;
+        remote_manifest.value.prune_external_sst_ids();
         self.manifest = remote_manifest;
     }
 
@@ -1233,6 +1271,7 @@ mod tests {
     use crate::manifest::store::test_utils::new_dirty_manifest;
     use crate::manifest::store::{ManifestStore, StoredManifest};
     use crate::manifest::{LsmTreeState, Segment};
+    use crate::test_utils::bounded_sst_view;
     use crate::utils::IdGenerator;
     use bytes::Bytes;
     use object_store::memory::InMemory;
@@ -1262,6 +1301,69 @@ mod tests {
             CompactionSpec::new(vec![SourceId::SortedRun(1)], 1),
         )
         .with_ctx(Some(CompactionContext::new(subcompactions, Some(0))))
+    }
+
+    #[test]
+    fn test_trivial_move_output_builds_sorted_run_from_disjoint_inputs() {
+        let l0 = bounded_sst_view(2, b"m", b"n");
+        let sr_first = bounded_sst_view(1, b"a", b"b");
+        let sr_last = bounded_sst_view(3, b"z", b"z");
+        let mut db_state = ManifestCore::new();
+        Arc::make_mut(&mut db_state.tree).l0 = VecDeque::from([l0.clone()]);
+        Arc::make_mut(&mut db_state.tree).compacted = vec![SortedRun {
+            id: 1,
+            sst_views: vec![sr_first.clone(), sr_last.clone()],
+        }];
+        let compaction = Compaction::new(
+            Ulid::new(),
+            CompactionSpec::new(vec![SstView(l0.id), SourceId::SortedRun(1)], 2),
+        );
+
+        let output = compaction
+            .trivial_move_output(&db_state)
+            .expect("disjoint inputs should be a trivial move");
+
+        assert_eq!(output.id, 2);
+        assert_eq!(
+            output
+                .sst_views
+                .iter()
+                .map(|view| view.id)
+                .collect::<Vec<_>>(),
+            vec![sr_first.id, l0.id, sr_last.id]
+        );
+    }
+
+    #[test]
+    fn test_trivial_move_output_rejects_overlapping_inputs() {
+        let l0 = bounded_sst_view(1, b"a", b"m");
+        let sr_view = bounded_sst_view(2, b"m", b"z");
+        let mut db_state = ManifestCore::new();
+        Arc::make_mut(&mut db_state.tree).l0 = VecDeque::from([l0.clone()]);
+        Arc::make_mut(&mut db_state.tree).compacted = vec![SortedRun {
+            id: 1,
+            sst_views: vec![sr_view],
+        }];
+        let compaction = Compaction::new(
+            Ulid::new(),
+            CompactionSpec::new(vec![SstView(l0.id), SourceId::SortedRun(1)], 2),
+        );
+
+        assert!(compaction.trivial_move_output(&db_state).is_none());
+    }
+
+    #[test]
+    fn test_trivial_move_output_rejects_drain() {
+        let db_state = ManifestCore::new();
+        let compaction = Compaction::new(
+            Ulid::new(),
+            CompactionSpec::drain_segment(
+                Bytes::from_static(b"segment/"),
+                vec![SourceId::SortedRun(1)],
+            ),
+        );
+
+        assert!(compaction.trivial_move_output(&db_state).is_none());
     }
 
     fn set_test_subcompactions(compaction: &mut Compaction, subcompactions: Vec<Subcompaction>) {
@@ -1365,14 +1467,25 @@ mod tests {
     }
 
     #[test]
-    fn test_compaction_status_active_and_finished() {
+    fn test_compaction_status_classifications() {
         assert!(CompactionStatus::Submitted.active());
+        assert!(CompactionStatus::Scheduled.active());
         assert!(CompactionStatus::Running.active());
+        assert!(CompactionStatus::Compacted.active());
         assert!(!CompactionStatus::Completed.active());
         assert!(!CompactionStatus::Failed.active());
 
+        assert!(CompactionStatus::Submitted.counts_against_max_concurrent());
+        assert!(CompactionStatus::Scheduled.counts_against_max_concurrent());
+        assert!(CompactionStatus::Running.counts_against_max_concurrent());
+        assert!(!CompactionStatus::Compacted.counts_against_max_concurrent());
+        assert!(!CompactionStatus::Completed.counts_against_max_concurrent());
+        assert!(!CompactionStatus::Failed.counts_against_max_concurrent());
+
         assert!(!CompactionStatus::Submitted.finished());
+        assert!(!CompactionStatus::Scheduled.finished());
         assert!(!CompactionStatus::Running.finished());
+        assert!(!CompactionStatus::Compacted.finished());
         assert!(CompactionStatus::Completed.finished());
         assert!(CompactionStatus::Failed.finished());
     }
@@ -1696,6 +1809,31 @@ mod tests {
             .map(|h| h.sst.id.unwrap_compacted_id())
             .collect();
         assert_eq!(expected_merged_l0s, merged_l0s);
+    }
+
+    #[test]
+    fn test_merge_remote_manifest_reestablishes_external_sst_invariant() {
+        let manifest = new_dirty_manifest();
+        let compactions = new_dirty_compactions(manifest.value.compactor_epoch);
+        let mut state = CompactorState::new(manifest, compactions);
+        let stale_id = SsTableId::Compacted(Ulid::new());
+        let mut remote = new_dirty_manifest();
+        remote.value.external_dbs = vec![crate::manifest::ExternalDb {
+            path: "/parent/db".to_string(),
+            source_checkpoint_id: uuid::Uuid::new_v4(),
+            final_checkpoint_id: Some(uuid::Uuid::new_v4()),
+            sst_ids: vec![stale_id],
+        }];
+
+        state.merge_remote_manifest(remote);
+
+        let external = &state.manifest().value.external_dbs;
+        assert_eq!(external.len(), 1, "detach metadata must be retained");
+        assert!(
+            external[0].sst_ids.is_empty(),
+            "IDs absent from the merged tree must not be resurrected"
+        );
+        assert!(external[0].final_checkpoint_id.is_some());
     }
 
     #[test]

@@ -86,6 +86,10 @@ impl FenceableManifest {
         Ok(Self { inner: fr, clock })
     }
 
+    pub(crate) fn manifest(&self) -> (u64, &Manifest) {
+        (self.inner.id().id(), self.inner.object())
+    }
+
     pub(crate) fn local_epoch(&self) -> u64 {
         self.inner.local_epoch()
     }
@@ -1084,6 +1088,7 @@ mod tests {
             flaky.clone(),
             Arc::new(DbRand::default()),
             Arc::new(DefaultSystemClock::new()),
+            None,
         ));
         let ms = Arc::new(ManifestStore::new(&Path::from(ROOT), retrying.clone()));
 

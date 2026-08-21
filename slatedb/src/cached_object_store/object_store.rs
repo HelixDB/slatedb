@@ -16,7 +16,7 @@ use object_store::{
     PutResult, RenameOptions,
 };
 use object_store::{ListResult, MultipartUpload, PutOptions, PutPayload};
-use slatedb_common::clock::SystemClock;
+use slatedb_common::clock::{DefaultSystemClock, SystemClock};
 use slatedb_common::DbRand;
 use std::{ops::Range, sync::Arc};
 
@@ -25,13 +25,38 @@ use crate::single_flight::SingleFlight;
 use crate::cached_object_store::storage::{LocalCacheStorage, PartID};
 use crate::db_cache::CacheUsageSnapshot;
 use crate::error::SlateDBError;
+use crate::utils::build_concurrent;
 use log::warn;
 
-use crate::utils::build_concurrent;
-use slatedb_common::metrics::MetricsRecorderHelper;
+use slatedb_common::metrics::{
+    MetricLevel, MetricsRecorder, MetricsRecorderHelper, NoopMetricsRecorder,
+};
 
+/// An [`ObjectStore`] wrapper that caches object parts on local disk.
+///
+/// The cache splits each object into fixed-size parts and stores them under a
+/// root folder.
+///
+/// Reads tagged by SlateDB as compacted SST reads are served from
+/// disk when present and admitted on a miss.
+///
+/// Writes can optionally be admitted via
+/// [`CachedObjectStoreBuilder::with_cache_on_flush`] and
+/// [`CachedObjectStoreBuilder::with_cache_on_compaction`].
+///
+/// All other calls (manifests, WAL, listings) pass through to the wrapped store.
+///
+/// Construct it over the raw backend and pass it to SlateDB as the object
+/// store itself:
+///
+/// ```ignore
+/// let cache = CachedObjectStore::builder("/var/slatedb-cache", backend)
+///     .build()
+///     .await?;
+/// let db = Db::builder(path, cache).build().await?;
+/// ```
 #[derive(Debug, Clone)]
-pub(crate) struct CachedObjectStore {
+pub struct CachedObjectStore {
     object_store: Arc<dyn ObjectStore>,
     part_size_bytes: usize, // expected to be aligned with mb or kb
     pub(crate) cache_storage: Arc<dyn LocalCacheStorage>,
@@ -57,7 +82,7 @@ impl CachedObjectStore {
         object_store: Arc<dyn ObjectStore>,
         cache_storage: Arc<dyn LocalCacheStorage>,
         part_size_bytes: usize,
-        cache_puts: bool,
+        cache_put_config: CachePutConfig,
         stats: Arc<CachedObjectStoreStats>,
     ) -> Result<Arc<Self>, SlateDBError> {
         Self::new_with_policies(
@@ -67,7 +92,7 @@ impl CachedObjectStore {
             stats,
             Arc::new(DefaultGetPolicy),
             Arc::new(DefaultPutPolicy {
-                put: CachePutConfig { cache_puts },
+                put: cache_put_config,
             }),
         )
     }
@@ -114,6 +139,28 @@ impl CachedObjectStore {
         clock: Arc<dyn SystemClock>,
         rand: Arc<DbRand>,
     ) -> Result<Option<Arc<Self>>, SlateDBError> {
+        Self::from_config_with_cache_put_config(
+            object_store,
+            options,
+            CachePutConfig {
+                cache_on_flush: options.cache_puts,
+                cache_on_compaction: options.cache_puts,
+            },
+            recorder,
+            clock,
+            rand,
+        )
+        .await
+    }
+
+    async fn from_config_with_cache_put_config(
+        object_store: Arc<dyn ObjectStore>,
+        options: &ObjectStoreCacheOptions,
+        cache_put_config: CachePutConfig,
+        recorder: &MetricsRecorderHelper,
+        clock: Arc<dyn SystemClock>,
+        rand: Arc<DbRand>,
+    ) -> Result<Option<Arc<Self>>, SlateDBError> {
         let cache_root_folder = match &options.root_folder {
             None => return Ok(None),
             Some(f) => f,
@@ -132,21 +179,45 @@ impl CachedObjectStore {
             object_store,
             cache_storage,
             options.part_size_bytes,
-            options.cache_puts,
+            cache_put_config,
             stats,
         )?;
         cached.start_evictor().await;
         Ok(Some(cached))
     }
 
-    /// Load files into cache up to a maximum number of bytes.
-    /// This method fetches objects from the provided paths and stores them in the cache
-    /// until the specified max_bytes limit is reached.
-    pub(crate) async fn load_files_to_cache(
+    /// Returns a builder for a `CachedObjectStore` that caches parts of the
+    /// objects in `object_store` under `root_folder` on the local filesystem.
+    pub fn builder(
+        root_folder: impl Into<std::path::PathBuf>,
+        object_store: Arc<dyn ObjectStore>,
+    ) -> CachedObjectStoreBuilder {
+        CachedObjectStoreBuilder {
+            object_store,
+            options: ObjectStoreCacheOptions {
+                root_folder: Some(root_folder.into()),
+                ..ObjectStoreCacheOptions::default()
+            },
+            cache_put_config: CachePutConfig::default(),
+            metrics_recorder: Arc::new(NoopMetricsRecorder::new()),
+            metric_level: MetricLevel::default(),
+        }
+    }
+
+    /// Loads files into the cache up to a maximum number of bytes.
+    ///
+    /// Fetches each object's raw bytes from the wrapped store and saves them
+    /// as cache parts on disk. Can be used to warm up the cache.
+    ///
+    /// The `max_bytes` budget is applied in path order: loading stops at the
+    /// first file that does not fit, so order paths by priority.
+    ///
+    /// Fetches are best-effort and failures are logged and skipped.
+    pub async fn load_files_to_cache(
         &self,
         file_paths: Vec<Path>,
         max_bytes: usize,
-    ) -> Result<(), SlateDBError> {
+    ) -> Result<(), crate::Error> {
         if file_paths.is_empty() || max_bytes == 0 {
             return Ok(());
         }
@@ -525,7 +596,7 @@ impl CachedObjectStore {
             // Cache miss, so we need to fetch from the object store.
             // Read Part — deduplicate concurrent fetches of the same part.
             // The SingleFlight fetches the full part and saves it to cache; each
-            // caller then slices out their own range_in_part.
+            // caller then copies out their own range_in_part.
             let bytes = this
                 .part_flights
                 .call((location.clone(), part_id), || async {
@@ -538,17 +609,50 @@ impl CachedObjectStore {
                         .get_opts(
                             &location,
                             GetOptions {
-                                range: Some(GetRange::Bounded(part_range)),
+                                range: Some(GetRange::Bounded(part_range.clone())),
                                 ..Default::default()
                             },
                         )
                         .await?;
 
-                    // Save the head and the part to cache for future accesses.
-                    let entry = this.cache_storage.entry(&location, this.part_size_bytes);
                     let meta = get_result.meta.clone();
                     let attrs = get_result.attributes.clone();
                     let bytes = get_result.bytes().await?;
+
+                    // A truncated but successful ranged body is possible and
+                    // should be caught here because the rest of the code
+                    // assumes the size is correct.
+                    //
+                    // We return a retryable error before anything is saved or
+                    // sliced and the retry layer above will retry.
+                    //
+                    // We also have to take the min of the part range end and
+                    // the object size because the part range may extend beyond
+                    // the object size.
+                    let expected_len = usize::try_from(
+                        meta.size
+                            .min(part_range.end)
+                            .saturating_sub(part_range.start),
+                    )
+                    .expect("part length exceeds usize");
+                    if bytes.len() != expected_len {
+                        return Err(object_store::Error::Generic {
+                            store: "cached_object_store",
+                            source: format!(
+                                "part fetch size check failed: {} bytes read, but expected \
+                                 {expected_len} bytes (part range {}..{} truncated at object \
+                                 size {})",
+                                bytes.len(),
+                                part_range.start,
+                                part_range.end,
+                                meta.size
+                            )
+                            .into(),
+                        });
+                    }
+
+                    // Save the head and the part to cache for future accesses.
+                    let entry = this.cache_storage.entry(&location, this.part_size_bytes);
                     entry.save_head((&meta, &attrs)).await.ok();
                     entry.save_part(part_id, bytes.clone()).await.ok();
 
@@ -556,7 +660,10 @@ impl CachedObjectStore {
                 })
                 .await?;
 
-            Ok((bytes.slice(range_in_part), ReadResultSource::Upstream))
+            Ok((
+                Bytes::copy_from_slice(&bytes[range_in_part]),
+                ReadResultSource::Upstream,
+            ))
         })
     }
 
@@ -637,6 +744,102 @@ impl CachedObjectStore {
             start: start_aligned,
             end: end_aligned,
         }
+    }
+}
+
+/// Builder for [`CachedObjectStore`]. Created by [`CachedObjectStore::builder`].
+pub struct CachedObjectStoreBuilder {
+    object_store: Arc<dyn ObjectStore>,
+    options: ObjectStoreCacheOptions,
+    cache_put_config: CachePutConfig,
+    metrics_recorder: Arc<dyn MetricsRecorder>,
+    metric_level: MetricLevel,
+}
+
+impl CachedObjectStoreBuilder {
+    /// Sets the limit of the cache size in bytes.
+    ///
+    /// `None` disables eviction and the default is 16gb.
+    pub fn with_max_cache_size_bytes(mut self, max_cache_size_bytes: Option<usize>) -> Self {
+        self.options.max_cache_size_bytes = max_cache_size_bytes;
+        self
+    }
+
+    /// Sets the size of each part file. Must be a multiple of 1kb.
+    ///
+    /// The default is 4mb.
+    pub fn with_part_size_bytes(mut self, part_size_bytes: usize) -> Self {
+        self.options.part_size_bytes = part_size_bytes;
+        self
+    }
+
+    /// Sets whether compacted SSTs produced by memtable flushes are admitted
+    /// to the cache on write.
+    ///
+    /// The default is false.
+    pub fn with_cache_on_flush(mut self, cache_on_flush: bool) -> Self {
+        self.cache_put_config.cache_on_flush = cache_on_flush;
+        self
+    }
+
+    /// Sets whether compacted SSTs produced by compaction are admitted to the
+    /// cache on write.
+    ///
+    /// The default is false.
+    pub fn with_cache_on_compaction(mut self, cache_on_compaction: bool) -> Self {
+        self.cache_put_config.cache_on_compaction = cache_on_compaction;
+        self
+    }
+
+    /// Sets the interval at which the cache directory is scanned to rebuild
+    /// the evictor's in-memory map.
+    ///
+    ///  `None` scans only once on startup and the default is 1 hour.
+    pub fn with_scan_interval(mut self, scan_interval: Option<std::time::Duration>) -> Self {
+        self.options.scan_interval = scan_interval;
+        self
+    }
+
+    /// Sets the maximum number of open file handles kept by the part file
+    /// handle cache.
+    ///
+    /// The default is 1000.
+    pub fn with_max_open_file_handles(mut self, max_open_file_handles: usize) -> Self {
+        self.options.max_open_file_handles = max_open_file_handles;
+        self
+    }
+
+    /// Sets the recorder for the cache's metrics (hit and access counters,
+    /// cache size gauges, eviction counters).
+    ///
+    ///  Defaults to a no-op recorder.
+    pub fn with_metrics_recorder(mut self, metrics_recorder: Arc<dyn MetricsRecorder>) -> Self {
+        self.metrics_recorder = metrics_recorder;
+        self
+    }
+
+    /// Sets the metric level for the cache's metrics.
+    ///
+    /// Defaults to [`MetricLevel::default`].
+    pub fn with_metric_level(mut self, metric_level: MetricLevel) -> Self {
+        self.metric_level = metric_level;
+        self
+    }
+
+    /// Builds the `CachedObjectStore` and starts its evictor.
+    pub async fn build(self) -> Result<Arc<CachedObjectStore>, crate::Error> {
+        let recorder = MetricsRecorderHelper::new(self.metrics_recorder, self.metric_level);
+        let cached = CachedObjectStore::from_config_with_cache_put_config(
+            self.object_store,
+            &self.options,
+            self.cache_put_config,
+            &recorder,
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+        )
+        .await
+        .map_err(crate::Error::from)?;
+        Ok(cached.expect("builder always sets root_folder"))
     }
 }
 
@@ -1000,13 +1203,18 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use super::CachedObjectStore;
+    use super::{CachedObjectStore, ReadResultSource};
+    use crate::cached_object_store::policy::CachePutConfig;
     use crate::cached_object_store::stats::CachedObjectStoreStats;
     use crate::cached_object_store::storage::{LocalCacheStorage, PartID};
     use crate::cached_object_store::storage_fs::FsCacheEntry;
     use crate::cached_object_store::storage_fs::FsCacheStorage;
+    use crate::config::ObjectStoreCacheOptions;
     use crate::db_state::SstType;
+    use crate::instrumented_object_store::{InstrumentedObjectStore, ObjectStoreComponent};
     use crate::object_store_tag::{ObjectStoreCallTag, TableStoreKind};
+    use crate::object_stores::ObjectStoreType;
+    use crate::retrying_object_store::RetryingObjectStore;
     use crate::test_utils::{
         gen_rand_bytes, ExtensionMarker, ExtensionObjectStore, FlakyObjectStore, GatedObjectStore,
     };
@@ -1025,6 +1233,13 @@ mod tests {
     }
 
     fn new_cached_store(object_store: Arc<dyn ObjectStore>) -> Arc<CachedObjectStore> {
+        new_cached_store_with_part_size(object_store, 1024)
+    }
+
+    fn new_cached_store_with_part_size(
+        object_store: Arc<dyn ObjectStore>,
+        part_size_bytes: usize,
+    ) -> Arc<CachedObjectStore> {
         let test_cache_folder = new_test_cache_folder();
         let recorder = MetricsRecorderHelper::noop();
         let stats = Arc::new(CachedObjectStoreStats::new(&recorder));
@@ -1037,7 +1252,39 @@ mod tests {
             Arc::new(DbRand::default()),
             1000,
         ));
-        CachedObjectStore::new(object_store, cache_storage, 1024, false, stats).unwrap()
+        CachedObjectStore::new(
+            object_store,
+            cache_storage,
+            part_size_bytes,
+            CachePutConfig::default(),
+            stats,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_upstream_part_range_does_not_retain_full_part() {
+        let part_size = 4 * 1024 * 1024;
+        let part = Bytes::from(vec![7_u8; part_size]);
+        let range = 1024..5120;
+        let source_range_ptr = part[range.clone()].as_ptr();
+        let location = Path::from("test");
+        let object_store = Arc::new(object_store::memory::InMemory::new());
+        object_store
+            .put(&location, PutPayload::from_bytes(part))
+            .await
+            .unwrap();
+        let cached_store = new_cached_store_with_part_size(object_store, part_size);
+
+        let (copied, source) = cached_store
+            .read_part(&location, 0, range, false)
+            .await
+            .unwrap();
+
+        assert!(matches!(source, ReadResultSource::Upstream));
+        assert_eq!(copied.len(), 4096);
+        assert!(copied.iter().all(|byte| *byte == 7));
+        assert_ne!(copied.as_ptr(), source_range_ptr);
     }
 
     #[tokio::test]
@@ -1067,9 +1314,14 @@ mod tests {
         ));
 
         let part_size = 1024;
-        let cached_store =
-            CachedObjectStore::new(object_store.clone(), cache_storage, part_size, false, stats)
-                .unwrap();
+        let cached_store = CachedObjectStore::new(
+            object_store.clone(),
+            cache_storage,
+            part_size,
+            CachePutConfig::default(),
+            stats,
+        )
+        .unwrap();
         let entry = cached_store.cache_storage.entry(&location, 1024);
 
         let object_size_hint = cached_store.save_get_result(&location, get_result).await?;
@@ -1145,8 +1397,14 @@ mod tests {
             1000,
         ));
 
-        let cached_store =
-            CachedObjectStore::new(object_store, cache_storage, part_size, false, stats).unwrap();
+        let cached_store = CachedObjectStore::new(
+            object_store,
+            cache_storage,
+            part_size,
+            CachePutConfig::default(),
+            stats,
+        )
+        .unwrap();
         let entry = cached_store.cache_storage.entry(&location, part_size);
         let object_size_hint = cached_store.save_get_result(&location, get_result).await?;
         assert_eq!(object_size_hint, 1024 * 3);
@@ -1246,8 +1504,14 @@ mod tests {
             1000,
         ));
 
-        let cached_store =
-            CachedObjectStore::new(object_store, cache_storage, 1024, false, stats).unwrap();
+        let cached_store = CachedObjectStore::new(
+            object_store,
+            cache_storage,
+            1024,
+            CachePutConfig::default(),
+            stats,
+        )
+        .unwrap();
 
         struct Test {
             input: (Option<GetRange>, usize),
@@ -1336,8 +1600,14 @@ mod tests {
             Arc::new(DbRand::default()),
             1000,
         ));
-        let cached_store =
-            CachedObjectStore::new(object_store, cache_storage, 1024, false, stats).unwrap();
+        let cached_store = CachedObjectStore::new(
+            object_store,
+            cache_storage,
+            1024,
+            CachePutConfig::default(),
+            stats,
+        )
+        .unwrap();
 
         let aligned = cached_store.align_range(&(9..1025), 1024);
         assert_eq!(aligned, 0..2048);
@@ -1360,8 +1630,14 @@ mod tests {
             Arc::new(DbRand::default()),
             1000,
         ));
-        let cached_store =
-            CachedObjectStore::new(object_store, cache_storage, 1024, false, stats).unwrap();
+        let cached_store = CachedObjectStore::new(
+            object_store,
+            cache_storage,
+            1024,
+            CachePutConfig::default(),
+            stats,
+        )
+        .unwrap();
 
         let aligned = cached_store.align_get_range(&GetRange::Bounded(9..1025));
         assert_eq!(aligned, GetRange::Bounded(0..2048));
@@ -1392,9 +1668,14 @@ mod tests {
             Arc::new(DbRand::default()),
             1000,
         ));
-        let cached_store =
-            CachedObjectStore::new(object_store.clone(), cache_storage, 1024, false, stats)
-                .unwrap();
+        let cached_store = CachedObjectStore::new(
+            object_store.clone(),
+            cache_storage,
+            1024,
+            CachePutConfig::default(),
+            stats,
+        )
+        .unwrap();
 
         let test_path = Path::from("/data/testdata1");
         let test_payload = gen_rand_bytes(1024 * 3 + 2);
@@ -1478,9 +1759,14 @@ mod tests {
 
         let object_store = Arc::new(object_store::memory::InMemory::new());
 
-        let cached_store =
-            CachedObjectStore::new(object_store.clone(), cache_storage, 1024, false, stats)
-                .unwrap();
+        let cached_store = CachedObjectStore::new(
+            object_store.clone(),
+            cache_storage,
+            1024,
+            CachePutConfig::default(),
+            stats,
+        )
+        .unwrap();
 
         // Create some test files to preload
         let test_paths = vec![
@@ -1530,9 +1816,14 @@ mod tests {
 
         let object_store = Arc::new(object_store::memory::InMemory::new());
 
-        let cached_store =
-            CachedObjectStore::new(object_store.clone(), cache_storage, 1024, false, stats)
-                .unwrap();
+        let cached_store = CachedObjectStore::new(
+            object_store.clone(),
+            cache_storage,
+            1024,
+            CachePutConfig::default(),
+            stats,
+        )
+        .unwrap();
 
         // Create some test files
         let test_paths = vec![Path::from("file1.sst"), Path::from("file2.sst")];
@@ -1598,7 +1889,7 @@ mod tests {
             instrumented as Arc<dyn ObjectStore>,
             cache_storage,
             1024,
-            false,
+            CachePutConfig::default(),
             stats,
         )
         .unwrap();
@@ -1954,6 +2245,92 @@ mod tests {
         assert_eq!(&bytes[..], &payload[..512]);
     }
 
+    #[tokio::test]
+    async fn test_part_fetch_validates_truncated_body_and_retries() {
+        let part_size = 1024usize;
+        let payload = gen_rand_bytes(part_size * 3);
+        let location = Path::from("/data/testfile1");
+        let inner: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        inner
+            .put(&location, PutPayload::from_bytes(payload.clone()))
+            .await
+            .unwrap();
+
+        let test_cache_folder = new_test_cache_folder();
+        let recorder = MetricsRecorderHelper::noop();
+        let stats = Arc::new(CachedObjectStoreStats::new(&recorder));
+        let cache_storage = Arc::new(FsCacheStorage::new(
+            test_cache_folder.clone(),
+            None,
+            None,
+            stats.clone(),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+            1000,
+        ));
+        let opts = || GetOptions {
+            range: Some(GetRange::Bounded(0..(part_size as u64 * 3))),
+            extensions: ObjectStoreCallTag::new(TableStoreKind::Main, SstType::Compacted).into(),
+            ..Default::default()
+        };
+
+        // Prefill the cache through a clean handle, then delete one part file
+        // so the read below must fill it from the backend lazily.
+        let prefill = CachedObjectStore::new(
+            inner.clone(),
+            cache_storage.clone(),
+            part_size,
+            CachePutConfig::default(),
+            stats.clone(),
+        )
+        .unwrap();
+        prefill
+            .get_opts(&location, opts())
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let part_path =
+            FsCacheEntry::make_part_path(test_cache_folder.clone(), &location, 1, part_size);
+        std::fs::remove_file(&part_path).unwrap();
+
+        // The backend truncates the next ranged body to 1 byte but reports
+        // success, mimicking a response cut mid-body without a stream error.
+        let flaky = Arc::new(FlakyObjectStore::new(inner, 0).with_truncate_get_range_bytes(1, 1));
+        let cached = CachedObjectStore::new(
+            flaky.clone(),
+            cache_storage,
+            part_size,
+            CachePutConfig::default(),
+            stats,
+        )
+        .unwrap();
+        let instrumented = Arc::new(InstrumentedObjectStore::new(
+            cached,
+            &recorder,
+            ObjectStoreComponent::Db,
+            ObjectStoreType::Main,
+        ));
+        let retrying = RetryingObjectStore::new(
+            instrumented,
+            Arc::new(DbRand::default()),
+            Arc::new(DefaultSystemClock::new()),
+            None,
+        );
+
+        let got = retrying
+            .get_opts(&location, opts())
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(got, payload);
+        // The truncated fill plus the successful fill on the reissued read.
+        assert_eq!(flaky.get_range_attempts(), 2);
+    }
+
     #[rstest::rstest]
     #[case::no_evictor_cached(false, true)]
     #[case::with_evictor_cached(true, true)]
@@ -1995,7 +2372,7 @@ mod tests {
             object_store,
             Arc::clone(&cache_storage) as Arc<dyn LocalCacheStorage>,
             PART_SIZE,
-            false,
+            CachePutConfig::default(),
             stats,
         )
         .unwrap();
@@ -2064,7 +2441,7 @@ mod tests {
 
     fn policy_test_store(
         upstream: Arc<dyn ObjectStore>,
-        cache_puts: bool,
+        policy: CachePutConfig,
     ) -> Arc<CachedObjectStore> {
         let recorder = MetricsRecorderHelper::noop();
         let stats = Arc::new(CachedObjectStoreStats::new(&recorder));
@@ -2077,7 +2454,7 @@ mod tests {
             Arc::new(DbRand::default()),
             1000,
         ));
-        CachedObjectStore::new(upstream, cache_storage, 1024, cache_puts, stats).unwrap()
+        CachedObjectStore::new(upstream, cache_storage, 1024, policy, stats).unwrap()
     }
 
     fn put_opts_tagged(tag: ObjectStoreCallTag) -> object_store::PutOptions {
@@ -2106,38 +2483,43 @@ mod tests {
     }
 
     #[rstest]
-    // WAL writes are never cached, even with cache_puts on.
-    #[case(ObjectStoreCallTag::new(TableStoreKind::Main, SstType::Wal), true, 0)]
-    // Compacted writes from the main store (flush) and the compactor are cached
-    // when cache_puts is set, and not otherwise.
+    // WAL writes are never cached, even with both flags enabled.
     #[case(
-        ObjectStoreCallTag::new(TableStoreKind::Main, SstType::Compacted),
-        true,
-        2
-    )]
-    #[case(
-        ObjectStoreCallTag::new(TableStoreKind::Main, SstType::Compacted),
-        false,
+        ObjectStoreCallTag::new(TableStoreKind::Main, SstType::Wal),
+        CachePutConfig { cache_on_flush: true, cache_on_compaction: true },
         0
     )]
+    // Flush writes (main store, compacted) cached only when cache_on_flush is set.
+    #[case(
+        ObjectStoreCallTag::new(TableStoreKind::Main, SstType::Compacted),
+        CachePutConfig { cache_on_flush: true, cache_on_compaction: false },
+        2
+    )]
+    #[case(
+        ObjectStoreCallTag::new(TableStoreKind::Main, SstType::Compacted),
+        CachePutConfig { cache_on_flush: false, cache_on_compaction: true },
+        0
+    )]
+    // Compaction writes (compactor store, compacted) cached only when
+    // cache_on_compaction is set.
     #[case(
         ObjectStoreCallTag::new(TableStoreKind::Compactor, SstType::Compacted),
-        true,
+        CachePutConfig { cache_on_flush: false, cache_on_compaction: true },
         2
     )]
     #[case(
         ObjectStoreCallTag::new(TableStoreKind::Compactor, SstType::Compacted),
-        false,
+        CachePutConfig { cache_on_flush: true, cache_on_compaction: false },
         0
     )]
     #[tokio::test]
     async fn test_put_caching_by_tag(
         #[case] tag: ObjectStoreCallTag,
-        #[case] cache_puts: bool,
+        #[case] policy: CachePutConfig,
         #[case] expected_parts: usize,
     ) {
         let upstream: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        let store = policy_test_store(upstream.clone(), cache_puts);
+        let store = policy_test_store(upstream.clone(), policy);
 
         let location = Path::from("compacted/01.sst");
         let payload = gen_rand_bytes(2048); // 2 parts of 1024 bytes
@@ -2154,9 +2536,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cache_puts_config_admits_flush_and_compaction_writes() {
+        let upstream: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let options = ObjectStoreCacheOptions {
+            root_folder: Some(new_test_cache_folder()),
+            part_size_bytes: 1024,
+            cache_puts: true,
+            ..ObjectStoreCacheOptions::default()
+        };
+        let store = CachedObjectStore::from_config(
+            upstream,
+            &options,
+            &MetricsRecorderHelper::noop(),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        for (location, tag) in [
+            (
+                Path::from("compacted/flush.sst"),
+                ObjectStoreCallTag::new(TableStoreKind::Main, SstType::Compacted),
+            ),
+            (
+                Path::from("compacted/compaction.sst"),
+                ObjectStoreCallTag::new(TableStoreKind::Compactor, SstType::Compacted),
+            ),
+        ] {
+            store
+                .put_opts(
+                    &location,
+                    PutPayload::from_bytes(gen_rand_bytes(2048)),
+                    put_opts_tagged(tag),
+                )
+                .await
+                .unwrap();
+            assert_eq!(cached_part_count(&store, &location).await, 2);
+        }
+    }
+
+    #[tokio::test]
     async fn test_untagged_put_is_not_cached() {
         let upstream: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        let store = policy_test_store(upstream.clone(), true);
+        let store = policy_test_store(
+            upstream.clone(),
+            CachePutConfig {
+                cache_on_flush: true,
+                cache_on_compaction: true,
+            },
+        );
 
         // No tag in the options: coordination I/O (manifest, etc.) is never cached.
         let location = Path::from("manifest/01.manifest");
@@ -2176,7 +2606,7 @@ mod tests {
     #[tokio::test]
     async fn test_compactor_get_bypasses_cache() {
         let upstream: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        let store = policy_test_store(upstream.clone(), false);
+        let store = policy_test_store(upstream.clone(), CachePutConfig::default());
 
         let location = Path::from("compacted/01.sst");
         let payload = gen_rand_bytes(2048);
@@ -2236,8 +2666,14 @@ mod tests {
             Arc::new(DbRand::default()),
             1000,
         ));
-        let store =
-            CachedObjectStore::new(upstream.clone(), cache_storage, 1024, false, stats).unwrap();
+        let store = CachedObjectStore::new(
+            upstream.clone(),
+            cache_storage,
+            1024,
+            CachePutConfig::default(),
+            stats,
+        )
+        .unwrap();
         store.start_evictor().await;
 
         let location = Path::from("compacted/01.sst");
@@ -2313,7 +2749,7 @@ mod tests {
     #[tokio::test]
     async fn test_compactor_head_reads_without_admitting() {
         let upstream: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        let store = policy_test_store(upstream.clone(), false);
+        let store = policy_test_store(upstream.clone(), CachePutConfig::default());
 
         let location = Path::from("compacted/01.sst");
         let payload = gen_rand_bytes(512);
@@ -2367,7 +2803,7 @@ mod tests {
     #[tokio::test]
     async fn test_wal_read_bypasses_cache() {
         let upstream: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        let store = policy_test_store(upstream.clone(), false);
+        let store = policy_test_store(upstream.clone(), CachePutConfig::default());
 
         let location = Path::from("wal/00000000000000000001.sst");
         let payload = gen_rand_bytes(2048);
@@ -2408,7 +2844,13 @@ mod tests {
     #[tokio::test]
     async fn test_put_writes_head_and_serves_first_read_from_cache() {
         let upstream: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        let store = policy_test_store(upstream.clone(), true);
+        let store = policy_test_store(
+            upstream.clone(),
+            CachePutConfig {
+                cache_on_flush: true,
+                cache_on_compaction: false,
+            },
+        );
 
         // A flush write (main store, compacted) is cached and commits a head.
         let location = Path::from("compacted/01.sst");
@@ -2474,7 +2916,13 @@ mod tests {
         #[case] expected_part_sizes: Vec<usize>,
     ) {
         let upstream: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        let store = policy_test_store(upstream.clone(), true);
+        let store = policy_test_store(
+            upstream.clone(),
+            CachePutConfig {
+                cache_on_flush: false,
+                cache_on_compaction: true,
+            },
+        );
 
         // A compaction output written as a multipart upload (the path large
         // compacted SSTs take). The tag survives multipart init, so no fallback
@@ -2518,20 +2966,24 @@ mod tests {
     }
 
     #[rstest]
-    // A compacted multipart upload is not cached when cache_puts is off.
+    // A compacted multipart upload is not cached when its source is disabled,
+    // even if the other source is enabled.
     #[case(
         ObjectStoreCallTag::new(TableStoreKind::Compactor, SstType::Compacted),
-        false
+        CachePutConfig { cache_on_flush: true, cache_on_compaction: false }
     )]
-    // A WAL multipart upload is never cached, even with cache_puts on.
-    #[case(ObjectStoreCallTag::new(TableStoreKind::Main, SstType::Wal), true)]
+    // A WAL multipart upload is never cached, even with both flags on.
+    #[case(
+        ObjectStoreCallTag::new(TableStoreKind::Main, SstType::Wal),
+        CachePutConfig { cache_on_flush: true, cache_on_compaction: true }
+    )]
     #[tokio::test]
     async fn test_multipart_upload_not_cached(
         #[case] tag: ObjectStoreCallTag,
-        #[case] cache_puts: bool,
+        #[case] policy: CachePutConfig,
     ) {
         let upstream: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        let store = policy_test_store(upstream.clone(), cache_puts);
+        let store = policy_test_store(upstream.clone(), policy);
 
         let location = Path::from("compacted/big.sst");
         let mut upload = store
@@ -2547,7 +2999,13 @@ mod tests {
     #[tokio::test]
     async fn test_multipart_head_is_the_commit_point() {
         let upstream: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        let store = policy_test_store(upstream.clone(), true);
+        let store = policy_test_store(
+            upstream.clone(),
+            CachePutConfig {
+                cache_on_flush: false,
+                cache_on_compaction: true,
+            },
+        );
 
         let location = Path::from("compacted/big.sst");
         let cache_location = location.clone();
