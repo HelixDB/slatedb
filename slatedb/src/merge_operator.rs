@@ -283,6 +283,10 @@ pub(crate) struct MergeOperatorIterator<T: RowEntryIterator> {
     /// A barrier sequence number that supports snapshot reads using this iterator. If not None,
     /// the iterator will not merge entries with sequence number greater than this value.
     snapshot_barrier_seq: Option<u64>,
+    /// Whether exhausting all visible entries proves that the key has no base value.
+    /// Full database reads set this because they merge every storage layer. Flush and
+    /// compaction iterators leave it unset because older levels may still contain a base.
+    resolve_missing_base: bool,
 }
 
 /// Tracks metadata across multiple entries during merge operations.
@@ -351,7 +355,13 @@ impl<T: RowEntryIterator> MergeOperatorIterator<T> {
             buffered_entry: None,
             merge_different_expire_ts,
             snapshot_barrier_seq,
+            resolve_missing_base: false,
         }
+    }
+
+    pub(crate) fn with_resolved_missing_base(mut self) -> Self {
+        self.resolve_missing_base = true;
+        self
     }
 }
 
@@ -449,6 +459,7 @@ impl<T: RowEntryIterator> MergeOperatorIterator<T> {
 
         let base_value = base.as_ref().and_then(|b| b.value.as_bytes());
         let found_base = base.is_some();
+        let base_is_resolved = found_base || self.resolve_missing_base;
 
         // Fold the base entry's metadata into the tracker so that its
         // create_ts and expire_ts are reflected in the merged result.
@@ -462,7 +473,7 @@ impl<T: RowEntryIterator> MergeOperatorIterator<T> {
         }
 
         results.reverse();
-        let final_result = if found_base {
+        let final_result = if base_is_resolved {
             self.merge_operator
                 .merge_batch_with_base(&key, base_value, &results)?
         } else {
@@ -475,7 +486,7 @@ impl<T: RowEntryIterator> MergeOperatorIterator<T> {
         Ok(Some(RowEntry {
             key: key.clone(),
             value: match final_result {
-                MergeResult::Value(value) if found_base => ValueDeletable::Value(value),
+                MergeResult::Value(value) if base_is_resolved => ValueDeletable::Value(value),
                 MergeResult::Value(value) => ValueDeletable::Merge(value),
                 MergeResult::Tombstone => ValueDeletable::Tombstone,
             },
@@ -806,6 +817,19 @@ mod tests {
             vec![RowEntry::new_merge(b"key", b"remove", 2)],
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn authoritative_missing_base_can_emit_a_tombstone() {
+        let mut iterator = MergeOperatorIterator::<MockRowEntryIterator>::new(
+            Arc::new(TombstoneOnRemoveOperator),
+            vec![RowEntry::new_merge(b"key", b"remove", 2)].into(),
+            true,
+            None,
+        )
+        .with_resolved_missing_base();
+
+        assert_iterator(&mut iterator, vec![RowEntry::new_tombstone(b"key", 2)]).await;
     }
 
     #[tokio::test]
