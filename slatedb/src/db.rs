@@ -504,6 +504,12 @@ impl DbInner {
     }
 
     async fn replay_wal(&self, wal_id_range: Range<u64>) -> Result<(), SlateDBError> {
+        let replay_started = self.system_clock.now();
+        let replay_range_start = wal_id_range.start;
+        let replay_range_end = wal_id_range.end;
+        let replay_wal_count = replay_range_end.saturating_sub(replay_range_start);
+        let mut replayed_entries = 0_u64;
+        let mut replayed_bytes = 0_u64;
         let mut current_memtable_wal_id = self
             .state
             .read()
@@ -584,6 +590,11 @@ impl DbInner {
                     .table
                     .record_touched_segments(touched_segments);
             }
+            let metadata = replayed_table.table.metadata();
+            replayed_entries = replayed_entries
+                .saturating_add(u64::try_from(metadata.entry_num).unwrap_or(u64::MAX));
+            replayed_bytes = replayed_bytes
+                .saturating_add(u64::try_from(metadata.entries_size_in_bytes).unwrap_or(u64::MAX));
             // Replayed rows come from WAL SSTs in remote storage, so they are already
             // durable. Update `last_remote_persisted_seq` before replaying to avoid a race with
             // the memtable flusher. The flusher calls flush_wals() to guarantee all data in the
@@ -604,6 +615,20 @@ impl DbInner {
         let guard = self.state.read();
         self.status_manager
             .report_memtable_segments(collect_touched_segments(&guard.view()));
+        info!(
+            "SlateDB WAL replay completed [writer_epoch={}, replay_start_wal_id={}, replay_end_wal_id={}, replay_wal_count={}, last_replayed_wal_id={}, replayed_entries={}, replayed_bytes={}, elapsed_ms={}]",
+            writer_epoch,
+            replay_range_start,
+            replay_range_end,
+            replay_wal_count,
+            current_memtable_wal_id,
+            replayed_entries,
+            replayed_bytes,
+            self.system_clock
+                .now()
+                .signed_duration_since(replay_started)
+                .num_milliseconds()
+        );
 
         Ok(())
     }
