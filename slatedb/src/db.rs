@@ -57,7 +57,6 @@ use crate::db_snapshot::DbSnapshot;
 use crate::db_state::{collect_touched_segments, DbState, SsTableId};
 use crate::db_stats::DbStats;
 use crate::error::SlateDBError;
-use crate::iter::IterationOrder;
 use crate::manifest::{Manifest, VersionedManifest};
 use crate::mem_table::KVTableMetadata;
 use crate::memtable_flusher::{FlushResult, FlushTarget, MemtableFlusher};
@@ -67,7 +66,6 @@ use crate::paths::PathResolver;
 use crate::prefix_extractor::PrefixExtractor;
 use crate::reader::{Reader, ScanContext};
 use crate::snapshot_manager::SnapshotManager;
-use crate::sst_iter::SstIteratorOptions;
 use crate::tablestore::TableStore;
 use crate::transaction_manager::TransactionManager;
 use crate::types::KeyValue;
@@ -526,21 +524,9 @@ impl DbInner {
             |_| -> Result<(), SlateDBError> { Ok(()) }
         );
 
-        let sst_iter_options = SstIteratorOptions {
-            max_fetch_tasks: 1,
-            blocks_to_fetch: 256,
-            cache_blocks: false,
-            cache_metadata: false,
-            eager_spawn: true,
-            order: IterationOrder::Ascending,
-            prefix: None,
-            filter_context: None,
-        };
-
         let replay_options = WalReplayOptions {
-            sst_batch_size: 4,
+            prefetch: self.settings.wal_replay,
             max_memtable_bytes: self.settings.l0_sst_size_bytes,
-            sst_iter_options,
             min_seq: None,
         };
 
@@ -2279,7 +2265,7 @@ mod tests {
         REQUEST_COUNT as OBJECT_STORE_REQUEST_COUNT,
         REQUEST_DURATION_SECONDS as OBJECT_STORE_REQUEST_DURATION_SECONDS,
     };
-    use crate::iter::RowEntryIterator;
+    use crate::iter::{IterationOrder, RowEntryIterator};
     use crate::manifest::store::{ManifestStore, StoredManifest};
     use crate::manifest::{ManifestCore, VersionedManifest};
     use crate::merge_operator::{
@@ -6727,12 +6713,12 @@ mod tests {
         )
         .await;
 
-        let head_arrivals_before = gated_store.head_gate.arrivals();
-        gated_store.head_gate.close();
+        let get_arrivals_before = gated_store.get_opts_gate.arrivals();
+        gated_store.get_opts_gate.close();
         fail_parallel::cfg(fp_registry.clone(), "replay-wal-pause", "off").unwrap();
         gated_store
-            .head_gate
-            .wait_for_arrivals(head_arrivals_before + 1)
+            .get_opts_gate
+            .wait_for_arrivals(get_arrivals_before + 1)
             .await;
 
         let db2 = Db::builder(path, base_store.clone())
@@ -6750,7 +6736,7 @@ mod tests {
             .delete_sst(&SsTableId::Wal(1))
             .await
             .unwrap();
-        gated_store.head_gate.release();
+        gated_store.get_opts_gate.release();
 
         let err = match w1_handle.await.unwrap() {
             Ok(_) => panic!("expected W1 open to fail"),
@@ -6806,19 +6792,19 @@ mod tests {
         )
         .await;
 
-        let head_arrivals_before = gated_store.head_gate.arrivals();
-        gated_store.head_gate.close();
+        let get_arrivals_before = gated_store.get_opts_gate.arrivals();
+        gated_store.get_opts_gate.close();
         fail_parallel::cfg(fp_registry.clone(), "replay-wal-pause", "off").unwrap();
         gated_store
-            .head_gate
-            .wait_for_arrivals(head_arrivals_before + 1)
+            .get_opts_gate
+            .wait_for_arrivals(get_arrivals_before + 1)
             .await;
 
         probe_table_store
             .delete_sst(&SsTableId::Wal(1))
             .await
             .unwrap();
-        gated_store.head_gate.release();
+        gated_store.get_opts_gate.release();
 
         let err = match w1_handle.await.unwrap() {
             Ok(_) => panic!("expected W1 open to fail"),
@@ -7352,6 +7338,7 @@ mod tests {
             min_filter_keys,
             l0_sst_size_bytes,
             max_wal_flushes_before_l0_flush: 4096,
+            wal_replay: crate::config::WalReplaySettings::default(),
             compactor_options,
             compression_codec: None,
             object_store_cache_options: ObjectStoreCacheOptions::default(),
