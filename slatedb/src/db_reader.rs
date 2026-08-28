@@ -11,7 +11,6 @@ use crate::db_stats::DbStats;
 use crate::db_status::{ClosedResultWriter, DbStatus, DbStatusManager};
 use crate::dispatcher::{MessageHandler, MessageHandlerExecutor, MessageTickerDef};
 use crate::error::SlateDBError;
-use crate::iter::IterationOrder;
 use crate::manifest::store::{ManifestStore, StoredManifest};
 use crate::manifest::{Manifest, ManifestCore, VersionedManifest};
 use crate::mem_table::{ImmutableMemtable, KVTable, WritableKVTable};
@@ -20,7 +19,6 @@ use crate::oracle::DbReaderOracle;
 use crate::paths::PathResolver;
 use crate::prefix_extractor::PrefixExtractor;
 use crate::reader::{DbStateReader, Reader, ScanContext};
-use crate::sst_iter::SstIteratorOptions;
 use crate::tablestore::TableStore;
 use crate::types::KeyValue;
 use crate::utils::IdGenerator;
@@ -891,17 +889,6 @@ impl DbReaderInner {
         mut publish: Option<ReplayPublisher<'_>>,
         db_stats: Option<&DbStats>,
     ) -> Result<(u64, u64), SlateDBError> {
-        let sst_iter_options = SstIteratorOptions {
-            max_fetch_tasks: 1,
-            blocks_to_fetch: 256,
-            cache_blocks: true,
-            cache_metadata: false,
-            eager_spawn: true,
-            order: IterationOrder::Ascending,
-            prefix: None,
-            filter_context: None,
-        };
-
         let (mut replay_after_wal_id, mut last_committed_seq) =
             replay_cursor.unwrap_or_else(|| {
                 if let Some(latest_replayed_table) = into_tables.front() {
@@ -920,9 +907,8 @@ impl DbReaderInner {
         };
 
         let replay_options = WalReplayOptions {
-            sst_batch_size: 4,
+            prefetch: reader_options.wal_replay,
             max_memtable_bytes: reader_options.max_memtable_bytes as usize,
-            sst_iter_options,
             // Skip entries that we already have in `imm_memtable` (that might be above last_l0_seq).
             min_seq: Some(last_committed_seq),
         };
@@ -1262,6 +1248,7 @@ impl MessageHandler<DbReaderMessage> for ManifestPoller {
 
 impl DbReader {
     fn validate_options(mode: DbReaderMode, options: &DbReaderOptions) -> Result<(), SlateDBError> {
+        options.wal_replay.validate()?;
         if mode != DbReaderMode::ManagedCheckpoint {
             return Ok(());
         }
@@ -3603,6 +3590,24 @@ mod tests {
         });
 
         assert!(!super::has_not_found_object_store_error(&err));
+    }
+
+    #[test]
+    fn reader_validation_rejects_invalid_wal_replay_settings_in_every_mode() {
+        for mode in [
+            DbReaderMode::Checkpoint(Uuid::nil()),
+            DbReaderMode::ManagedCheckpoint,
+            DbReaderMode::FollowLatest,
+        ] {
+            let options = DbReaderOptions {
+                wal_replay: crate::config::WalReplaySettings {
+                    max_concurrent_objects: 0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            assert!(DbReader::validate_options(mode, &options).is_err());
+        }
     }
 
     #[tokio::test]

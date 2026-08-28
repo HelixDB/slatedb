@@ -16,11 +16,11 @@ use slatedb_common::ObjectMetadata;
 use tokio::io::AsyncWriteExt;
 use ulid::Ulid;
 
-use crate::blob::ReadOnlyBlob;
+use crate::blob::{BytesBlob, ReadOnlyBlob};
 use crate::block_cache_policy::{should_cache_data_block, BlockCachePolicy};
 use crate::db_cache::CacheTarget;
 use crate::db_cache::{CacheLoader, CachedEntry, CachedKey, DbCache, EncodedCachedFilter};
-use crate::db_state::{SsTableHandle, SsTableId, SstType};
+use crate::db_state::{SsTableHandle, SsTableId, SsTableInfo, SstType};
 use crate::error::SlateDBError;
 use crate::filter_policy::NamedFilter;
 use crate::flatbuffer_types::SsTableIndexOwned;
@@ -47,6 +47,14 @@ pub(crate) struct TableStore {
     block_cache_policy: BlockCachePolicy,
     /// Which component owns this store. Tagged on compacted-SST calls.
     kind: TableStoreKind,
+}
+
+pub(crate) enum DecodedWalSst {
+    Fence,
+    Data {
+        format_version: u16,
+        blocks: VecDeque<Block>,
+    },
 }
 
 struct ReadOnlyObject {
@@ -318,6 +326,117 @@ impl TableStore {
         }
         wal_list.sort_by_key(|m| m.id.unwrap_wal_id());
         Ok(wal_list)
+    }
+
+    /// Lists only the WAL suffix needed for one replay operation.
+    pub(crate) async fn list_wal_ssts_for_replay(
+        &self,
+        id_range: Range<u64>,
+    ) -> Result<Vec<IdentifiedObjectMetadata<SsTableId>>, SlateDBError> {
+        if id_range.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let wal_path = self.path_resolver.wal_path();
+        let object_store = self.object_stores.store_of(ObjectStoreType::Wal);
+        let mut files_stream = if id_range.start == 0 {
+            object_store.list(Some(&wal_path))
+        } else {
+            let offset = self.path(&SsTableId::Wal(id_range.start - 1));
+            object_store.list_with_offset(Some(&wal_path), &offset)
+        };
+        let mut wal_list = Vec::new();
+
+        while let Some(file) = files_stream.next().await.transpose()? {
+            let Ok(Some(SsTableId::Wal(id))) = self.path_resolver.parse_table_id(&file.location)
+            else {
+                continue;
+            };
+            if id >= id_range.end {
+                break;
+            }
+            if id >= id_range.start {
+                wal_list.push(IdentifiedObjectMetadata::from_object_meta(
+                    SsTableId::Wal(id),
+                    file,
+                ));
+            }
+        }
+        wal_list.sort_by_key(|metadata| metadata.id.unwrap_wal_id());
+        Ok(wal_list)
+    }
+
+    /// Fetches a WAL SST with one full-object GET.
+    pub(crate) async fn read_wal_sst_bytes(&self, wal_id: u64) -> Result<Bytes, SlateDBError> {
+        let id = SsTableId::Wal(wal_id);
+        let obj = ReadOnlyObject {
+            object_store: self.object_stores.store_for(&id),
+            path: self.path(&id),
+            tag: ObjectStoreCallTag::new(self.kind, SstType::Wal),
+        };
+        obj.read().await.map_err(|err| err.with_path(&obj.path))
+    }
+
+    /// Decodes a fully fetched WAL locally. A validation failure refetches the
+    /// complete object once before decoding again.
+    pub(crate) async fn decode_wal_sst(
+        &self,
+        wal_id: u64,
+        bytes: Bytes,
+    ) -> Result<DecodedWalSst, SlateDBError> {
+        let id = SsTableId::Wal(wal_id);
+        let object_store = self.object_stores.store_for(&id);
+        let path = self.path(&id);
+        let sst_format = self.sst_format.clone();
+        let mut initial_bytes = Some(bytes);
+
+        read_with_validation_retry(
+            ObjectStoreCallTag::new(self.kind, SstType::Wal),
+            move |tag| {
+                let object_store = Arc::clone(&object_store);
+                let path = path.clone();
+                let sst_format = sst_format.clone();
+                let bytes = initial_bytes.take();
+                async move {
+                    let bytes = match bytes {
+                        Some(bytes) => bytes,
+                        None => {
+                            let obj = ReadOnlyObject {
+                                object_store,
+                                path: path.clone(),
+                                tag,
+                            };
+                            obj.read().await.map_err(|err| err.with_path(&path))?
+                        }
+                    };
+                    if bytes.is_empty() {
+                        return Ok(DecodedWalSst::Fence);
+                    }
+
+                    let blob = BytesBlob::new(bytes);
+                    let object_len = blob.len().await?;
+                    let (info, format_version) = sst_format
+                        .read_info_and_version(&blob)
+                        .await
+                        .map_err(|err| err.with_path(&path))?;
+                    let index = sst_format
+                        .read_index(&info, &blob)
+                        .await
+                        .map_err(|err| err.with_path(&path))?;
+                    validate_wal_sst_layout(&info, &index, object_len, &path)?;
+                    let block_count = index.borrow().block_meta().len();
+                    let blocks = sst_format
+                        .read_blocks(&info, &index, 0..block_count, &blob)
+                        .await
+                        .map_err(|err| err.with_path(&path))?;
+                    Ok(DecodedWalSst::Data {
+                        format_version,
+                        blocks,
+                    })
+                }
+            },
+        )
+        .await
     }
 
     pub(crate) async fn next_wal_sst_id(
@@ -1107,6 +1226,59 @@ impl TableStore {
                 .await;
         }
     }
+}
+
+fn validate_wal_sst_layout(
+    info: &SsTableInfo,
+    index: &SsTableIndexOwned,
+    object_len: u64,
+    path: &Path,
+) -> Result<(), SlateDBError> {
+    for (name, offset, len) in [
+        ("index", info.index_offset, info.index_len),
+        ("filter", info.filter_offset, info.filter_len),
+        ("stats", info.stats_offset, info.stats_len),
+    ] {
+        let Some(end) = offset.checked_add(len) else {
+            return Err(invalid_wal_layout(path, format!("{name} range overflow")));
+        };
+        if end > object_len {
+            return Err(invalid_wal_layout(
+                path,
+                format!("{name} range {offset}..{end} exceeds object length {object_len}"),
+            ));
+        }
+    }
+
+    let block_meta = index.borrow().block_meta();
+    let mut previous_offset = None;
+    for block in 0..block_meta.len() {
+        let offset = block_meta.get(block).offset();
+        if offset >= info.filter_offset {
+            return Err(invalid_wal_layout(
+                path,
+                format!(
+                    "block {block} offset {offset} reaches data end {}",
+                    info.filter_offset
+                ),
+            ));
+        }
+        if previous_offset.is_some_and(|previous| offset <= previous) {
+            return Err(invalid_wal_layout(
+                path,
+                format!("block {block} offset {offset} is not strictly increasing"),
+            ));
+        }
+        previous_offset = Some(offset);
+    }
+    Ok(())
+}
+
+fn invalid_wal_layout(path: &Path, reason: String) -> SlateDBError {
+    SlateDBError::WalDataError(Arc::new(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("invalid WAL SST layout at {path}: {reason}"),
+    )))
 }
 
 async fn wal_object_exists(

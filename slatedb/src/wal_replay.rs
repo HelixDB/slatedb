@@ -1,30 +1,30 @@
-use crate::db_state::SsTableId;
+use crate::block_iterator::DataBlockIterator;
+use crate::config::WalReplaySettings;
 use crate::error::SlateDBError;
-use crate::iter::{EmptyIterator, RowEntryIterator};
+use crate::format::block::Block;
+use crate::iter::{IterationOrder, RowEntryIterator};
 use crate::manifest::ManifestCore;
-use crate::manifest::SsTableView;
 use crate::mem_table::WritableKVTable;
-use crate::sst_iter::{SstIterator, SstIteratorOptions};
-use crate::tablestore::TableStore;
+use crate::tablestore::{DecodedWalSst, TableStore};
+use crate::types::RowEntry;
 use crate::utils::panic_string;
+use async_trait::async_trait;
+use bytes::Bytes;
 use log::{error, info};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::ops::Range;
 use std::sync::Arc;
-use tokio::task;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 
 pub(crate) struct WalReplayOptions {
-    /// The number of SSTs to preload while replaying
-    pub(crate) sst_batch_size: usize,
+    /// Limits concurrent full-object WAL prefetch.
+    pub(crate) prefetch: WalReplaySettings,
 
     /// The target maximum number of bytes in each returned table. WAL replay only
     /// splits between complete WAL SSTs, so a returned table may exceed this if a
     /// single WAL SST is larger.
     pub(crate) max_memtable_bytes: usize,
-
-    /// Options to pass through to underlying SST iterators
-    pub(crate) sst_iter_options: SstIteratorOptions,
 
     /// The minimum seq number to replay. If unset, will replay all
     /// entries after `last_l0_seq` in the manifest.
@@ -34,9 +34,8 @@ pub(crate) struct WalReplayOptions {
 impl Default for WalReplayOptions {
     fn default() -> Self {
         Self {
-            sst_batch_size: 4,
+            prefetch: WalReplaySettings::default(),
             max_memtable_bytes: 64 * 1024 * 1024,
-            sst_iter_options: SstIteratorOptions::default(),
             min_seq: None,
         }
     }
@@ -52,6 +51,68 @@ pub(crate) struct ReplayedMemtable {
 struct WalIdAndIter {
     wal_id: u64,
     iter: Box<dyn RowEntryIterator + 'static>,
+    _permit: OwnedSemaphorePermit,
+}
+
+struct WalObjectPlan {
+    wal_id: u64,
+    expected_size: Option<u64>,
+}
+
+struct FetchedWal {
+    wal_id: u64,
+    bytes: Bytes,
+    permit: OwnedSemaphorePermit,
+}
+
+struct PendingWal {
+    wal_id: u64,
+    handle: JoinHandle<Result<FetchedWal, SlateDBError>>,
+}
+
+struct WalBlocksIterator {
+    format_version: u16,
+    blocks: VecDeque<Block>,
+    current: Option<DataBlockIterator<Block>>,
+}
+
+impl WalBlocksIterator {
+    fn new(format_version: u16, blocks: VecDeque<Block>) -> Self {
+        Self {
+            format_version,
+            blocks,
+            current: None,
+        }
+    }
+}
+
+#[async_trait]
+impl RowEntryIterator for WalBlocksIterator {
+    async fn init(&mut self) -> Result<(), SlateDBError> {
+        Ok(())
+    }
+
+    async fn next(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
+        loop {
+            if let Some(current) = &mut self.current {
+                if let Some(entry) = current.next().await? {
+                    return Ok(Some(entry));
+                }
+            }
+            let Some(block) = self.blocks.pop_front() else {
+                return Ok(None);
+            };
+            self.current = Some(DataBlockIterator::new(
+                block,
+                self.format_version,
+                IterationOrder::Ascending,
+            )?);
+        }
+    }
+
+    async fn seek(&mut self, _next_key: &[u8]) -> Result<(), SlateDBError> {
+        Err(SlateDBError::InvalidDBState)
+    }
 }
 
 struct IteratorHolder<T> {
@@ -87,11 +148,18 @@ pub(crate) struct WalReplayIterator {
     wal_id_range: Range<u64>,
     table_store: Arc<TableStore>,
     current_iter: IteratorHolder<WalIdAndIter>,
-    next_iters: VecDeque<JoinHandle<Result<Option<WalIdAndIter>, SlateDBError>>>,
+    pending_plans: VecDeque<WalObjectPlan>,
+    pending_fetches: VecDeque<PendingWal>,
+    byte_semaphore: Arc<Semaphore>,
     last_tick: i64,
     last_seq: u64,
     min_seq: u64,
-    next_wal_id: u64,
+    fetched_objects: u64,
+    fetched_bytes: u64,
+    decoded_objects: u64,
+    peak_concurrent_objects: usize,
+    peak_reserved_bytes: usize,
+    completion_logged: bool,
 }
 
 impl WalReplayIterator {
@@ -101,10 +169,7 @@ impl WalReplayIterator {
         options: WalReplayOptions,
         table_store: Arc<TableStore>,
     ) -> Result<Self, SlateDBError> {
-        let sst_batch_size = options.sst_batch_size;
-        if sst_batch_size < 1 {
-            return Err(SlateDBError::InvalidSSTBatchSize(sst_batch_size));
-        }
+        options.prefetch.validate()?;
 
         // load the last seq number from manifest, and use it as the starting seq number to avoid
         // replaying the entries that are already in the L0 SST. while replaying the WALs, we'll
@@ -113,82 +178,130 @@ impl WalReplayIterator {
         let min_seq = options.min_seq.unwrap_or(db_state.last_l0_seq);
         let last_seq = db_state.last_l0_seq;
         let last_tick = db_state.last_l0_clock_tick;
-        let next_wal_id = wal_id_range.start;
+        let listed_sizes = table_store
+            .list_wal_ssts_for_replay(wal_id_range.clone())
+            .await?
+            .into_iter()
+            .map(|metadata| (metadata.id.unwrap_wal_id(), metadata.metadata.size))
+            .collect::<BTreeMap<_, _>>();
+        let pending_plans = wal_id_range
+            .clone()
+            .map(|wal_id| WalObjectPlan {
+                wal_id,
+                expected_size: listed_sizes.get(&wal_id).copied(),
+            })
+            .collect();
+        let byte_semaphore = Arc::new(Semaphore::new(options.prefetch.max_inflight_bytes));
 
         let mut replay_iter = WalReplayIterator {
             options,
             wal_id_range,
             table_store: Arc::clone(&table_store),
             current_iter: IteratorHolder::new(),
-            next_iters: VecDeque::new(),
+            pending_plans,
+            pending_fetches: VecDeque::new(),
+            byte_semaphore,
             last_tick,
             last_seq,
             min_seq,
-            next_wal_id,
+            fetched_objects: 0,
+            fetched_bytes: 0,
+            decoded_objects: 0,
+            peak_concurrent_objects: 0,
+            peak_reserved_bytes: 0,
+            completion_logged: false,
         };
 
-        for _ in 0..sst_batch_size {
-            if !replay_iter.maybe_load_next_iter() {
-                break;
-            }
-        }
+        replay_iter.fill_prefetch();
+        info!(
+            "SlateDB WAL full-object replay initialized [replay_start_wal_id={}, replay_end_wal_id={}, replay_wal_count={}, listed_wal_count={}, missing_size_count={}, max_concurrent_objects={}, max_inflight_bytes={}]",
+            replay_iter.wal_id_range.start,
+            replay_iter.wal_id_range.end,
+            replay_iter
+                .wal_id_range
+                .end
+                .saturating_sub(replay_iter.wal_id_range.start),
+            listed_sizes.len(),
+            replay_iter
+                .wal_id_range
+                .end
+                .saturating_sub(replay_iter.wal_id_range.start)
+                .saturating_sub(listed_sizes.len() as u64),
+            replay_iter.options.prefetch.max_concurrent_objects,
+            replay_iter.options.prefetch.max_inflight_bytes,
+        );
 
         Ok(replay_iter)
     }
 
-    fn maybe_load_next_iter(&mut self) -> bool {
-        if !self.wal_id_range.contains(&self.next_wal_id)
-            || self.next_iters.len() >= self.options.sst_batch_size
-        {
-            return false;
-        }
-
-        let next_wal_id = self.next_wal_id;
-        self.next_wal_id += 1;
-
-        async fn load_iter(
-            wal_id: u64,
-            sst_iter_options: SstIteratorOptions,
-            table_store: Arc<TableStore>,
-        ) -> Result<Option<WalIdAndIter>, SlateDBError> {
-            let sst = match table_store.open_sst(&SsTableId::Wal(wal_id)).await {
-                Ok(sst) => sst,
-                Err(SlateDBError::EmptySSTable) => {
-                    // Zero-byte WAL files are fence markers; replay them as empty WALs
-                    // so the last replayed WAL ID still advances past the marker.
-                    return Ok(Some(WalIdAndIter {
-                        wal_id,
-                        iter: Box::new(EmptyIterator::new()),
-                    }));
-                }
-                Err(err) => return Err(err),
+    fn fill_prefetch(&mut self) {
+        while self.pending_fetches.len() < self.options.prefetch.max_concurrent_objects {
+            let Some(plan) = self.pending_plans.front() else {
+                break;
             };
-            let iter = SstIterator::new_owned_initialized(
-                ..,
-                SsTableView::identity(sst),
-                Arc::clone(&table_store),
-                sst_iter_options,
-            )
-            .await?;
-            Ok(iter.map(|iter| WalIdAndIter {
-                wal_id,
-                iter: Box::new(iter) as Box<dyn RowEntryIterator + 'static>,
-            }))
+            let byte_limit = self.options.prefetch.max_inflight_bytes;
+            let reserved_bytes = plan
+                .expected_size
+                .and_then(|size| usize::try_from(size).ok())
+                .unwrap_or(byte_limit)
+                .clamp(1, byte_limit);
+            let permit_count = u32::try_from(reserved_bytes)
+                .expect("validated WAL replay byte limit must fit in u32");
+            let Ok(permit) = Arc::clone(&self.byte_semaphore).try_acquire_many_owned(permit_count)
+            else {
+                break;
+            };
+            let plan = self
+                .pending_plans
+                .pop_front()
+                .expect("front plan must exist");
+            let table_store = Arc::clone(&self.table_store);
+            let handle = tokio::spawn(async move {
+                let bytes = table_store.read_wal_sst_bytes(plan.wal_id).await?;
+                if let Some(expected_size) = plan.expected_size {
+                    let actual_size = u64::try_from(bytes.len()).map_err(|err| {
+                        SlateDBError::WalDataError(Arc::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            err,
+                        )))
+                    })?;
+                    if actual_size != expected_size {
+                        return Err(SlateDBError::WalDataError(Arc::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "WAL {} size changed between listing and GET: expected {}, got {}",
+                                plan.wal_id, expected_size, actual_size
+                            ),
+                        ))));
+                    }
+                }
+                Ok(FetchedWal {
+                    wal_id: plan.wal_id,
+                    bytes,
+                    permit,
+                })
+            });
+            self.pending_fetches.push_back(PendingWal {
+                wal_id: plan.wal_id,
+                handle,
+            });
+            self.peak_concurrent_objects =
+                self.peak_concurrent_objects.max(self.pending_fetches.len());
+            self.peak_reserved_bytes = self.peak_reserved_bytes.max(
+                self.options
+                    .prefetch
+                    .max_inflight_bytes
+                    .saturating_sub(self.byte_semaphore.available_permits()),
+            );
         }
-
-        let handle = task::spawn(load_iter(
-            next_wal_id,
-            self.options.sst_iter_options.clone(),
-            Arc::clone(&self.table_store),
-        ));
-        self.next_iters.push_back(handle);
-        true
     }
 
     async fn advance_current_iter(&mut self) -> Result<(), SlateDBError> {
-        let next_iter = if let Some(join_handle) = self.next_iters.pop_front() {
-            match join_handle.await {
-                Ok(Ok(sst_iter)) => sst_iter,
+        self.current_iter.current_iter.take();
+        self.fill_prefetch();
+        let next_iter = if let Some(pending) = self.pending_fetches.pop_front() {
+            let fetched = match pending.handle.await {
+                Ok(Ok(fetched)) => fetched,
                 Ok(Err(slate_err)) => return Err(slate_err),
                 Err(join_err) => {
                     let task_name = format!("wal_replay[{:?}]", self.wal_id_range);
@@ -202,11 +315,34 @@ impl WalReplayIterator {
                     }
                     return Err(SlateDBError::BackgroundTaskCancelled(task_name));
                 }
-            }
+            };
+            assert_eq!(pending.wal_id, fetched.wal_id);
+            self.fetched_objects = self.fetched_objects.saturating_add(1);
+            self.fetched_bytes = self
+                .fetched_bytes
+                .saturating_add(u64::try_from(fetched.bytes.len()).unwrap_or(u64::MAX));
+            let decoded = self
+                .table_store
+                .decode_wal_sst(fetched.wal_id, fetched.bytes)
+                .await?;
+            self.decoded_objects = self.decoded_objects.saturating_add(1);
+            let iter: Box<dyn RowEntryIterator + 'static> = match decoded {
+                DecodedWalSst::Fence => Box::new(WalBlocksIterator::new(0, VecDeque::new())),
+                DecodedWalSst::Data {
+                    format_version,
+                    blocks,
+                } => Box::new(WalBlocksIterator::new(format_version, blocks)),
+            };
+            Some(WalIdAndIter {
+                wal_id: fetched.wal_id,
+                iter,
+                _permit: fetched.permit,
+            })
         } else {
             None
         };
         self.current_iter.advance(next_iter);
+        self.fill_prefetch();
         Ok(())
     }
 
@@ -222,7 +358,12 @@ impl WalReplayIterator {
     /// must not split a WAL SST across replayed memtables.
     pub(crate) async fn next(&mut self) -> Result<Option<ReplayedMemtable>, SlateDBError> {
         if self.current_iter.is_finished() {
+            self.log_completion();
             return Ok(None);
+        }
+
+        if !self.current_iter.initialized {
+            self.advance_current_iter().await?;
         }
 
         let table = WritableKVTable::new();
@@ -273,7 +414,6 @@ impl WalReplayIterator {
                 }
             }
 
-            self.maybe_load_next_iter();
             self.advance_current_iter().await?
         }
 
@@ -285,7 +425,33 @@ impl WalReplayIterator {
                 last_wal_id,
             }))
         } else {
+            self.log_completion();
             Ok(None)
+        }
+    }
+
+    fn log_completion(&mut self) {
+        if self.completion_logged {
+            return;
+        }
+        self.completion_logged = true;
+        info!(
+            "SlateDB WAL full-object replay completed [replay_start_wal_id={}, replay_end_wal_id={}, fetched_objects={}, fetched_bytes={}, decoded_objects={}, peak_concurrent_objects={}, peak_reserved_bytes={}]",
+            self.wal_id_range.start,
+            self.wal_id_range.end,
+            self.fetched_objects,
+            self.fetched_bytes,
+            self.decoded_objects,
+            self.peak_concurrent_objects,
+            self.peak_reserved_bytes,
+        );
+    }
+}
+
+impl Drop for WalReplayIterator {
+    fn drop(&mut self) {
+        for pending in &self.pending_fetches {
+            pending.handle.abort();
         }
     }
 }
@@ -295,6 +461,7 @@ mod tests {
     use super::{WalReplayIterator, WalReplayOptions};
     use crate::block_cache_policy::BlockCachePolicy;
     use crate::bytes_range::BytesRange;
+    use crate::config::WalReplaySettings;
     use crate::db_state::SsTableId;
     use crate::format::sst::SsTableFormat;
     use crate::iter::{IterationOrder, RowEntryIterator};
@@ -303,12 +470,13 @@ mod tests {
     use crate::object_stores::ObjectStores;
     use crate::proptest_util::{rng, sample};
     use crate::tablestore::{TableStore, TableStoreKind};
+    use crate::test_utils::{GatedObjectStore, RecordingObjectStore};
     use crate::types::RowEntry;
     use crate::{error::SlateDBError, test_utils};
     use bytes::Bytes;
     use object_store::memory::InMemory;
     use object_store::path::Path;
-    use object_store::ObjectStore;
+    use object_store::{ObjectStore, ObjectStoreExt};
     use proptest::test_runner::TestRng;
     use rand::Rng;
     use std::cmp::min;
@@ -441,6 +609,231 @@ mod tests {
         )
         .await;
         assert!(replay_iter.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn should_issue_one_full_get_per_wal() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let recording = Arc::new(RecordingObjectStore::new(inner));
+        let table_store = test_table_store_with_object_store(recording.clone());
+        for wal_id in 1..=3 {
+            let mut builder = table_store.wal_table_builder();
+            builder
+                .add(RowEntry::new_value(
+                    format!("key-{wal_id}").as_bytes(),
+                    b"value",
+                    wal_id,
+                ))
+                .await
+                .unwrap();
+            let encoded = builder.build().await.unwrap();
+            table_store
+                .write_sst(&SsTableId::Wal(wal_id), &encoded)
+                .await
+                .unwrap();
+        }
+        recording.clear();
+
+        let mut replay_iter = WalReplayIterator::range(
+            1..4,
+            &ManifestCore::new(),
+            WalReplayOptions::default(),
+            table_store,
+        )
+        .await
+        .unwrap();
+        while replay_iter.next().await.unwrap().is_some() {}
+
+        assert_eq!(recording.get_kinds(false).len(), 3);
+        assert!(recording.get_kinds(true).is_empty());
+        assert_eq!(
+            recording.get_sst_types(false),
+            vec![Some(crate::db_state::SstType::Wal); 3]
+        );
+        assert_eq!(recording.get_retries(false), vec![None; 3]);
+    }
+
+    #[tokio::test]
+    async fn should_refetch_the_full_wal_once_after_checksum_failure() {
+        let inner = Arc::new(InMemory::new());
+        let recording = Arc::new(RecordingObjectStore::new(inner.clone()));
+        let table_store = test_table_store_with_object_store(recording.clone());
+        let mut builder = table_store.wal_table_builder();
+        builder
+            .add(RowEntry::new_value(b"key", b"value", 1))
+            .await
+            .unwrap();
+        let encoded = builder.build().await.unwrap();
+        table_store
+            .write_sst(&SsTableId::Wal(1), &encoded)
+            .await
+            .unwrap();
+        let metadata = table_store
+            .list_wal_ssts_for_replay(1..2)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let mut corrupted = inner
+            .get(&metadata.metadata.location)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap()
+            .to_vec();
+        corrupted[0] ^= 1;
+        inner
+            .put(&metadata.metadata.location, corrupted.into())
+            .await
+            .unwrap();
+        recording.clear();
+
+        let mut replay_iter = WalReplayIterator::range(
+            1..2,
+            &ManifestCore::new(),
+            WalReplayOptions::default(),
+            table_store,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            replay_iter.next().await,
+            Err(SlateDBError::ChecksumMismatch { .. })
+        ));
+        assert_eq!(recording.get_kinds(false).len(), 2);
+        assert_eq!(recording.get_retries(false)[0], None);
+        assert!(recording.get_retries(false)[1].is_some());
+    }
+
+    #[tokio::test]
+    async fn should_not_skip_a_missing_wal_id() {
+        let table_store = test_table_store();
+        for wal_id in [1, 3] {
+            let mut builder = table_store.wal_table_builder();
+            builder
+                .add(RowEntry::new_value(
+                    format!("key-{wal_id}").as_bytes(),
+                    b"value",
+                    wal_id,
+                ))
+                .await
+                .unwrap();
+            let encoded = builder.build().await.unwrap();
+            table_store
+                .write_sst(&SsTableId::Wal(wal_id), &encoded)
+                .await
+                .unwrap();
+        }
+
+        let mut replay_iter = WalReplayIterator::range(
+            1..4,
+            &ManifestCore::new(),
+            WalReplayOptions::default(),
+            table_store,
+        )
+        .await
+        .unwrap();
+        let Err(error) = replay_iter.next().await else {
+            panic!("missing WAL must fail replay");
+        };
+        assert!(error.has_object_store_not_found());
+    }
+
+    #[tokio::test]
+    async fn should_prefetch_up_to_the_object_limit() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let gated = Arc::new(GatedObjectStore::new(inner));
+        let table_store = test_table_store_with_object_store(gated.clone());
+        for wal_id in 1..=4 {
+            let mut builder = table_store.wal_table_builder();
+            builder
+                .add(RowEntry::new_value(
+                    format!("key-{wal_id}").as_bytes(),
+                    b"value",
+                    wal_id,
+                ))
+                .await
+                .unwrap();
+            let encoded = builder.build().await.unwrap();
+            table_store
+                .write_sst(&SsTableId::Wal(wal_id), &encoded)
+                .await
+                .unwrap();
+        }
+        gated.get_opts_gate.close();
+
+        let mut replay_iter = WalReplayIterator::range(
+            1..5,
+            &ManifestCore::new(),
+            WalReplayOptions {
+                prefetch: WalReplaySettings {
+                    max_concurrent_objects: 2,
+                    max_inflight_bytes: 1024 * 1024,
+                },
+                ..WalReplayOptions::default()
+            },
+            table_store,
+        )
+        .await
+        .unwrap();
+        gated.get_opts_gate.wait_for_arrivals(2).await;
+        assert_eq!(gated.get_opts_gate.arrivals(), 2);
+
+        gated.get_opts_gate.release();
+        while replay_iter.next().await.unwrap().is_some() {}
+        assert_eq!(gated.get_opts_gate.arrivals(), 4);
+    }
+
+    #[tokio::test]
+    async fn should_hold_byte_permits_until_the_wal_is_consumed() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let gated = Arc::new(GatedObjectStore::new(inner));
+        let table_store = test_table_store_with_object_store(gated.clone());
+        for wal_id in 1..=2 {
+            let mut builder = table_store.wal_table_builder();
+            builder
+                .add(RowEntry::new_value(
+                    format!("key-{wal_id}").as_bytes(),
+                    &[b'x'; 128],
+                    wal_id,
+                ))
+                .await
+                .unwrap();
+            let encoded = builder.build().await.unwrap();
+            table_store
+                .write_sst(&SsTableId::Wal(wal_id), &encoded)
+                .await
+                .unwrap();
+        }
+        gated.get_opts_gate.close();
+
+        let mut replay_iter = WalReplayIterator::range(
+            1..3,
+            &ManifestCore::new(),
+            WalReplayOptions {
+                prefetch: WalReplaySettings {
+                    max_concurrent_objects: 2,
+                    max_inflight_bytes: 1,
+                },
+                max_memtable_bytes: 1,
+                ..WalReplayOptions::default()
+            },
+            table_store,
+        )
+        .await
+        .unwrap();
+        gated.get_opts_gate.wait_for_arrivals(1).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(gated.get_opts_gate.arrivals(), 1);
+
+        gated.get_opts_gate.release();
+        assert!(replay_iter.next().await.unwrap().is_some());
+        assert!(replay_iter.next().await.unwrap().is_some());
+        assert!(replay_iter.next().await.unwrap().is_none());
+        assert_eq!(gated.get_opts_gate.arrivals(), 2);
     }
 
     #[tokio::test]
@@ -778,9 +1171,13 @@ mod tests {
 
     fn test_table_store() -> Arc<TableStore> {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        test_table_store_with_object_store(object_store)
+    }
+
+    fn test_table_store_with_object_store(object_store: Arc<dyn ObjectStore>) -> Arc<TableStore> {
         let path = Path::from("/tmp/test_kv_store");
         Arc::new(TableStore::new(
-            ObjectStores::new(object_store.clone(), None),
+            ObjectStores::new(object_store, None),
             SsTableFormat::default(),
             path,
             None,

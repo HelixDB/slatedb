@@ -3775,6 +3775,7 @@ mod tests {
             min_filter_keys,
             l0_sst_size_bytes,
             max_wal_flushes_before_l0_flush: 4096,
+            wal_replay: crate::config::WalReplaySettings::default(),
             compactor_options,
             compression_codec: None,
             object_store_cache_options: crate::config::ObjectStoreCacheOptions::default(),
