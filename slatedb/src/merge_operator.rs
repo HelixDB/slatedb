@@ -22,6 +22,13 @@ pub enum MergeOperatorError {
     Callback { message: String },
 }
 
+/// The resolved result when merge operands reach an existing base entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MergeResult {
+    Value(Bytes),
+    Tombstone,
+}
+
 /// A trait for implementing custom merge operations in SlateDB.
 ///
 /// The MergeOperator allows applications to bypass the traditional read/modify/update cycle
@@ -112,6 +119,20 @@ pub trait MergeOperator {
         }
         result.ok_or(MergeOperatorError::EmptyBatch)
     }
+
+    /// Resolves operands when the iterator has reached an existing value or
+    /// tombstone. Implementations may return a tombstone when the logical
+    /// result is empty. This hook is not used when older data may still exist,
+    /// so returning a tombstone cannot hide an unseen base value.
+    fn merge_batch_with_base(
+        &self,
+        key: &Bytes,
+        existing_value: Option<Bytes>,
+        operands: &[Bytes],
+    ) -> Result<MergeResult, MergeOperatorError> {
+        self.merge_batch(key, existing_value, operands)
+            .map(MergeResult::Value)
+    }
 }
 
 pub(crate) type MergeOperatorType = Arc<dyn MergeOperator + Send + Sync>;
@@ -169,6 +190,19 @@ impl MergeOperator for InstrumentedMergeOperator {
         // This counts the exact operand slices that successfully reach
         // `merge_batch`, including intermediate results produced by batched
         // merge resolution.
+        self.merge_batch_operands.increment(operands.len() as u64);
+        Ok(result)
+    }
+
+    fn merge_batch_with_base(
+        &self,
+        key: &Bytes,
+        existing_value: Option<Bytes>,
+        operands: &[Bytes],
+    ) -> Result<MergeResult, MergeOperatorError> {
+        let result = self
+            .merge_operator
+            .merge_batch_with_base(key, existing_value, operands)?;
         self.merge_batch_operands.increment(operands.len() as u64);
         Ok(result)
     }
@@ -428,16 +462,22 @@ impl<T: RowEntryIterator> MergeOperatorIterator<T> {
         }
 
         results.reverse();
-        let final_result = self
-            .merge_operator
-            .merge_batch(&key, base_value, &results)?;
+        let final_result = if found_base {
+            self.merge_operator
+                .merge_batch_with_base(&key, base_value, &results)?
+        } else {
+            MergeResult::Value(
+                self.merge_operator
+                    .merge_batch(&key, base_value, &results)?,
+            )
+        };
 
         Ok(Some(RowEntry {
             key: key.clone(),
-            value: if found_base {
-                ValueDeletable::Value(final_result)
-            } else {
-                ValueDeletable::Merge(final_result)
+            value: match final_result {
+                MergeResult::Value(value) if found_base => ValueDeletable::Value(value),
+                MergeResult::Value(value) => ValueDeletable::Merge(value),
+                MergeResult::Tombstone => ValueDeletable::Tombstone,
             },
             seq: merge_tracker.seq,
             create_ts: merge_tracker.max_create_ts,
@@ -597,6 +637,50 @@ mod tests {
         }
     }
 
+    struct TombstoneOnRemoveOperator;
+
+    impl MergeOperator for TombstoneOnRemoveOperator {
+        fn merge(
+            &self,
+            _key: &Bytes,
+            existing_value: Option<Bytes>,
+            value: Bytes,
+        ) -> Result<Bytes, MergeOperatorError> {
+            Ok(existing_value.unwrap_or(value))
+        }
+
+        fn merge_batch(
+            &self,
+            _key: &Bytes,
+            existing_value: Option<Bytes>,
+            operands: &[Bytes],
+        ) -> Result<Bytes, MergeOperatorError> {
+            existing_value
+                .or_else(|| operands.last().cloned())
+                .ok_or(MergeOperatorError::EmptyBatch)
+        }
+
+        fn merge_batch_with_base(
+            &self,
+            _key: &Bytes,
+            _existing_value: Option<Bytes>,
+            operands: &[Bytes],
+        ) -> Result<MergeResult, MergeOperatorError> {
+            if operands
+                .last()
+                .is_some_and(|operand| operand.as_ref() == b"remove")
+            {
+                Ok(MergeResult::Tombstone)
+            } else {
+                operands
+                    .last()
+                    .cloned()
+                    .map(MergeResult::Value)
+                    .ok_or(MergeOperatorError::EmptyBatch)
+            }
+        }
+    }
+
     #[test]
     fn test_instrumented_merge_operator_counts_successful_batch_operands() {
         const TEST_COUNTER: &str = "test.merge_operator.operands";
@@ -642,6 +726,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_instrumented_merge_operator_counts_base_resolution_operands() {
+        const TEST_COUNTER: &str = "test.merge_operator.base_operands";
+
+        let (metrics_recorder, recorder) = test_recorder_helper();
+        let counter = recorder.counter(TEST_COUNTER).register();
+        let merge_operator =
+            instrument_merge_operator(Arc::new(TombstoneOnRemoveOperator), counter);
+
+        let result = merge_operator
+            .merge_batch_with_base(
+                &Bytes::from_static(b"key1"),
+                Some(Bytes::from_static(b"present")),
+                &[Bytes::from_static(b"remove")],
+            )
+            .unwrap();
+
+        assert_eq!(result, MergeResult::Tombstone);
+        assert_eq!(
+            lookup_metric(metrics_recorder.as_ref(), TEST_COUNTER),
+            Some(1)
+        );
+    }
+
     #[tokio::test]
     async fn test_merge_operator_iterator() {
         let merge_operator = Arc::new(MockMergeOperator {});
@@ -668,6 +776,34 @@ mod tests {
                 RowEntry::new_value(b"key2", b"1", 5),
                 RowEntry::new_value(b"key3", b"123", 8),
             ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn merge_result_tombstone_is_emitted_only_after_reaching_a_base() {
+        let merge_operator = Arc::new(TombstoneOnRemoveOperator);
+        let mut with_base = MergeOperatorIterator::<MockRowEntryIterator>::new(
+            merge_operator.clone(),
+            vec![
+                RowEntry::new_value(b"key", b"present", 1),
+                RowEntry::new_merge(b"key", b"remove", 2),
+            ]
+            .into(),
+            true,
+            None,
+        );
+        assert_iterator(&mut with_base, vec![RowEntry::new_tombstone(b"key", 2)]).await;
+
+        let mut without_base = MergeOperatorIterator::<MockRowEntryIterator>::new(
+            merge_operator,
+            vec![RowEntry::new_merge(b"key", b"remove", 2)].into(),
+            true,
+            None,
+        );
+        assert_iterator(
+            &mut without_base,
+            vec![RowEntry::new_merge(b"key", b"remove", 2)],
         )
         .await;
     }

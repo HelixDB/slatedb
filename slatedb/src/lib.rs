@@ -65,7 +65,7 @@ pub use garbage_collector::{GarbageCollectorBuilder, GcFilter};
 pub use instrumented_object_store::stats as instrumented_object_store_stats;
 pub use iter::IterationOrder;
 pub use manifest::VersionedManifest;
-pub use merge_operator::{MergeOperator, MergeOperatorError};
+pub use merge_operator::{MergeOperator, MergeOperatorError, MergeResult};
 pub use ops::{DbCacheManagerOps, DbMetadataOps, DbReadOps, DbTransactionOps, DbWriteOps};
 pub use paths::PathResolver;
 pub use prefix_extractor::{PrefixExtractor, PrefixTarget};

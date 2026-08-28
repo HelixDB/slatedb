@@ -22,13 +22,16 @@ pub enum IsolationLevel {
 }
 
 /// Conflict behavior for a transaction's final operations on one key.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TransactionWriteKind {
     /// The key conflicts with every concurrent write to the same key.
     Exclusive,
     /// The key is merge-only and may coexist with another merge-only,
     /// commutative write to the same key.
     CommutativeMerge,
+    /// Merge operations may coexist only when their logical discriminator
+    /// sets do not overlap.
+    DisjointMerge(HashSet<Bytes>),
 }
 
 #[derive(Debug)]
@@ -60,10 +63,16 @@ impl TransactionState {
         for (key, kind) in writes {
             self.writes
                 .entry(key)
-                .and_modify(|existing| {
-                    if *existing != kind {
-                        *existing = TransactionWriteKind::Exclusive;
-                    }
+                .and_modify(|existing| match (&mut *existing, &kind) {
+                    (
+                        TransactionWriteKind::CommutativeMerge,
+                        TransactionWriteKind::CommutativeMerge,
+                    ) => {}
+                    (
+                        TransactionWriteKind::DisjointMerge(existing),
+                        TransactionWriteKind::DisjointMerge(next),
+                    ) => existing.extend(next.iter().cloned()),
+                    _ => *existing = TransactionWriteKind::Exclusive,
                 })
                 .or_insert(kind);
         }
@@ -197,7 +206,7 @@ impl TransactionManager {
     ) {
         let mut inner = self.inner.write();
         if let Some(txn_state) = inner.active_txns.get_mut(txn_id) {
-            txn_state.track_writes(writes.iter().map(|(key, kind)| (key.clone(), *kind)));
+            txn_state.track_writes(writes.iter().map(|(key, kind)| (key.clone(), kind.clone())));
         }
     }
 
@@ -387,13 +396,18 @@ impl TransactionManagerInner {
                     let Some(other_kind) = committed_txn.writes.get(key) else {
                         continue;
                     };
-                    if !matches!(
-                        (kind, other_kind),
+                    let compatible = match (kind, other_kind) {
                         (
                             TransactionWriteKind::CommutativeMerge,
-                            TransactionWriteKind::CommutativeMerge
-                        )
-                    ) {
+                            TransactionWriteKind::CommutativeMerge,
+                        ) => true,
+                        (
+                            TransactionWriteKind::DisjointMerge(current),
+                            TransactionWriteKind::DisjointMerge(committed),
+                        ) => current.is_disjoint(committed),
+                        _ => false,
+                    };
+                    if !compatible {
                         return true;
                     }
                 }
@@ -477,6 +491,20 @@ mod tests {
         keys.into_iter()
             .map(|key| (Bytes::from(key), TransactionWriteKind::CommutativeMerge))
             .collect()
+    }
+
+    fn disjoint_writes(
+        key: &'static str,
+        discriminators: impl IntoIterator<Item = &'static str>,
+    ) -> HashMap<Bytes, TransactionWriteKind> {
+        [(
+            Bytes::from(key),
+            TransactionWriteKind::DisjointMerge(
+                discriminators.into_iter().map(Bytes::from).collect(),
+            ),
+        )]
+        .into_iter()
+        .collect()
     }
 
     struct CheckConflictTestCase {
@@ -790,6 +818,59 @@ mod tests {
             exclusive_then_commutative.writes.get(b"key".as_slice()),
             Some(&TransactionWriteKind::Exclusive)
         );
+
+        let mut repeated_disjoint = TransactionState {
+            started_seq: 0,
+            committed_seq: None,
+            writes: HashMap::new(),
+            read_keys: HashSet::new(),
+            read_ranges: Vec::new(),
+        };
+        repeated_disjoint.track_writes(disjoint_writes("key", ["member-a"]));
+        repeated_disjoint.track_writes(disjoint_writes("key", ["member-b"]));
+        assert_eq!(
+            repeated_disjoint.writes.get(b"key".as_slice()),
+            Some(&TransactionWriteKind::DisjointMerge(
+                [
+                    Bytes::from_static(b"member-a"),
+                    Bytes::from_static(b"member-b")
+                ]
+                .into_iter()
+                .collect()
+            ))
+        );
+
+        repeated_disjoint.track_writes(commutative_writes(["key"]));
+        assert_eq!(
+            repeated_disjoint.writes.get(b"key".as_slice()),
+            Some(&TransactionWriteKind::Exclusive)
+        );
+    }
+
+    #[test]
+    fn test_disjoint_merge_conflicts_only_on_overlapping_discriminators() {
+        let txn_manager = create_transaction_manager();
+        txn_manager
+            .inner
+            .write()
+            .recent_committed_txns
+            .push_back(TransactionState {
+                started_seq: 50,
+                committed_seq: Some(150),
+                writes: disjoint_writes("key", ["member-a", "member-b"]),
+                read_keys: HashSet::new(),
+                read_ranges: Vec::new(),
+            });
+
+        let inner = txn_manager.inner.read();
+        assert!(
+            !inner.has_write_write_conflict(&disjoint_writes("key", ["member-c", "member-d"]), 100)
+        );
+        assert!(
+            inner.has_write_write_conflict(&disjoint_writes("key", ["member-b", "member-c"]), 100)
+        );
+        assert!(inner.has_write_write_conflict(&commutative_writes(["key"]), 100));
+        assert!(inner.has_write_write_conflict(&exclusive_writes(["key"]), 100));
     }
 
     #[test]
@@ -803,6 +884,33 @@ mod tests {
                 started_seq: 50,
                 committed_seq: Some(150),
                 writes: commutative_writes(["foo5"]),
+                read_keys: HashSet::new(),
+                read_ranges: Vec::new(),
+            });
+        let read_keys = [Bytes::from_static(b"foo5")].into_iter().collect();
+
+        let inner = txn_manager.inner.read();
+        assert!(inner.has_read_write_conflict(&read_keys, Vec::new(), 100));
+        assert!(inner.has_read_write_conflict(
+            &HashSet::new(),
+            vec![BytesRange::from(
+                Bytes::from_static(b"foo0")..=Bytes::from_static(b"foo9")
+            )],
+            100
+        ));
+    }
+
+    #[test]
+    fn test_disjoint_writes_remain_visible_to_point_and_range_read_conflicts() {
+        let txn_manager = create_transaction_manager();
+        txn_manager
+            .inner
+            .write()
+            .recent_committed_txns
+            .push_back(TransactionState {
+                started_seq: 50,
+                committed_seq: Some(150),
+                writes: disjoint_writes("foo5", ["member"]),
                 read_keys: HashSet::new(),
                 read_ranges: Vec::new(),
             });
