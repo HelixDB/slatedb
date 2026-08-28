@@ -7,7 +7,7 @@ use crate::mem_table::WritableKVTable;
 use crate::sst_iter::{SstIterator, SstIteratorOptions};
 use crate::tablestore::TableStore;
 use crate::utils::panic_string;
-use log::error;
+use log::{error, info};
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::Arc;
@@ -244,6 +244,24 @@ impl WalReplayIterator {
                 }
 
                 last_wal_id = wal_id_and_iter.wal_id;
+                let replayed_wal_count = last_wal_id
+                    .saturating_sub(self.wal_id_range.start)
+                    .saturating_add(1);
+                if replayed_wal_count.is_multiple_of(128) {
+                    let metadata = table.metadata();
+                    info!(
+                        "SlateDB WAL replay progress [replay_start_wal_id={}, replay_end_wal_id={}, replay_wal_count={}, last_replayed_wal_id={}, replayed_wal_count={}, replayed_entries={}, replayed_bytes={}]",
+                        self.wal_id_range.start,
+                        self.wal_id_range.end,
+                        self.wal_id_range
+                            .end
+                            .saturating_sub(self.wal_id_range.start),
+                        last_wal_id,
+                        replayed_wal_count,
+                        metadata.entry_num,
+                        metadata.entries_size_in_bytes
+                    );
+                }
 
                 let meta = table.metadata();
                 let estimated_bytes = self
