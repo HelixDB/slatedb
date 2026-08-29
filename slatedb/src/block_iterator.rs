@@ -105,7 +105,7 @@ pub(crate) struct BlockIterator<B: BlockLike> {
     off_off: usize,
     // first key in the block, because slateDB does not support multi version of keys
     // so we use `Bytes` temporarily
-    first_key: Bytes,
+    first_key: Option<Bytes>,
     ordering: IterationOrder,
 }
 
@@ -195,7 +195,7 @@ impl<B: BlockLike> RowEntryIterator for BlockIterator<B> {
 impl<B: BlockLike> BlockIterator<B> {
     pub(crate) fn new(block: B, ordering: IterationOrder) -> Self {
         BlockIterator {
-            first_key: BlockIterator::decode_first_key(&block),
+            first_key: None,
             block,
             off_off: 0,
             ordering,
@@ -215,23 +215,41 @@ impl<B: BlockLike> BlockIterator<B> {
         self.off_off >= self.block.offsets().len()
     }
 
-    fn load_at_current_off(&self) -> Result<Option<RowEntry>, SlateDBError> {
+    fn load_at_current_off(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
         if self.is_empty() {
             return Ok(None);
         }
+        self.ensure_first_key()?;
         let off_off = match self.ordering {
             Ascending => self.off_off,
             Descending => self.block.offsets().len() - 1 - self.off_off,
         };
 
-        let off = self.block.offsets()[off_off];
-        let off_usz = off as usize;
-        // TODO: bounds checks to avoid panics? (paulgb)
-        let mut cursor = self.block.data().slice(off_usz..);
+        let off_usz = usize::from(self.block.offsets()[off_off]);
+        let row_end = self
+            .block
+            .offsets()
+            .get(off_off + 1)
+            .map(|offset| usize::from(*offset))
+            .unwrap_or_else(|| self.block.data().len());
+        if off_usz >= row_end || row_end > self.block.data().len() {
+            return Err(corrupt_block("invalid V1 row boundary"));
+        }
+        let mut cursor = self.block.data().slice(off_usz..row_end);
         let codec = SstRowCodecV0::new();
         let sst_row = codec.decode(&mut cursor)?;
+        if cursor.has_remaining() {
+            return Err(corrupt_block("V1 row contains trailing bytes"));
+        }
+        let first_key = self
+            .first_key
+            .as_ref()
+            .ok_or_else(|| corrupt_block("V1 block first key was not initialized"))?;
+        if sst_row.key_prefix_len > first_key.len() {
+            return Err(corrupt_block("V1 row key prefix exceeds first key"));
+        }
         Ok(Some(RowEntry::new(
-            sst_row.restore_full_key(&self.first_key),
+            sst_row.restore_full_key(first_key),
             sst_row.value,
             sst_row.seq,
             sst_row.create_ts,
@@ -239,31 +257,75 @@ impl<B: BlockLike> BlockIterator<B> {
         )))
     }
 
-    fn decode_first_key(block: &B) -> Bytes {
+    fn ensure_first_key(&mut self) -> Result<(), SlateDBError> {
+        if self.first_key.is_some() {
+            return Ok(());
+        }
+        self.first_key = Some(Self::decode_first_key(&self.block)?);
+        Ok(())
+    }
+
+    fn decode_first_key(block: &B) -> Result<Bytes, SlateDBError> {
+        if block.offsets().first().copied() != Some(0) {
+            return Err(corrupt_block("first V1 row offset is not zero"));
+        }
+        if block.data().len() < 4 {
+            return Err(corrupt_block("truncated V1 first key"));
+        }
         let mut buf = block.data().slice(..);
         let overlap_len = buf.get_u16() as usize;
-        assert_eq!(overlap_len, 0, "first key overlap should be 0");
+        if overlap_len != 0 {
+            return Err(corrupt_block("first V1 key prefix is not zero"));
+        }
         let key_len = buf.get_u16() as usize;
+        if buf.remaining() < key_len {
+            return Err(corrupt_block("truncated V1 first key suffix"));
+        }
         let first_key = &buf[..key_len];
-        Bytes::copy_from_slice(first_key)
+        Ok(Bytes::copy_from_slice(first_key))
     }
 
     /// Decodes just the key at the given offset index without parsing the full row.
     /// This is more efficient for binary search where we only need to compare keys.
-    fn decode_key_at_index(&self, index: usize) -> Result<Bytes, SlateDBError> {
-        let off = self.block.offsets()[index] as usize;
+    fn decode_key_at_index(&mut self, index: usize) -> Result<Bytes, SlateDBError> {
+        self.ensure_first_key()?;
+        let Some(&offset) = self.block.offsets().get(index) else {
+            return Err(corrupt_block("V1 key offset index is out of range"));
+        };
+        let off = usize::from(offset);
+        if off >= self.block.data().len() {
+            return Err(corrupt_block("V1 key offset is outside block data"));
+        }
         let mut cursor = self.block.data().slice(off..);
+
+        if cursor.remaining() < 4 {
+            return Err(corrupt_block("truncated V1 key lengths"));
+        }
 
         let key_prefix_len = cursor.get_u16() as usize;
         let key_suffix_len = cursor.get_u16() as usize;
+        let first_key = self
+            .first_key
+            .as_ref()
+            .ok_or_else(|| corrupt_block("V1 block first key was not initialized"))?;
+        if key_prefix_len > first_key.len() || cursor.remaining() < key_suffix_len {
+            return Err(corrupt_block("invalid V1 key prefix or suffix length"));
+        }
         let key_suffix = &cursor[..key_suffix_len];
 
         // Reconstruct the full key from first_key prefix + suffix
-        let mut full_key = BytesMut::with_capacity(key_prefix_len + key_suffix_len);
-        full_key.extend_from_slice(&self.first_key[..key_prefix_len]);
+        let key_len = key_prefix_len
+            .checked_add(key_suffix_len)
+            .ok_or_else(|| corrupt_block("V1 key length overflow"))?;
+        let mut full_key = BytesMut::with_capacity(key_len);
+        full_key.extend_from_slice(&first_key[..key_prefix_len]);
         full_key.extend_from_slice(key_suffix);
         Ok(full_key.freeze())
     }
+}
+
+fn corrupt_block(reason: &'static str) -> SlateDBError {
+    SlateDBError::CorruptSst { reason, path: None }
 }
 
 #[cfg(test)]
@@ -622,7 +684,7 @@ mod tests {
         assert!(block_builder.add_value(b"prefix_bbb", b"2", None, None));
         assert!(block_builder.add_value(b"prefix_ccc", b"3", None, None));
         let block = block_builder.build().unwrap();
-        let iter = BlockIterator::new_ascending(&block);
+        let mut iter = BlockIterator::new_ascending(&block);
 
         // when: decoding keys at each index
         // then: full keys are correctly reconstructed

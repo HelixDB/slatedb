@@ -198,16 +198,22 @@ impl SstRowCodecV0 {
     }
 
     pub(crate) fn decode(&self, data: &mut Bytes) -> Result<SstRowEntry, SlateDBError> {
+        require_remaining(data, 4, "truncated V1 row key lengths")?;
         let key_prefix_len = data.get_u16() as usize;
         let key_suffix_len = data.get_u16() as usize;
+        require_remaining(data, key_suffix_len, "truncated V1 row key suffix")?;
         let key_suffix = data.slice(..key_suffix_len);
         data.advance(key_suffix_len);
 
         // decode seq & flags
+        require_remaining(data, 9, "truncated V1 row sequence or flags")?;
         let seq = data.get_u64();
         let flags = self.decode_flags(data.get_u8())?;
 
         // decode expire_ts & create_ts
+        let timestamp_bytes = usize::from(flags.contains(RowFlags::HAS_EXPIRE_TS)) * 8
+            + usize::from(flags.contains(RowFlags::HAS_CREATE_TS)) * 8;
+        require_remaining(data, timestamp_bytes, "truncated V1 row timestamp")?;
         let (expire_ts, create_ts) =
             if flags.contains(RowFlags::HAS_EXPIRE_TS | RowFlags::HAS_CREATE_TS) {
                 (Some(data.get_i64()), Some(data.get_i64()))
@@ -221,19 +227,25 @@ impl SstRowCodecV0 {
 
         // skip decoding value for tombstone.
         if flags.contains(RowFlags::TOMBSTONE) {
-            return Ok(SstRowEntry::new(
+            return Ok(SstRowEntry {
                 key_prefix_len,
                 key_suffix,
                 seq,
-                ValueDeletable::Tombstone,
                 create_ts,
-                None,
-            ));
+                // Tombstones historically discard expiry even if an old
+                // encoder wrote the flag and field. Preserve that V1
+                // decoding contract while still consuming and validating the
+                // encoded timestamp above.
+                expire_ts: None,
+                value: ValueDeletable::Tombstone,
+            });
         }
 
         // decode value
+        require_remaining(data, 4, "truncated V1 row value length")?;
         let value_len = data.get_u32() as usize;
-        let value = data.slice(..value_len);
+        require_remaining(data, value_len, "truncated V1 row value")?;
+        let value = data.split_to(value_len);
         Ok(SstRowEntry {
             key_prefix_len,
             key_suffix,
@@ -264,6 +276,17 @@ impl SstRowCodecV0 {
         }
         Ok(parsed)
     }
+}
+
+fn require_remaining(
+    data: &Bytes,
+    required: usize,
+    reason: &'static str,
+) -> Result<(), SlateDBError> {
+    if data.len() < required {
+        return Err(SlateDBError::CorruptSst { reason, path: None });
+    }
+    Ok(())
 }
 
 #[cfg(test)]

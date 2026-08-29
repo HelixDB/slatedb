@@ -3,7 +3,7 @@ use crate::format::row::{SstRowCodecV0, SstRowEntry};
 use crate::format::sst::{CHECKSUM_SIZE, OFFSET_SIZE};
 use crate::types::RowEntry;
 use crate::utils::clamp_allocated_size_bytes;
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 
 pub(crate) const SIZEOF_U16: usize = std::mem::size_of::<u16>();
 
@@ -26,23 +26,74 @@ impl Block {
     }
 
     #[rustfmt::skip]
-    pub(crate) fn decode(bytes: Bytes) -> Self {
-        // Get number of elements in the block
+    pub(crate) fn decode(bytes: Bytes) -> Result<Self, SlateDBError> {
+        Self::decode_with_memory_limit(bytes, usize::MAX)
+    }
+
+    pub(crate) fn decode_with_memory_limit(
+        bytes: Bytes,
+        memory_limit: usize,
+    ) -> Result<Self, SlateDBError> {
         let data = bytes.as_ref();
-        let entry_offsets_len = (&data[data.len() - SIZEOF_U16..]).get_u16() as usize;
-        let data_end = data.len()
-            - SIZEOF_U16                                            // Entry u16 length
-            - entry_offsets_len * SIZEOF_U16; // Offset byte array length
-        let offsets_raw = &data[data_end..data.len() - SIZEOF_U16]; // Entry u16
-        let offsets = offsets_raw
-            .chunks(SIZEOF_U16)
-            .map(|mut x| x.get_u16())
-            .collect();
-        let bytes = bytes.slice(0..data_end);
-        Self {
-            data: bytes,
-            offsets,
+        if data.len() < SIZEOF_U16 {
+            return Err(corrupt_block("block is missing its offset count"));
         }
+        let entry_offsets_len = u16::from_be_bytes(
+            data[data.len() - SIZEOF_U16..]
+                .try_into()
+                .map_err(|_| corrupt_block("invalid block offset count"))?,
+        ) as usize;
+        if entry_offsets_len == 0 {
+            return Err(SlateDBError::EmptyBlock);
+        }
+        let offsets_size = entry_offsets_len
+            .checked_mul(SIZEOF_U16)
+            .ok_or_else(|| corrupt_block("block offset table size overflow"))?;
+        let required_memory = data
+            .len()
+            .checked_add(offsets_size)
+            .ok_or_else(|| corrupt_block("decoded block memory size overflow"))?;
+        if required_memory > memory_limit {
+            return Err(SlateDBError::WalReplayMemoryLimitExceeded {
+                kind: "decoded WAL block",
+                required_bytes: required_memory,
+                limit_bytes: memory_limit,
+            });
+        }
+        let trailer_size = offsets_size
+            .checked_add(SIZEOF_U16)
+            .ok_or_else(|| corrupt_block("block trailer size overflow"))?;
+        let data_end = data
+            .len()
+            .checked_sub(trailer_size)
+            .ok_or_else(|| corrupt_block("block offset table exceeds block length"))?;
+        if data_end == 0 {
+            return Err(corrupt_block("block contains no row data"));
+        }
+        let offsets_raw = &data[data_end..data.len() - SIZEOF_U16];
+        let mut offsets = Vec::with_capacity(entry_offsets_len);
+        for raw in offsets_raw.chunks_exact(SIZEOF_U16) {
+            let offset = u16::from_be_bytes(
+                raw.try_into()
+                    .map_err(|_| corrupt_block("invalid block row offset"))?,
+            );
+            if usize::from(offset) >= data_end {
+                return Err(corrupt_block("block row offset is outside row data"));
+            }
+            if offsets.last().is_some_and(|previous| *previous >= offset) {
+                return Err(corrupt_block(
+                    "block row offsets are not strictly increasing",
+                ));
+            }
+            offsets.push(offset);
+        }
+        if offsets.first().copied() != Some(0) {
+            return Err(corrupt_block("first block row offset is not zero"));
+        }
+        Ok(Self {
+            data: bytes.slice(0..data_end),
+            offsets,
+        })
     }
 
     pub(crate) fn clamp_allocated_size(&self) -> Self {
@@ -71,6 +122,10 @@ impl Block {
         ans += CHECKSUM_SIZE * number_of_blocks;
         ans
     }
+}
+
+fn corrupt_block(reason: &'static str) -> SlateDBError {
+    SlateDBError::CorruptSst { reason, path: None }
 }
 
 pub(super) struct BlockBuilderV1 {
@@ -329,7 +384,7 @@ mod tests {
     fn test_block(#[case] test_case: BlockTestCase) {
         let block = build_block(&test_case);
         let encoded = block.encode();
-        let decoded = Block::decode(encoded);
+        let decoded = Block::decode(encoded).unwrap();
         let block_data = &block.data;
         let block_offsets = &block.offsets;
         // Decode the block data using offsets and validate each decoded entry
@@ -389,7 +444,7 @@ mod tests {
         extended_data.put(encoded.as_ref());
         extended_data.put_bytes(0u8, case.extra_bytes);
         let extended_data = extended_data.freeze();
-        let block_extended = Block::decode(extended_data.slice(..encoded.len()));
+        let block_extended = Block::decode(extended_data.slice(..encoded.len())).unwrap();
 
         let block_clamped = block_extended.clamp_allocated_size();
 

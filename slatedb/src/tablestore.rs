@@ -25,7 +25,10 @@ use crate::error::SlateDBError;
 use crate::filter_policy::NamedFilter;
 use crate::flatbuffer_types::SsTableIndexOwned;
 use crate::format::block::Block;
-use crate::format::sst::{EncodedSsTable, EncodedSsTableBlock, SsTableFormat, CHECKSUM_SIZE};
+use crate::format::sst::{
+    EncodedSsTable, EncodedSsTableBlock, SsTableFormat, CHECKSUM_SIZE, METADATA_OFFSET_SIZE,
+    VERSION_SIZE,
+};
 use crate::object_store_tag::ObjectStoreCallTag;
 pub(crate) use crate::object_store_tag::TableStoreKind;
 use crate::object_stores::{ObjectStoreType, ObjectStores};
@@ -51,10 +54,16 @@ pub(crate) struct TableStore {
 
 pub(crate) enum DecodedWalSst {
     Fence,
-    Data {
-        format_version: u16,
-        blocks: VecDeque<Block>,
-    },
+    Data(Box<DecodedWalSstData>),
+}
+
+pub(crate) struct DecodedWalSstData {
+    pub(crate) wal_id: u64,
+    pub(crate) format_version: u16,
+    pub(crate) object_bytes: Bytes,
+    pub(crate) info: SsTableInfo,
+    pub(crate) index: SsTableIndexOwned,
+    pub(crate) retained_decode_bytes: usize,
 }
 
 struct ReadOnlyObject {
@@ -371,6 +380,18 @@ impl TableStore {
         &self,
         wal_id: u64,
         expected_size: Option<u64>,
+        max_object_bytes: usize,
+    ) -> Result<Bytes, SlateDBError> {
+        self.read_wal_sst_bytes_with_retry(wal_id, expected_size, max_object_bytes, None)
+            .await
+    }
+
+    async fn read_wal_sst_bytes_with_retry(
+        &self,
+        wal_id: u64,
+        expected_size: Option<u64>,
+        max_object_bytes: usize,
+        retry: Option<crate::error::RetryReason>,
     ) -> Result<Bytes, SlateDBError> {
         let id = SsTableId::Wal(wal_id);
         let obj = ReadOnlyObject {
@@ -378,8 +399,10 @@ impl TableStore {
             path: self.path(&id),
             tag: ObjectStoreCallTag::new(self.kind, SstType::Wal),
         };
+        let mut tag = ObjectStoreCallTag::new(self.kind, SstType::Wal);
+        tag.retry = retry;
         let opts = GetOptions {
-            extensions: obj.extensions(),
+            extensions: tag.into(),
             ..GetOptions::default()
         };
         let result = obj
@@ -388,6 +411,20 @@ impl TableStore {
             .await
             .map_err(SlateDBError::from)
             .map_err(|err| err.with_path(&obj.path))?;
+        let response_size = usize::try_from(result.meta.size).map_err(|_| {
+            SlateDBError::WalReplayMemoryLimitExceeded {
+                kind: "encoded WAL object",
+                required_bytes: usize::MAX,
+                limit_bytes: max_object_bytes,
+            }
+        })?;
+        if response_size > max_object_bytes {
+            return Err(SlateDBError::WalReplayMemoryLimitExceeded {
+                kind: "encoded WAL object",
+                required_bytes: response_size,
+                limit_bytes: max_object_bytes,
+            });
+        }
         if expected_size.is_some_and(|expected| result.meta.size != expected) {
             return Err(invalid_wal_size(
                 &obj.path,
@@ -396,7 +433,7 @@ impl TableStore {
                 result.meta.size,
             ));
         }
-        let response_size = result.meta.size;
+        let response_size_u64 = result.meta.size;
         let bytes = result
             .bytes()
             .await
@@ -408,78 +445,123 @@ impl TableStore {
                 err,
             )))
         })?;
-        if actual_size != response_size {
+        if actual_size != response_size_u64 {
             return Err(invalid_wal_size(
                 &obj.path,
                 wal_id,
-                Some(response_size),
+                Some(response_size_u64),
                 actual_size,
             ));
         }
         Ok(bytes)
     }
 
-    /// Decodes a fully fetched WAL locally. A validation failure refetches the
-    /// complete object once before decoding again.
+    pub(crate) async fn refetch_wal_sst_after_validation(
+        &self,
+        wal_id: u64,
+        expected_size: usize,
+        max_object_bytes: usize,
+        working_memory_limit: usize,
+        reason: crate::error::RetryReason,
+    ) -> Result<DecodedWalSst, SlateDBError> {
+        let expected_size = u64::try_from(expected_size).map_err(|_| {
+            SlateDBError::WalReplayMemoryLimitExceeded {
+                kind: "encoded WAL object",
+                required_bytes: expected_size,
+                limit_bytes: max_object_bytes,
+            }
+        })?;
+        let bytes = self
+            .read_wal_sst_bytes_with_retry(
+                wal_id,
+                Some(expected_size),
+                max_object_bytes,
+                Some(reason),
+            )
+            .await?;
+        self.decode_wal_sst(wal_id, bytes, working_memory_limit)
+            .await
+    }
+
+    /// Decodes the metadata and index of a fully fetched WAL locally. Data
+    /// blocks are decoded lazily by [`Self::decode_wal_block`].
     pub(crate) async fn decode_wal_sst(
         &self,
         wal_id: u64,
         bytes: Bytes,
+        working_memory_limit: usize,
     ) -> Result<DecodedWalSst, SlateDBError> {
-        let id = SsTableId::Wal(wal_id);
-        let object_store = self.object_stores.store_for(&id);
-        let path = self.path(&id);
-        let sst_format = self.sst_format.clone();
-        let mut initial_bytes = Some(bytes);
+        let path = self.path(&SsTableId::Wal(wal_id));
+        if bytes.is_empty() {
+            return Ok(DecodedWalSst::Fence);
+        }
+        let blob = BytesBlob::new(bytes.clone());
+        let object_len = blob.len().await?;
+        let footer_size = METADATA_OFFSET_SIZE + VERSION_SIZE;
+        let footer_start = bytes
+            .len()
+            .checked_sub(footer_size)
+            .ok_or(SlateDBError::EmptySSTable)?;
+        let metadata_offset = u64::from_be_bytes(
+            bytes[footer_start..footer_start + METADATA_OFFSET_SIZE]
+                .try_into()
+                .map_err(|_| SlateDBError::EmptySSTable)?,
+        );
+        let (info, format_version) = self
+            .sst_format
+            .read_info_and_version(&blob)
+            .await
+            .map_err(|error| error.with_path(&path))?;
+        validate_wal_sst_info_layout(&info, object_len, metadata_offset, &path)?;
+        let index = self
+            .sst_format
+            .read_wal_index_bounded(&info, &blob, working_memory_limit)
+            .await
+            .map_err(|error| error.with_path(&path))?;
+        validate_wal_sst_index_layout(&info, &index, &path)?;
+        let retained_decode_bytes = index
+            .size()
+            .checked_add(info.first_entry.as_ref().map_or(0, Bytes::len))
+            .and_then(|size| size.checked_add(info.last_entry.as_ref().map_or(0, Bytes::len)))
+            .ok_or(SlateDBError::WalReplayMemoryLimitExceeded {
+                kind: "WAL metadata and index",
+                required_bytes: usize::MAX,
+                limit_bytes: working_memory_limit,
+            })?;
+        if retained_decode_bytes > working_memory_limit {
+            return Err(SlateDBError::WalReplayMemoryLimitExceeded {
+                kind: "WAL metadata and index",
+                required_bytes: retained_decode_bytes,
+                limit_bytes: working_memory_limit,
+            });
+        }
+        Ok(DecodedWalSst::Data(Box::new(DecodedWalSstData {
+            wal_id,
+            format_version,
+            object_bytes: bytes,
+            info,
+            index,
+            retained_decode_bytes,
+        })))
+    }
 
-        read_with_validation_retry(
-            ObjectStoreCallTag::new(self.kind, SstType::Wal),
-            move |tag| {
-                let object_store = Arc::clone(&object_store);
-                let path = path.clone();
-                let sst_format = sst_format.clone();
-                let bytes = initial_bytes.take();
-                async move {
-                    let bytes = match bytes {
-                        Some(bytes) => bytes,
-                        None => {
-                            let obj = ReadOnlyObject {
-                                object_store,
-                                path: path.clone(),
-                                tag,
-                            };
-                            obj.read().await.map_err(|err| err.with_path(&path))?
-                        }
-                    };
-                    if bytes.is_empty() {
-                        return Ok(DecodedWalSst::Fence);
-                    }
-
-                    let blob = BytesBlob::new(bytes);
-                    let object_len = blob.len().await?;
-                    let (info, format_version) = sst_format
-                        .read_info_and_version(&blob)
-                        .await
-                        .map_err(|err| err.with_path(&path))?;
-                    validate_wal_sst_info_layout(&info, object_len, &path)?;
-                    let index = sst_format
-                        .read_index(&info, &blob)
-                        .await
-                        .map_err(|err| err.with_path(&path))?;
-                    validate_wal_sst_index_layout(&info, &index, &path)?;
-                    let block_count = index.borrow().block_meta().len();
-                    let blocks = sst_format
-                        .read_blocks(&info, &index, 0..block_count, &blob)
-                        .await
-                        .map_err(|err| err.with_path(&path))?;
-                    Ok(DecodedWalSst::Data {
-                        format_version,
-                        blocks,
-                    })
-                }
-            },
-        )
-        .await
+    pub(crate) async fn decode_wal_block(
+        &self,
+        wal: &DecodedWalSstData,
+        block_index: usize,
+        working_memory_limit: usize,
+    ) -> Result<Block, SlateDBError> {
+        let path = self.path(&SsTableId::Wal(wal.wal_id));
+        self.sst_format
+            .decode_wal_block_from_object(
+                &wal.info,
+                &wal.index,
+                block_index,
+                &wal.object_bytes,
+                working_memory_limit,
+            )
+            .await
+            .map_err(|error| error.with_path(&path))
     }
 
     pub(crate) async fn next_wal_sst_id(
@@ -1274,6 +1356,7 @@ impl TableStore {
 fn validate_wal_sst_info_layout(
     info: &SsTableInfo,
     object_len: u64,
+    metadata_offset: u64,
     path: &Path,
 ) -> Result<(), SlateDBError> {
     for (name, offset, len) in [
@@ -1284,12 +1367,18 @@ fn validate_wal_sst_info_layout(
         let Some(end) = offset.checked_add(len) else {
             return Err(invalid_wal_layout(path, format!("{name} range overflow")));
         };
-        if end > object_len {
+        if end > metadata_offset {
             return Err(invalid_wal_layout(
                 path,
-                format!("{name} range {offset}..{end} exceeds object length {object_len}"),
+                format!("{name} range {offset}..{end} exceeds metadata offset {metadata_offset}"),
             ));
         }
+    }
+    if metadata_offset >= object_len {
+        return Err(invalid_wal_layout(
+            path,
+            format!("metadata offset {metadata_offset} reaches object length {object_len}"),
+        ));
     }
 
     let filter_end = info
@@ -1347,6 +1436,19 @@ fn validate_wal_sst_info_layout(
                 ),
             ));
         }
+    }
+    let data_end = if info.stats_len > 0 {
+        info.stats_offset
+            .checked_add(info.stats_len)
+            .ok_or_else(|| invalid_wal_layout(path, "stats range overflow".to_string()))?
+    } else {
+        index_end
+    };
+    if data_end != metadata_offset {
+        return Err(invalid_wal_layout(
+            path,
+            format!("last WAL section ends at {data_end}, metadata starts at {metadata_offset}"),
+        ));
     }
     Ok(())
 }
@@ -1650,7 +1752,7 @@ mod tests {
     use crate::types::{RowEntry, ValueDeletable};
     use crate::{
         block_iterator::BlockIteratorLatest,
-        db_state::{SsTableId, SsTableInfo},
+        db_state::{SsTableId, SsTableInfo, SstType},
         iter::RowEntryIterator,
     };
     use slatedb_common::clock::DefaultSystemClock;
@@ -1666,9 +1768,10 @@ mod tests {
             filter_len: 4,
             index_offset: 20,
             index_len: 8,
+            sst_type: SstType::Wal,
             ..SsTableInfo::default()
         };
-        assert!(validate_wal_sst_info_layout(&valid, 128, &path).is_ok());
+        assert!(validate_wal_sst_info_layout(&valid, 128, 28, &path).is_ok());
 
         let invalid = [
             SsTableInfo {
@@ -1702,10 +1805,11 @@ mod tests {
         ];
         for info in invalid {
             assert!(
-                validate_wal_sst_info_layout(&info, 128, &path).is_err(),
+                validate_wal_sst_info_layout(&info, 128, 28, &path).is_err(),
                 "invalid WAL layout was accepted: {info:?}"
             );
         }
+        assert!(validate_wal_sst_info_layout(&valid, 128, 29, &path).is_err());
     }
 
     #[tokio::test]

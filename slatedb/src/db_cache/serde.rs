@@ -102,7 +102,7 @@ impl SerializedCachedEntryV1 {
     fn into_cached_entry(self) -> Result<CachedEntry, SlateDBError> {
         let item = match self {
             SerializedCachedEntryV1::Block(encoded) => {
-                let block = Block::decode(encoded);
+                let block = Block::decode(encoded)?;
                 CachedItem::Block(Arc::new(block))
             }
             SerializedCachedEntryV1::SsTableIndex(encoded) => {
