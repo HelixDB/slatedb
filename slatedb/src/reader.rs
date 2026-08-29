@@ -21,6 +21,7 @@ use crate::types::{KeyValue, RowEntry, ValueDeletable};
 use crate::{error::SlateDBError, DbIterator};
 
 use bytes::Bytes;
+use smallvec::{smallvec, SmallVec};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
@@ -277,10 +278,6 @@ impl Reader {
             return Ok(Vec::new());
         }
 
-        let prepared_max_seq =
-            self.prepare_max_seq(max_seq, options.durability_filter, options.dirty);
-        let merge_operator_enabled = self.read_merge_operator.is_some();
-
         let mut key_to_idx = HashMap::<Bytes, usize>::with_capacity(keys.len());
         let mut unique_keys = Vec::<Bytes>::with_capacity(keys.len());
         let mut output_positions = Vec::<Vec<usize>>::with_capacity(keys.len());
@@ -297,13 +294,53 @@ impl Reader {
             output_positions.push(vec![output_idx]);
         }
 
-        let mut resolved = vec![false; unique_keys.len()];
-        let mut values = vec![None; unique_keys.len()];
-        let mut fallback_to_point_get = vec![false; unique_keys.len()];
+        let values = self
+            .resolve_unique_key_values(&unique_keys, options, db_state, max_seq)
+            .await?;
+
+        let mut result = vec![None; keys.len()];
+        for (key_idx, positions) in output_positions.into_iter().enumerate() {
+            for position in positions {
+                result[position] = values[key_idx].clone();
+            }
+        }
+
+        Ok(result)
+    }
+
+    pub(crate) async fn multi_get_unique_key_value_with_options(
+        &self,
+        keys: &[Bytes],
+        options: &ReadOptions,
+        db_state: &(dyn DbStateReader + Sync + Send),
+        max_seq: Option<u64>,
+    ) -> Result<Vec<Option<KeyValue>>, SlateDBError> {
+        self.db_stats.get_requests.increment(1);
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.resolve_unique_key_values(keys, options, db_state, max_seq)
+            .await
+    }
+
+    async fn resolve_unique_key_values(
+        &self,
+        unique_keys: &[Bytes],
+        options: &ReadOptions,
+        db_state: &(dyn DbStateReader + Sync + Send),
+        max_seq: Option<u64>,
+    ) -> Result<Vec<Option<KeyValue>>, SlateDBError> {
+        let prepared_max_seq =
+            self.prepare_max_seq(max_seq, options.durability_filter, options.dirty);
+        let merge_operator_enabled = self.read_merge_operator.is_some();
+
+        let mut resolved: SmallVec<[bool; 8]> = smallvec![false; unique_keys.len()];
+        let mut values: SmallVec<[Option<KeyValue>; 8]> = smallvec![None; unique_keys.len()];
+        let mut fallback_to_point_get: SmallVec<[bool; 8]> = smallvec![false; unique_keys.len()];
 
         self.resolve_rows_from_memtable_for_keys(
             db_state.memtable(),
-            &unique_keys,
+            unique_keys,
             prepared_max_seq,
             merge_operator_enabled,
             &mut resolved,
@@ -319,7 +356,7 @@ impl Reader {
 
             self.resolve_rows_from_memtable_for_keys(
                 imm.table(),
-                &unique_keys,
+                unique_keys,
                 prepared_max_seq,
                 merge_operator_enabled,
                 &mut resolved,
@@ -331,7 +368,7 @@ impl Reader {
 
         self.resolve_rows_from_segments_for_keys(
             db_state.core(),
-            &unique_keys,
+            unique_keys,
             prepared_max_seq,
             options,
             merge_operator_enabled,
@@ -358,20 +395,7 @@ impl Reader {
             resolved[key_idx] = true;
         }
 
-        let mut result = vec![None; keys.len()];
-        for (key_idx, positions) in output_positions.into_iter().enumerate() {
-            let value = if resolved[key_idx] {
-                values[key_idx].clone()
-            } else {
-                None
-            };
-
-            for position in positions {
-                result[position] = value.clone();
-            }
-        }
-
-        Ok(result)
+        Ok(values.into_vec())
     }
 
     fn all_done(resolved: &[bool], fallback_to_point_get: &[bool]) -> bool {

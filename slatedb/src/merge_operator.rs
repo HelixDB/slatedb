@@ -133,6 +133,23 @@ pub trait MergeOperator {
         self.merge_batch(key, existing_value, operands)
             .map(MergeResult::Value)
     }
+
+    /// Validates that `operands` can be merged with a fully resolved base.
+    ///
+    /// Checked disjoint writes call this hook before staging. The default
+    /// implementation resolves the merge and discards its result. Operators
+    /// may override it to avoid constructing an output value when decoding
+    /// the base and operands is sufficient to prove that the later merge
+    /// cannot fail.
+    fn validate_merge_with_base(
+        &self,
+        key: &Bytes,
+        existing_value: Option<Bytes>,
+        operands: &[Bytes],
+    ) -> Result<(), MergeOperatorError> {
+        self.merge_batch_with_base(key, existing_value, operands)
+            .map(|_| ())
+    }
 }
 
 pub(crate) type MergeOperatorType = Arc<dyn MergeOperator + Send + Sync>;
@@ -205,6 +222,16 @@ impl MergeOperator for InstrumentedMergeOperator {
             .merge_batch_with_base(key, existing_value, operands)?;
         self.merge_batch_operands.increment(operands.len() as u64);
         Ok(result)
+    }
+
+    fn validate_merge_with_base(
+        &self,
+        key: &Bytes,
+        existing_value: Option<Bytes>,
+        operands: &[Bytes],
+    ) -> Result<(), MergeOperatorError> {
+        self.merge_operator
+            .validate_merge_with_base(key, existing_value, operands)
     }
 }
 

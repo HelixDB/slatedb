@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
+use smallvec::{smallvec, SmallVec};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -19,6 +20,29 @@ use crate::reader::ScanContext;
 use crate::transaction_manager::{IsolationLevel, TransactionManager, TransactionWriteKind};
 use crate::types::KeyValue;
 use crate::{DbReadOps, DbTransactionOps};
+
+/// One owned, tokenized disjoint merge for checked batch staging.
+pub struct DisjointMergeBatchEntry {
+    key: Bytes,
+    operand: Bytes,
+    discriminators: DisjointMergeDiscriminators,
+}
+
+impl DisjointMergeBatchEntry {
+    /// Builds an entry without an intermediate token collection.
+    pub fn from_tokens<K, V, I>(key: K, tokens: I, operand: V) -> Self
+    where
+        K: Into<Bytes>,
+        V: Into<Bytes>,
+        I: IntoIterator<Item = u128>,
+    {
+        Self {
+            key: key.into(),
+            operand: operand.into(),
+            discriminators: DisjointMergeDiscriminators::from_tokens(tokens),
+        }
+    }
+}
 
 /// A database transaction that provides atomic read-write operations with
 /// configurable isolation levels. This is the main interface for transactional
@@ -334,6 +358,76 @@ impl DbTransaction {
         }
 
         Ok(result)
+    }
+
+    async fn multi_get_unique_key_value_with_options_untracked(
+        &self,
+        keys: &[Bytes],
+        options: &ReadOptions,
+    ) -> Result<Vec<Option<KeyValue>>, crate::Error> {
+        self.db_inner.check_closed()?;
+        let db_state = self.db_inner.state.read().view();
+        let mut resolved: SmallVec<[bool; 8]> = smallvec![false; keys.len()];
+        let mut values: SmallVec<[Option<KeyValue>; 8]> = smallvec![None; keys.len()];
+        let mut fallback_to_point_get: SmallVec<[bool; 8]> = smallvec![false; keys.len()];
+
+        {
+            let write_batch = self.write_batch.read();
+            for (key_idx, key) in keys.iter().enumerate() {
+                match write_batch.lookup_latest_for_key(key.as_ref()) {
+                    WriteBatchLookup::Put(value) => {
+                        resolved[key_idx] = true;
+                        values[key_idx] = Some(KeyValue {
+                            key: key.clone(),
+                            value,
+                            seq: u64::MAX,
+                            create_ts: 0,
+                            expire_ts: None,
+                        });
+                    }
+                    WriteBatchLookup::Delete => resolved[key_idx] = true,
+                    WriteBatchLookup::Merge => fallback_to_point_get[key_idx] = true,
+                    WriteBatchLookup::NotPresent => {}
+                }
+            }
+        }
+
+        let reader_key_indices = keys
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, _)| (!resolved[idx] && !fallback_to_point_get[idx]).then_some(idx))
+            .collect::<SmallVec<[usize; 8]>>();
+        if !reader_key_indices.is_empty() {
+            let reader_keys = reader_key_indices
+                .iter()
+                .map(|idx| keys[*idx].clone())
+                .collect::<SmallVec<[Bytes; 8]>>();
+            let reader_values = self
+                .db_inner
+                .reader
+                .multi_get_unique_key_value_with_options(
+                    &reader_keys,
+                    options,
+                    &db_state,
+                    Some(self.started_seq),
+                )
+                .await
+                .map_err(crate::Error::from)?;
+            for (key_idx, value) in reader_key_indices.into_iter().zip(reader_values) {
+                values[key_idx] = value;
+            }
+        }
+
+        for key_idx in fallback_to_point_get
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, should_fallback)| should_fallback.then_some(idx))
+        {
+            values[key_idx] = self
+                .get_key_value_with_options_inner(keys[key_idx].as_ref(), options, false)
+                .await?;
+        }
+        Ok(values.into_vec())
     }
 
     /// Scan a range of keys using the default scan options.
@@ -888,6 +982,61 @@ impl DbTransaction {
             .await
     }
 
+    /// Validates and atomically stages one tokenized disjoint merge per key.
+    ///
+    /// The transaction-visible rows are resolved in one batch without adding
+    /// SSI read dependencies. All rows and operands are validated before any
+    /// new operand is staged. Duplicate physical keys are rejected because a
+    /// batch must contain exactly one composed logical delta per row.
+    pub async fn merge_disjoint_checked_batch<M>(&self, merges: M) -> Result<(), crate::Error>
+    where
+        M: IntoIterator<Item = DisjointMergeBatchEntry>,
+    {
+        let mut keys = HashSet::new();
+        let mut prepared = SmallVec::<[DisjointMergeBatchEntry; 8]>::new();
+        for merge in merges {
+            if !keys.insert(merge.key.clone()) {
+                return Err(SlateDBError::DuplicateDisjointMergeKey { key: merge.key }.into());
+            }
+            prepared.push(merge);
+        }
+        if prepared.is_empty() {
+            return Ok(());
+        }
+
+        let merge_operator = self
+            .db_inner
+            .flush_merge_operator
+            .as_ref()
+            .ok_or(SlateDBError::MergeOperatorMissing)?;
+        let row_keys = prepared
+            .iter()
+            .map(|merge| merge.key.clone())
+            .collect::<SmallVec<[Bytes; 8]>>();
+        let existing_values = self
+            .multi_get_unique_key_value_with_options_untracked(&row_keys, &ReadOptions::default())
+            .await?;
+        for (merge, existing_value) in prepared.iter().zip(existing_values) {
+            merge_operator
+                .validate_merge_with_base(
+                    &merge.key,
+                    existing_value.map(|value| value.value),
+                    std::slice::from_ref(&merge.operand),
+                )
+                .map_err(SlateDBError::from)?;
+        }
+
+        let mut write_batch = self.write_batch.write();
+        for merge in prepared {
+            write_batch.merge_disjoint_with_discriminators(
+                merge.key,
+                merge.operand,
+                merge.discriminators,
+            );
+        }
+        Ok(())
+    }
+
     async fn validate_and_stage_disjoint(
         &self,
         key: Bytes,
@@ -904,7 +1053,7 @@ impl DbTransaction {
             .await?
             .map(|value| value.value);
         merge_operator
-            .merge_batch_with_base(&key, existing_value, std::slice::from_ref(&operand))
+            .validate_merge_with_base(&key, existing_value, std::slice::from_ref(&operand))
             .map_err(SlateDBError::from)?;
         self.write_batch
             .write()
@@ -1321,6 +1470,30 @@ mod tests {
             Ok(Bytes::copy_from_slice(
                 &existing.saturating_add(operand).to_le_bytes(),
             ))
+        }
+    }
+
+    struct RejectingValidationMergeOperator;
+
+    impl MergeOperator for RejectingValidationMergeOperator {
+        fn merge(
+            &self,
+            _key: &Bytes,
+            _existing_value: Option<Bytes>,
+            value: Bytes,
+        ) -> Result<Bytes, MergeOperatorError> {
+            Ok(value)
+        }
+
+        fn validate_merge_with_base(
+            &self,
+            _key: &Bytes,
+            _existing_value: Option<Bytes>,
+            _operands: &[Bytes],
+        ) -> Result<(), MergeOperatorError> {
+            Err(MergeOperatorError::Callback {
+                message: "validation hook rejected the merge".to_string(),
+            })
         }
     }
 
@@ -2874,6 +3047,139 @@ mod tests {
         composed.commit().await.unwrap();
         let value = db.get(b"composed").await.unwrap().unwrap();
         assert_eq!(u64::from_le_bytes(value.as_ref().try_into().unwrap()), 2);
+    }
+
+    #[tokio::test]
+    async fn checked_disjoint_merge_uses_operator_validation_hook() {
+        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = crate::Db::builder("checked_disjoint_validation_hook", object_store)
+            .with_merge_operator(Arc::new(RejectingValidationMergeOperator))
+            .build()
+            .await
+            .unwrap();
+        let transaction = db.begin(IsolationLevel::Snapshot).await.unwrap();
+
+        let error = transaction
+            .merge_disjoint_tokens_checked(b"members", [1], b"operand")
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("validation hook rejected"));
+        transaction.commit().await.unwrap();
+        assert_eq!(db.get(b"members").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn checked_disjoint_batch_is_unique_and_stages_only_after_full_validation() {
+        const INCREMENT: [u8; 8] = 1_u64.to_le_bytes();
+
+        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = crate::Db::builder("checked_disjoint_batch_atomicity", object_store)
+            .with_merge_operator(Arc::new(StrictCounterMergeOperator))
+            .build()
+            .await
+            .unwrap();
+        db.put(b"corrupt", b"bad").await.unwrap();
+
+        let invalid = db
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await
+            .unwrap();
+        assert!(invalid
+            .merge_disjoint_checked_batch([
+                DisjointMergeBatchEntry::from_tokens(
+                    Bytes::from_static(b"valid"),
+                    [1],
+                    Bytes::copy_from_slice(&INCREMENT),
+                ),
+                DisjointMergeBatchEntry::from_tokens(
+                    Bytes::from_static(b"corrupt"),
+                    [2],
+                    Bytes::copy_from_slice(&INCREMENT),
+                ),
+            ])
+            .await
+            .is_err());
+        invalid.commit().await.unwrap();
+        assert_eq!(db.get(b"valid").await.unwrap(), None);
+        assert_eq!(db.get(b"corrupt").await.unwrap().unwrap(), b"bad"[..]);
+
+        let duplicate = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let error = duplicate
+            .merge_disjoint_checked_batch([
+                DisjointMergeBatchEntry::from_tokens(
+                    Bytes::from_static(b"same"),
+                    [1],
+                    Bytes::copy_from_slice(&INCREMENT),
+                ),
+                DisjointMergeBatchEntry::from_tokens(
+                    Bytes::from_static(b"same"),
+                    [2],
+                    Bytes::copy_from_slice(&INCREMENT),
+                ),
+            ])
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::Invalid);
+        duplicate.commit().await.unwrap();
+        assert_eq!(db.get(b"same").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn checked_disjoint_batches_remain_concurrent_without_ssi_reads() {
+        const INCREMENT: [u8; 8] = 1_u64.to_le_bytes();
+
+        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = crate::Db::builder("checked_disjoint_batch_concurrency", object_store)
+            .with_merge_operator(Arc::new(StrictCounterMergeOperator))
+            .build()
+            .await
+            .unwrap();
+        let first = db
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await
+            .unwrap();
+        let second = db
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await
+            .unwrap();
+        first
+            .merge_disjoint_checked_batch([
+                DisjointMergeBatchEntry::from_tokens(
+                    Bytes::from_static(b"a"),
+                    [1],
+                    Bytes::copy_from_slice(&INCREMENT),
+                ),
+                DisjointMergeBatchEntry::from_tokens(
+                    Bytes::from_static(b"b"),
+                    [11],
+                    Bytes::copy_from_slice(&INCREMENT),
+                ),
+            ])
+            .await
+            .unwrap();
+        second
+            .merge_disjoint_checked_batch([
+                DisjointMergeBatchEntry::from_tokens(
+                    Bytes::from_static(b"a"),
+                    [2],
+                    Bytes::copy_from_slice(&INCREMENT),
+                ),
+                DisjointMergeBatchEntry::from_tokens(
+                    Bytes::from_static(b"b"),
+                    [12],
+                    Bytes::copy_from_slice(&INCREMENT),
+                ),
+            ])
+            .await
+            .unwrap();
+
+        first.commit().await.unwrap();
+        second.commit().await.unwrap();
+        for key in [b"a".as_slice(), b"b".as_slice()] {
+            let value = db.get(key).await.unwrap().unwrap();
+            assert_eq!(u64::from_le_bytes(value.as_ref().try_into().unwrap()), 2);
+        }
     }
 
     #[tokio::test]

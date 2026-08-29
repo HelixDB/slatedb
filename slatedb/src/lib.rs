@@ -53,7 +53,7 @@ pub use db_cache::CacheTarget;
 pub use db_iter::{DbIterator, DbRecencyIterator};
 pub use db_reader::{DbReader, DbReaderMode};
 pub use db_snapshot::DbSnapshot;
-pub use db_transaction::DbTransaction;
+pub use db_transaction::{DbTransaction, DisjointMergeBatchEntry};
 pub use error::{CloseReason, Error, ErrorCode, ErrorKind};
 pub use filter::BloomFilter;
 pub use filter_policy::{

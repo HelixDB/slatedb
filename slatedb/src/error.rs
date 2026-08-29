@@ -71,6 +71,9 @@ pub(crate) enum SlateDBError {
     #[allow(unused)]
     InvalidDeletion,
 
+    #[error("disjoint merge batch contains duplicate key {key:?}")]
+    DuplicateDisjointMergeKey { key: Bytes },
+
     #[error("invalid sst error")]
     InvalidFlatbuffer(#[from] flatbuffers::InvalidFlatbuffer),
 
@@ -736,6 +739,7 @@ impl From<SlateDBError> for Error {
             SlateDBError::EmptySegmentPrefix { .. } => Error::invalid(msg),
             SlateDBError::InvalidClockTick { .. } => Error::invalid(msg),
             SlateDBError::InvalidDeletion => Error::invalid(msg),
+            SlateDBError::DuplicateDisjointMergeKey { .. } => Error::invalid(msg),
             SlateDBError::MergeOperatorError(err) => Error::invalid(msg).with_source(Box::new(err)),
             SlateDBError::MergeOperatorMissing => Error::invalid(msg),
             SlateDBError::IncompatibleMergeTtls { .. } => Error::invalid(msg),

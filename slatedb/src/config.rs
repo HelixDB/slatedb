@@ -2161,11 +2161,9 @@ object_store_cache_options:
         let error = zero_transaction_limit
             .validate()
             .expect_err("zero transaction conflict metadata limit is invalid");
-        assert!(
-            error
-                .to_string()
-                .contains("max_transaction_conflict_metadata_bytes")
-        );
+        assert!(error
+            .to_string()
+            .contains("max_transaction_conflict_metadata_bytes"));
 
         let retained_below_transaction = Settings {
             max_transaction_conflict_metadata_bytes: 2,
@@ -2175,10 +2173,8 @@ object_store_cache_options:
         let error = retained_below_transaction
             .validate()
             .expect_err("retained conflict metadata limit cannot be below one transaction");
-        assert!(
-            error
-                .to_string()
-                .contains("max_retained_conflict_metadata_bytes")
-        );
+        assert!(error
+            .to_string()
+            .contains("max_retained_conflict_metadata_bytes"));
     }
 }
