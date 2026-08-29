@@ -2099,6 +2099,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_range_replay_rejects_large_index_before_fetching_it() {
+        let inner = Arc::new(InMemory::new());
+        let recording = Arc::new(RecordingObjectStore::new(inner));
+        let format = SsTableFormat {
+            block_size: 128,
+            ..SsTableFormat::default()
+        };
+        let table_store = test_table_store_with_format_and_object_store(format, recording.clone());
+        let mut builder = table_store.wal_table_builder();
+        for seq in 1..=1024 {
+            builder
+                .add(RowEntry::new_value(
+                    format!("large-index-{seq:04}-{}", "k".repeat(64)).as_bytes(),
+                    &[b'x'; 128],
+                    seq,
+                ))
+                .await
+                .unwrap();
+        }
+        let encoded = builder.build().await.unwrap();
+        let index_len = usize::try_from(encoded.info.index_len).unwrap();
+        let total_budget = 64 * 1024;
+        let metadata_memory_limit = total_budget / 8;
+        assert!(encoded.remaining_len() > total_budget * 3 / 4);
+        assert!(index_len > metadata_memory_limit);
+        assert!(encoded.unconsumed_blocks.len() > 100);
+        table_store
+            .write_sst(&SsTableId::Wal(1), &encoded)
+            .await
+            .unwrap();
+        recording.clear();
+
+        let mut replay = WalReplayIterator::range(
+            1..2,
+            &ManifestCore::new(),
+            WalReplayOptions {
+                prefetch: WalReplaySettings {
+                    max_concurrent_objects: 4,
+                    max_inflight_bytes: total_budget,
+                },
+                ..WalReplayOptions::default()
+            },
+            table_store,
+        )
+        .await
+        .unwrap();
+        let Err(error) = replay.next().await else {
+            panic!("oversized WAL index was not rejected");
+        };
+
+        assert!(matches!(
+            error,
+            SlateDBError::WalReplayMemoryLimitExceeded {
+                kind: "encoded and decoded WAL index",
+                ..
+            }
+        ));
+        assert!(
+            recording
+                .get_range_sizes()
+                .into_iter()
+                .all(|range_bytes| range_bytes <= metadata_memory_limit as u64),
+            "index validation must reject before the oversized index range GET"
+        );
+    }
+
+    #[tokio::test]
     async fn oversized_range_replay_supports_codecs_and_block_transformations() {
         let mut codecs = Vec::with_capacity(5);
         codecs.push(None);
