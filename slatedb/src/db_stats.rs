@@ -40,6 +40,12 @@ pub const SST_FILTER_NEGATIVE_COUNT: &str = db_stat_name!("sst_filter_negative_c
 ///   write_amp = (`WAL_FLUSH_BYTES` + `L0_FLUSH_BYTES` + `compactor::stats::BYTES_COMPACTED`)
 ///               / `MEMTABLE_WRITE_BYTES`
 pub const MEMTABLE_WRITE_BYTES: &str = db_stat_name!("memtable_write_bytes");
+pub const CONFLICT_METADATA_RETAINED_BYTES: &str =
+    db_stat_name!("conflict_metadata_retained_bytes");
+pub const CONFLICT_METADATA_RETAINED_TOKENS: &str =
+    db_stat_name!("conflict_metadata_retained_tokens");
+pub const CONFLICT_METADATA_QUOTA_REJECTIONS: &str =
+    db_stat_name!("conflict_metadata_quota_rejections");
 pub const READER_WAL_REPLAY_SSTS: &str = db_stat_name!("reader_wal_replay_ssts");
 pub const READER_WAL_REPLAY_BYTES: &str = db_stat_name!("reader_wal_replay_bytes");
 pub const READER_WAL_REPLAY_BATCHES: &str = db_stat_name!("reader_wal_replay_batches");
@@ -81,6 +87,9 @@ pub(crate) struct DbStatsInner {
     pub(crate) merge_operator_read_operands: Arc<dyn CounterFn>,
     pub(crate) merge_operator_flush_operands: Arc<dyn CounterFn>,
     pub(crate) memtable_write_bytes: Arc<dyn CounterFn>,
+    pub(crate) conflict_metadata_retained_bytes: Arc<dyn GaugeFn>,
+    pub(crate) conflict_metadata_retained_tokens: Arc<dyn GaugeFn>,
+    pub(crate) conflict_metadata_quota_rejections: Arc<dyn CounterFn>,
     pub(crate) reader_wal_replay_ssts: Arc<dyn CounterFn>,
     pub(crate) reader_wal_replay_bytes: Arc<dyn CounterFn>,
     pub(crate) reader_wal_replay_batches: Arc<dyn CounterFn>,
@@ -173,6 +182,15 @@ impl DbStats {
                 .description(MERGE_OPERATOR_OPERANDS_DESCRIPTION)
                 .register(),
             memtable_write_bytes: recorder.counter(MEMTABLE_WRITE_BYTES).register(),
+            conflict_metadata_retained_bytes: recorder
+                .gauge(CONFLICT_METADATA_RETAINED_BYTES)
+                .register(),
+            conflict_metadata_retained_tokens: recorder
+                .gauge(CONFLICT_METADATA_RETAINED_TOKENS)
+                .register(),
+            conflict_metadata_quota_rejections: recorder
+                .counter(CONFLICT_METADATA_QUOTA_REJECTIONS)
+                .register(),
             reader_wal_replay_ssts: recorder.counter(READER_WAL_REPLAY_SSTS).register(),
             reader_wal_replay_bytes: recorder.counter(READER_WAL_REPLAY_BYTES).register(),
             reader_wal_replay_batches: recorder.counter(READER_WAL_REPLAY_BATCHES).register(),

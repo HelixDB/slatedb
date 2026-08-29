@@ -297,6 +297,11 @@ pub(crate) enum SlateDBError {
     #[error("transaction conflict")]
     TransactionConflict,
 
+    #[error(
+        "transaction conflict metadata limit exceeded: requested={requested} bytes, limit={limit} bytes"
+    )]
+    ConflictMetadataLimitExceeded { requested: usize, limit: usize },
+
     #[error("iterator not initialized")]
     IteratorNotInitialized,
 
@@ -506,6 +511,9 @@ pub enum ErrorKind {
 pub enum ErrorCode {
     /// A reader cannot open because no database manifest exists.
     DatabaseMissing,
+
+    /// Transaction conflict metadata exceeded its configured hard limit.
+    ConflictMetadataLimitExceeded,
 }
 
 impl From<ErrorKind> for CloseReason {
@@ -731,6 +739,9 @@ impl From<SlateDBError> for Error {
             SlateDBError::MergeOperatorError(err) => Error::invalid(msg).with_source(Box::new(err)),
             SlateDBError::MergeOperatorMissing => Error::invalid(msg),
             SlateDBError::IncompatibleMergeTtls { .. } => Error::invalid(msg),
+            SlateDBError::ConflictMetadataLimitExceeded { .. } => {
+                Error::invalid(msg).with_code(ErrorCode::ConflictMetadataLimitExceeded)
+            }
             SlateDBError::IteratorNotInitialized => Error::invalid(msg),
             SlateDBError::InvalidSequenceOrder { .. } => Error::invalid(msg),
             SlateDBError::InvalidEnvironmentVariable { .. } => Error::invalid(msg),

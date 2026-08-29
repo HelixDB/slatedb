@@ -4,7 +4,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::batch::{MergeConflictKind, WriteBatch, WriteBatchIterator, WriteBatchLookup};
+use crate::batch::{
+    DisjointMergeDiscriminators, MergeConflictKind, WriteBatch, WriteBatchIterator,
+    WriteBatchLookup,
+};
 use crate::bytes_range::{ByteRangeBounds, BytesRange};
 use crate::config::{MergeOptions, PutOptions, ReadOptions, ScanOptions, WriteOptions};
 use crate::db::DbInner;
@@ -139,10 +142,20 @@ impl DbTransaction {
         key: K,
         options: &ReadOptions,
     ) -> Result<Option<KeyValue>, crate::Error> {
+        self.get_key_value_with_options_inner(key, options, true)
+            .await
+    }
+
+    async fn get_key_value_with_options_inner<K: AsRef<[u8]> + Send>(
+        &self,
+        key: K,
+        options: &ReadOptions,
+        track_read: bool,
+    ) -> Result<Option<KeyValue>, crate::Error> {
         self.db_inner.check_closed()?;
 
         // Track read key for SSI conflict detection if needed
-        if self.isolation_level == IsolationLevel::SerializableSnapshot {
+        if track_read && self.isolation_level == IsolationLevel::SerializableSnapshot {
             let key_bytes = Bytes::copy_from_slice(key.as_ref());
             let mut read_keys = HashSet::new();
             read_keys.insert(key_bytes);
@@ -825,6 +838,80 @@ impl DbTransaction {
         Ok(())
     }
 
+    /// Validates and buffers a disjoint merge without registering a read
+    /// dependency for the physical key.
+    ///
+    /// Validation resolves the transaction snapshot together with all earlier
+    /// batch-local operations for `key`, then applies `operand` through the
+    /// configured merge operator. The result is discarded and the operand is
+    /// staged only when resolution succeeds. Concurrent ordinary writes still
+    /// conflict at commit, while valid disjoint writes retain their logical
+    /// member compatibility.
+    ///
+    /// Disjoint merges never expire. Callers that need TTL semantics must use
+    /// an exclusive merge with explicit [`MergeOptions`].
+    pub async fn merge_disjoint_checked<K, V, D, I>(
+        &self,
+        key: K,
+        discriminators: I,
+        operand: V,
+    ) -> Result<(), crate::Error>
+    where
+        K: AsRef<[u8]> + Send,
+        V: AsRef<[u8]> + Send,
+        D: AsRef<[u8]>,
+        I: IntoIterator<Item = D>,
+    {
+        let key = Bytes::copy_from_slice(key.as_ref());
+        let operand = Bytes::copy_from_slice(operand.as_ref());
+        let discriminators = DisjointMergeDiscriminators::from_bytes(discriminators);
+        self.validate_and_stage_disjoint(key, operand, discriminators)
+            .await
+    }
+
+    /// Fixed-width equivalent of [`Self::merge_disjoint_checked`].
+    pub async fn merge_disjoint_tokens_checked<K, V, I>(
+        &self,
+        key: K,
+        tokens: I,
+        operand: V,
+    ) -> Result<(), crate::Error>
+    where
+        K: AsRef<[u8]> + Send,
+        V: AsRef<[u8]> + Send,
+        I: IntoIterator<Item = u128>,
+    {
+        let key = Bytes::copy_from_slice(key.as_ref());
+        let operand = Bytes::copy_from_slice(operand.as_ref());
+        let discriminators = DisjointMergeDiscriminators::from_tokens(tokens);
+        self.validate_and_stage_disjoint(key, operand, discriminators)
+            .await
+    }
+
+    async fn validate_and_stage_disjoint(
+        &self,
+        key: Bytes,
+        operand: Bytes,
+        discriminators: DisjointMergeDiscriminators,
+    ) -> Result<(), crate::Error> {
+        let merge_operator = self
+            .db_inner
+            .flush_merge_operator
+            .as_ref()
+            .ok_or(SlateDBError::MergeOperatorMissing)?;
+        let existing_value = self
+            .get_key_value_with_options_inner(&key, &ReadOptions::default(), false)
+            .await?
+            .map(|value| value.value);
+        merge_operator
+            .merge_batch_with_base(&key, existing_value, std::slice::from_ref(&operand))
+            .map_err(SlateDBError::from)?;
+        self.write_batch
+            .write()
+            .merge_disjoint_with_discriminators(key, operand, discriminators);
+        Ok(())
+    }
+
     /// Merge a key-value pair into the transaction with custom options.
     ///
     /// ## Errors
@@ -951,7 +1038,8 @@ impl DbTransaction {
                 })
                 .collect()
         };
-        self.txn_manager.track_writes(&self.txn_id, &tracked_writes);
+        self.txn_manager
+            .track_writes(&self.txn_id, &tracked_writes)?;
 
         // Submit the WriteBatch to the database for processing. The batch is sent to a
         // dedicated background task (in batch_write.rs) that processes all WriteBatches
@@ -1205,6 +1293,34 @@ mod tests {
                 total += u64::from_le_bytes(operand.as_ref().try_into().unwrap());
             }
             Ok(Bytes::copy_from_slice(&total.to_le_bytes()))
+        }
+    }
+
+    struct StrictCounterMergeOperator;
+
+    impl MergeOperator for StrictCounterMergeOperator {
+        fn merge(
+            &self,
+            _key: &Bytes,
+            existing_value: Option<Bytes>,
+            value: Bytes,
+        ) -> Result<Bytes, MergeOperatorError> {
+            let decode = |bytes: &Bytes| {
+                <[u8; 8]>::try_from(bytes.as_ref())
+                    .map(u64::from_le_bytes)
+                    .map_err(|_| MergeOperatorError::Callback {
+                        message: "counter values and operands must be eight bytes".to_string(),
+                    })
+            };
+            let existing = existing_value
+                .as_ref()
+                .map(decode)
+                .transpose()?
+                .unwrap_or(0);
+            let operand = decode(&value)?;
+            Ok(Bytes::copy_from_slice(
+                &existing.saturating_add(operand).to_le_bytes(),
+            ))
         }
     }
 
@@ -2706,6 +2822,175 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checked_disjoint_merge_rejects_corrupt_snapshot_and_pending_values() {
+        const INCREMENT: [u8; 8] = 1_u64.to_le_bytes();
+
+        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = crate::Db::builder("checked_disjoint_corruption", object_store)
+            .with_merge_operator(Arc::new(StrictCounterMergeOperator))
+            .build()
+            .await
+            .unwrap();
+        db.put(b"persisted", b"corrupt").await.unwrap();
+
+        let persisted = db
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await
+            .unwrap();
+        assert!(persisted
+            .merge_disjoint_tokens_checked(b"persisted", [1], INCREMENT)
+            .await
+            .is_err());
+        persisted.rollback();
+        assert_eq!(db.get(b"persisted").await.unwrap().unwrap(), b"corrupt"[..]);
+
+        let pending = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        pending.put(b"pending", b"corrupt").unwrap();
+        assert!(pending
+            .merge_disjoint_tokens_checked(b"pending", [2], INCREMENT)
+            .await
+            .is_err());
+        pending.rollback();
+        assert_eq!(db.get(b"pending").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn checked_disjoint_merges_remain_concurrent_without_ssi_read_conflicts() {
+        const INCREMENT: [u8; 8] = 1_u64.to_le_bytes();
+
+        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = crate::Db::builder("checked_disjoint_concurrency", object_store)
+            .with_merge_operator(Arc::new(StrictCounterMergeOperator))
+            .build()
+            .await
+            .unwrap();
+        let first = db
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await
+            .unwrap();
+        let second = db
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await
+            .unwrap();
+        first
+            .merge_disjoint_tokens_checked(b"members", [1], INCREMENT)
+            .await
+            .unwrap();
+        second
+            .merge_disjoint_tokens_checked(b"members", [2], INCREMENT)
+            .await
+            .unwrap();
+        first.commit().await.unwrap();
+        second.commit().await.unwrap();
+
+        let value = db.get(b"members").await.unwrap().unwrap();
+        assert_eq!(u64::from_le_bytes(value.as_ref().try_into().unwrap()), 2);
+    }
+
+    #[tokio::test]
+    async fn disjoint_merges_ignore_database_default_ttl() {
+        use slatedb_common::clock::MockSystemClock;
+
+        const INCREMENT: [u8; 8] = 1_u64.to_le_bytes();
+        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let clock = Arc::new(MockSystemClock::new());
+        let settings = crate::config::Settings {
+            default_ttl: Some(10),
+            ..Default::default()
+        };
+        let db = crate::Db::builder("disjoint_no_default_ttl", object_store)
+            .with_settings(settings)
+            .with_system_clock(clock.clone())
+            .with_merge_operator(Arc::new(StrictCounterMergeOperator))
+            .build()
+            .await
+            .unwrap();
+
+        clock.set(100);
+        let checked = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        checked
+            .merge_disjoint_tokens_checked(b"checked", [1], INCREMENT)
+            .await
+            .unwrap();
+        checked
+            .commit_with_options(&WriteOptions {
+                await_durable: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let unchecked = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        unchecked
+            .merge_disjoint_tokens(b"unchecked", [2], INCREMENT)
+            .unwrap();
+        unchecked
+            .commit_with_options(&WriteOptions {
+                await_durable: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        clock.set(1_000);
+        assert!(db.get(b"checked").await.unwrap().is_some());
+        assert!(db.get(b"unchecked").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn disjoint_conflict_metadata_limits_reject_before_writing_and_recycle() {
+        const INCREMENT: [u8; 8] = 1_u64.to_le_bytes();
+        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let settings = crate::config::Settings {
+            max_transaction_conflict_metadata_bytes: core::mem::size_of::<u128>(),
+            max_retained_conflict_metadata_bytes: 2 * core::mem::size_of::<u128>(),
+            ..Default::default()
+        };
+        let db = crate::Db::builder("disjoint_metadata_limits", object_store)
+            .with_settings(settings)
+            .with_merge_operator(Arc::new(StrictCounterMergeOperator))
+            .build()
+            .await
+            .unwrap();
+
+        let old = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        for (key, token) in [(b"first".as_slice(), 1), (b"second".as_slice(), 2)] {
+            let txn = db.begin(IsolationLevel::Snapshot).await.unwrap();
+            txn.merge_disjoint_tokens(key, [token], INCREMENT).unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        let rejected = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        rejected
+            .merge_disjoint_tokens(b"rejected", [3], INCREMENT)
+            .unwrap();
+        let error = rejected.commit().await.unwrap_err();
+        assert_eq!(
+            error.code(),
+            Some(crate::ErrorCode::ConflictMetadataLimitExceeded)
+        );
+        assert_eq!(db.get(b"rejected").await.unwrap(), None);
+
+        old.rollback();
+        let recycled = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        recycled
+            .merge_disjoint_tokens(b"recycled", [4], INCREMENT)
+            .unwrap();
+        recycled.commit().await.unwrap();
+        assert!(db.get(b"recycled").await.unwrap().is_some());
+
+        let oversized = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        oversized
+            .merge_disjoint_tokens(b"oversized", [5, 6], INCREMENT)
+            .unwrap();
+        let error = oversized.commit().await.unwrap_err();
+        assert_eq!(
+            error.code(),
+            Some(crate::ErrorCode::ConflictMetadataLimitExceeded)
+        );
+        assert_eq!(db.get(b"oversized").await.unwrap(), None);
+    }
+
+    #[tokio::test]
     async fn test_disjoint_merges_conflict_on_overlapping_discriminator() {
         const INCREMENT: [u8; 8] = 1u64.to_le_bytes();
 
@@ -3131,6 +3416,10 @@ mod tests {
             garbage_collector_options: None,
             metric_level: MetricLevel::default(),
             default_ttl: None,
+            max_transaction_conflict_metadata_bytes:
+                crate::config::DEFAULT_MAX_TRANSACTION_CONFLICT_METADATA_BYTES,
+            max_retained_conflict_metadata_bytes:
+                crate::config::DEFAULT_MAX_RETAINED_CONFLICT_METADATA_BYTES,
             object_store_max_retries: None,
             block_format: None,
         }

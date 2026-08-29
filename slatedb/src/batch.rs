@@ -4,14 +4,13 @@
 //! collection of write operations (puts and/or deletes) that are applied
 //! atomically to the database.
 
-use crate::config::{MergeOptions, PutOptions};
+use crate::config::{MergeOptions, PutOptions, Ttl};
 use crate::db_common::extract_segment_prefix;
 use crate::error::SlateDBError;
 use crate::iter::{IterationOrder, RowEntryIterator};
 use crate::merge_operator::{MergeOperatorIterator, MergeOperatorType};
 use crate::prefix_extractor::PrefixExtractor;
 use crate::types::{RowEntry, ValueDeletable};
-use ahash::AHashSet;
 use async_trait::async_trait;
 use bytes::Bytes;
 use smallvec::{smallvec, SmallVec};
@@ -27,7 +26,7 @@ const INLINE_MERGE_DISCRIMINATOR_LEN: usize = 16;
 /// Graph membership discriminators are eight or nine bytes, so they remain
 /// inline. Longer opaque discriminators retain the public API contract and
 /// spill through `SmallVec` only when required.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct MergeDiscriminator(SmallVec<[u8; INLINE_MERGE_DISCRIMINATOR_LEN]>);
 
 /// A non-empty, immutable discriminator set shared between batch and
@@ -37,8 +36,8 @@ pub(crate) struct DisjointMergeDiscriminators(DisjointMergeDiscriminatorSet);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum DisjointMergeDiscriminatorSet {
-    Bytes(Arc<AHashSet<MergeDiscriminator>>),
-    Tokens(Arc<AHashSet<u128>>),
+    Bytes(Arc<[MergeDiscriminator]>),
+    Tokens(Arc<[u128]>),
 }
 
 impl DisjointMergeDiscriminators {
@@ -47,7 +46,7 @@ impl DisjointMergeDiscriminators {
         D: AsRef<[u8]>,
         I: IntoIterator<Item = D>,
     {
-        let discriminators = discriminators
+        let mut discriminators = discriminators
             .into_iter()
             .map(|discriminator| {
                 let discriminator = discriminator.as_ref();
@@ -57,23 +56,25 @@ impl DisjointMergeDiscriminators {
                 );
                 MergeDiscriminator(SmallVec::from_slice(discriminator))
             })
-            .collect::<AHashSet<_>>();
+            .collect::<Vec<_>>();
         assert!(
             !discriminators.is_empty(),
             "disjoint merge discriminators cannot be empty"
         );
-        Self(DisjointMergeDiscriminatorSet::Bytes(Arc::new(
-            discriminators,
-        )))
+        discriminators.sort_unstable();
+        discriminators.dedup();
+        Self(DisjointMergeDiscriminatorSet::Bytes(discriminators.into()))
     }
 
     pub(crate) fn from_tokens(tokens: impl IntoIterator<Item = u128>) -> Self {
-        let tokens = tokens.into_iter().collect::<AHashSet<_>>();
+        let mut tokens = tokens.into_iter().collect::<Vec<_>>();
         assert!(
             !tokens.is_empty(),
             "disjoint merge discriminators cannot be empty"
         );
-        Self(DisjointMergeDiscriminatorSet::Tokens(Arc::new(tokens)))
+        tokens.sort_unstable();
+        tokens.dedup();
+        Self(DisjointMergeDiscriminatorSet::Tokens(tokens.into()))
     }
 
     fn extend(&mut self, newer: Self) -> bool {
@@ -82,14 +83,14 @@ impl DisjointMergeDiscriminators {
                 DisjointMergeDiscriminatorSet::Bytes(existing),
                 DisjointMergeDiscriminatorSet::Bytes(newer),
             ) => {
-                Arc::make_mut(existing).extend(Arc::unwrap_or_clone(newer));
+                *existing = merge_sorted(existing, &newer).into();
                 true
             }
             (
                 DisjointMergeDiscriminatorSet::Tokens(existing),
                 DisjointMergeDiscriminatorSet::Tokens(newer),
             ) => {
-                Arc::make_mut(existing).extend(Arc::unwrap_or_clone(newer));
+                *existing = merge_sorted(existing, &newer).into();
                 true
             }
             (DisjointMergeDiscriminatorSet::Bytes(_), DisjointMergeDiscriminatorSet::Tokens(_))
@@ -105,14 +106,14 @@ impl DisjointMergeDiscriminators {
                 DisjointMergeDiscriminatorSet::Bytes(existing),
                 DisjointMergeDiscriminatorSet::Bytes(newer),
             ) => {
-                Arc::make_mut(existing).extend(newer.iter().cloned());
+                *existing = merge_sorted(existing, newer).into();
                 true
             }
             (
                 DisjointMergeDiscriminatorSet::Tokens(existing),
                 DisjointMergeDiscriminatorSet::Tokens(newer),
             ) => {
-                Arc::make_mut(existing).extend(newer.iter().copied());
+                *existing = merge_sorted(existing, newer).into();
                 true
             }
             (DisjointMergeDiscriminatorSet::Bytes(_), DisjointMergeDiscriminatorSet::Tokens(_))
@@ -127,15 +128,33 @@ impl DisjointMergeDiscriminators {
             (
                 DisjointMergeDiscriminatorSet::Bytes(current),
                 DisjointMergeDiscriminatorSet::Bytes(other),
-            ) => current.is_disjoint(other),
+            ) => sorted_slices_are_disjoint(current, other),
             (
                 DisjointMergeDiscriminatorSet::Tokens(current),
                 DisjointMergeDiscriminatorSet::Tokens(other),
-            ) => current.is_disjoint(other),
+            ) => sorted_slices_are_disjoint(current, other),
             (DisjointMergeDiscriminatorSet::Bytes(_), DisjointMergeDiscriminatorSet::Tokens(_))
             | (DisjointMergeDiscriminatorSet::Tokens(_), DisjointMergeDiscriminatorSet::Bytes(_)) => {
                 false
             }
+        }
+    }
+
+    pub(crate) fn payload_bytes(&self) -> usize {
+        match &self.0 {
+            DisjointMergeDiscriminatorSet::Bytes(discriminators) => {
+                discriminators.iter().map(|value| value.0.len()).sum()
+            }
+            DisjointMergeDiscriminatorSet::Tokens(tokens) => {
+                tokens.len() * core::mem::size_of::<u128>()
+            }
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        match &self.0 {
+            DisjointMergeDiscriminatorSet::Bytes(discriminators) => discriminators.len(),
+            DisjointMergeDiscriminatorSet::Tokens(tokens) => tokens.len(),
         }
     }
 
@@ -158,6 +177,43 @@ impl DisjointMergeDiscriminators {
             DisjointMergeDiscriminatorSet::Tokens(tokens) => Arc::strong_count(tokens),
         }
     }
+}
+
+fn merge_sorted<T: Clone + Ord>(left: &[T], right: &[T]) -> Vec<T> {
+    let mut merged = Vec::with_capacity(left.len() + right.len());
+    let (mut left_index, mut right_index) = (0, 0);
+    while left_index < left.len() && right_index < right.len() {
+        match left[left_index].cmp(&right[right_index]) {
+            std::cmp::Ordering::Less => {
+                merged.push(left[left_index].clone());
+                left_index += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                merged.push(left[left_index].clone());
+                left_index += 1;
+                right_index += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                merged.push(right[right_index].clone());
+                right_index += 1;
+            }
+        }
+    }
+    merged.extend_from_slice(&left[left_index..]);
+    merged.extend_from_slice(&right[right_index..]);
+    merged
+}
+
+fn sorted_slices_are_disjoint<T: Ord>(left: &[T], right: &[T]) -> bool {
+    let (mut left_index, mut right_index) = (0, 0);
+    while left_index < left.len() && right_index < right.len() {
+        match left[left_index].cmp(&right[right_index]) {
+            std::cmp::Ordering::Less => left_index += 1,
+            std::cmp::Ordering::Equal => return false,
+            std::cmp::Ordering::Greater => right_index += 1,
+        }
+    }
+    true
 }
 
 /// A batch of write operations (puts, deletes, and merges). All operations in
@@ -441,13 +497,10 @@ impl WriteBatch {
         D: AsRef<[u8]>,
         I: IntoIterator<Item = D>,
     {
-        self.merge_with_conflict_kind(
+        self.merge_disjoint_with_discriminators(
             key,
             value,
-            &MergeOptions::default(),
-            Some(MergeConflictKind::Disjoint(
-                DisjointMergeDiscriminators::from_bytes(discriminators),
-            )),
+            DisjointMergeDiscriminators::from_bytes(discriminators),
         );
     }
 
@@ -457,13 +510,27 @@ impl WriteBatch {
         V: AsRef<[u8]>,
         I: IntoIterator<Item = u128>,
     {
+        self.merge_disjoint_with_discriminators(
+            key,
+            value,
+            DisjointMergeDiscriminators::from_tokens(tokens),
+        );
+    }
+
+    pub(crate) fn merge_disjoint_with_discriminators<K, V>(
+        &mut self,
+        key: K,
+        value: V,
+        discriminators: DisjointMergeDiscriminators,
+    ) where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
         self.merge_with_conflict_kind(
             key,
             value,
-            &MergeOptions::default(),
-            Some(MergeConflictKind::Disjoint(
-                DisjointMergeDiscriminators::from_tokens(tokens),
-            )),
+            &MergeOptions { ttl: Ttl::NoExpiry },
+            Some(MergeConflictKind::Disjoint(discriminators)),
         );
     }
 

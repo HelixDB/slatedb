@@ -617,6 +617,17 @@ pub struct CheckpointOptions {
 /// Setting both will result in an error.
 ///
 /// For backward compatibility, DBOptions is a type alias for Settings.
+pub(crate) const DEFAULT_MAX_TRANSACTION_CONFLICT_METADATA_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const DEFAULT_MAX_RETAINED_CONFLICT_METADATA_BYTES: usize = 256 * 1024 * 1024;
+
+const fn default_max_transaction_conflict_metadata_bytes() -> usize {
+    DEFAULT_MAX_TRANSACTION_CONFLICT_METADATA_BYTES
+}
+
+const fn default_max_retained_conflict_metadata_bytes() -> usize {
+    DEFAULT_MAX_RETAINED_CONFLICT_METADATA_BYTES
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 pub struct Settings {
     /// How frequently to flush the write-ahead log to object storage.
@@ -771,6 +782,15 @@ pub struct Settings {
     /// Default: no TTL (insertions will remain until deleted)
     pub default_ttl: Option<u64>,
 
+    /// Maximum logical-discriminator payload retained by one transaction.
+    #[serde(default = "default_max_transaction_conflict_metadata_bytes")]
+    pub max_transaction_conflict_metadata_bytes: usize,
+
+    /// Maximum logical-discriminator payload retained across active and
+    /// recently committed transactions.
+    #[serde(default = "default_max_retained_conflict_metadata_bytes")]
+    pub max_retained_conflict_metadata_bytes: usize,
+
     /// Maximum number of wrapper-level retries for a single object-store
     /// operation, on top of the `object_store` client's own HTTP retries.
     /// Applies to both foreground (user API) and background-task operations,
@@ -819,7 +839,15 @@ impl std::fmt::Debug for Settings {
             )
             .field("garbage_collector_options", &self.garbage_collector_options)
             .field("metric_level", &self.metric_level)
-            .field("default_ttl", &self.default_ttl);
+            .field("default_ttl", &self.default_ttl)
+            .field(
+                "max_transaction_conflict_metadata_bytes",
+                &self.max_transaction_conflict_metadata_bytes,
+            )
+            .field(
+                "max_retained_conflict_metadata_bytes",
+                &self.max_retained_conflict_metadata_bytes,
+            );
         data.finish()
     }
 }
@@ -858,6 +886,19 @@ impl Settings {
                 "max_unflushed_bytes ({}) must be greater than l0_sst_size_bytes ({})",
                 self.max_unflushed_bytes, self.l0_sst_size_bytes,
             ))
+            .into());
+        }
+        if self.max_transaction_conflict_metadata_bytes == 0 {
+            return Err(SlateDBError::InvalidConfiguration(
+                "max_transaction_conflict_metadata_bytes must be at least 1".into(),
+            )
+            .into());
+        }
+        if self.max_retained_conflict_metadata_bytes < self.max_transaction_conflict_metadata_bytes
+        {
+            return Err(SlateDBError::InvalidConfiguration(
+                "max_retained_conflict_metadata_bytes must be greater than or equal to max_transaction_conflict_metadata_bytes".into(),
+            )
             .into());
         }
         Ok(())
@@ -1050,6 +1091,9 @@ impl Default for Settings {
             garbage_collector_options: Some(GarbageCollectorOptions::default()),
             metric_level: MetricLevel::default(),
             default_ttl: None,
+            max_transaction_conflict_metadata_bytes:
+                DEFAULT_MAX_TRANSACTION_CONFLICT_METADATA_BYTES,
+            max_retained_conflict_metadata_bytes: DEFAULT_MAX_RETAINED_CONFLICT_METADATA_BYTES,
             object_store_max_retries: None,
             #[cfg(test)]
             block_format: None,
