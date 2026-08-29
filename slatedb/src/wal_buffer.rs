@@ -956,10 +956,34 @@ mod tests {
         Arc<DbStatusManager>,
         Arc<DefaultMetricsRecorder>,
     ) {
+        setup_wal_buffer_with_format_and_replay_limits(
+            SsTableFormat::default(),
+            1000,
+            flush_interval,
+            listener,
+            max_replay_metadata_bytes,
+            max_replay_block_bytes,
+        )
+        .await
+    }
+
+    async fn setup_wal_buffer_with_format_and_replay_limits(
+        format: SsTableFormat,
+        max_wal_bytes_size: usize,
+        flush_interval: Duration,
+        listener: wal::WalStatusListener,
+        max_replay_metadata_bytes: usize,
+        max_replay_block_bytes: usize,
+    ) -> (
+        WalBufferManager,
+        Arc<TableStore>,
+        Arc<DbStatusManager>,
+        Arc<DefaultMetricsRecorder>,
+    ) {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let table_store = Arc::new(TableStore::new(
             ObjectStores::new(object_store, None),
-            SsTableFormat::default(),
+            format,
             Path::from("/root"),
             None,
             TableStoreKind::Main,
@@ -979,7 +1003,7 @@ mod tests {
             &helper,
             0, // recent_flushed_wal_id
             table_store.clone(),
-            1000, // max_wal_bytes_size
+            max_wal_bytes_size,
             max_replay_metadata_bytes,
             max_replay_block_bytes,
             Some(flush_interval), // max_flush_interval
@@ -1103,6 +1127,53 @@ mod tests {
         let error = flush.await.unwrap_err();
 
         assert!(matches!(error, WalError::DataError(_)));
+        assert!(table_store
+            .list_wal_ssts_for_replay(1..2)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn many_block_wal_with_unreplayable_index_is_rejected_before_object_write() {
+        let metadata_memory_limit = 8 * 1024;
+        let format = SsTableFormat {
+            block_size: 128,
+            ..SsTableFormat::default()
+        };
+        let (mut wal_buffer, table_store, _, _) = setup_wal_buffer_with_format_and_replay_limits(
+            format,
+            usize::MAX,
+            Duration::MAX,
+            Arc::new(|_status| {}),
+            metadata_memory_limit,
+            32 * 1024 * 1024,
+        )
+        .await;
+        let entries = (1..=1024)
+            .map(|seq| {
+                make_entry(
+                    &format!("large-index-{seq:04}-{}", "k".repeat(64)),
+                    &"v".repeat(128),
+                    seq,
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut builder = table_store.wal_table_builder();
+        for entry in &entries {
+            builder.add(entry.clone()).await.unwrap();
+        }
+        let encoded = builder.build().await.unwrap();
+        assert!(encoded.unconsumed_blocks.len() > 100);
+        assert!(usize::try_from(encoded.info.index_len).unwrap() > metadata_memory_limit);
+
+        wal_buffer.append(&entries).await.unwrap();
+        let flush = wal_buffer.flush().await.unwrap();
+        let error = flush.await.unwrap_err();
+
+        assert!(matches!(error, WalError::DataError(_)));
+        assert!(error.to_string().contains("WAL index"));
         assert!(table_store
             .list_wal_ssts_for_replay(1..2)
             .await
