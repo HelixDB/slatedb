@@ -17,6 +17,71 @@ use smallvec::{smallvec, SmallVec};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::iter::Peekable;
 use std::ops::RangeBounds;
+use std::sync::Arc;
+
+const INLINE_MERGE_DISCRIMINATOR_LEN: usize = 16;
+
+/// Transaction-only logical member identity for a disjoint merge.
+///
+/// Graph membership discriminators are eight or nine bytes, so they remain
+/// inline. Longer opaque discriminators retain the public API contract and
+/// spill through `SmallVec` only when required.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct MergeDiscriminator(SmallVec<[u8; INLINE_MERGE_DISCRIMINATOR_LEN]>);
+
+/// A non-empty, immutable discriminator set shared between batch and
+/// transaction conflict tracking.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DisjointMergeDiscriminators(Arc<HashSet<MergeDiscriminator>>);
+
+impl DisjointMergeDiscriminators {
+    pub(crate) fn new<D, I>(discriminators: I) -> Self
+    where
+        D: AsRef<[u8]>,
+        I: IntoIterator<Item = D>,
+    {
+        let discriminators = discriminators
+            .into_iter()
+            .map(|discriminator| {
+                let discriminator = discriminator.as_ref();
+                assert!(
+                    !discriminator.is_empty(),
+                    "disjoint merge discriminators cannot be empty"
+                );
+                MergeDiscriminator(SmallVec::from_slice(discriminator))
+            })
+            .collect::<HashSet<_>>();
+        assert!(
+            !discriminators.is_empty(),
+            "disjoint merge discriminators cannot be empty"
+        );
+        Self(Arc::new(discriminators))
+    }
+
+    fn extend(&mut self, newer: Self) {
+        Arc::make_mut(&mut self.0).extend(Arc::unwrap_or_clone(newer.0));
+    }
+
+    pub(crate) fn extend_from(&mut self, newer: &Self) {
+        Arc::make_mut(&mut self.0).extend(newer.0.iter().cloned());
+    }
+
+    pub(crate) fn is_disjoint(&self, other: &Self) -> bool {
+        self.0.is_disjoint(&other.0)
+    }
+
+    #[cfg(test)]
+    fn all_inline(&self) -> bool {
+        self.0
+            .iter()
+            .all(|discriminator| !discriminator.0.spilled())
+    }
+
+    #[cfg(test)]
+    fn strong_count(&self) -> usize {
+        Arc::strong_count(&self.0)
+    }
+}
 
 /// A batch of write operations (puts, deletes, and merges). All operations in
 /// the batch are applied atomically to the database. Put and delete operations
@@ -65,7 +130,7 @@ pub struct WriteBatch {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum MergeConflictKind {
     Commutative,
-    Disjoint(HashSet<Bytes>),
+    Disjoint(DisjointMergeDiscriminators),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -292,26 +357,20 @@ impl WriteBatch {
         );
     }
 
-    pub(crate) fn merge_disjoint<K, V>(&mut self, key: K, value: V, discriminators: HashSet<Bytes>)
+    pub(crate) fn merge_disjoint<K, V, D, I>(&mut self, key: K, value: V, discriminators: I)
     where
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
+        D: AsRef<[u8]>,
+        I: IntoIterator<Item = D>,
     {
-        assert!(
-            !discriminators.is_empty(),
-            "disjoint merge discriminators cannot be empty"
-        );
-        assert!(
-            discriminators
-                .iter()
-                .all(|discriminator| !discriminator.is_empty()),
-            "disjoint merge discriminators cannot be empty"
-        );
         self.merge_with_conflict_kind(
             key,
             value,
             &MergeOptions::default(),
-            Some(MergeConflictKind::Disjoint(discriminators)),
+            Some(MergeConflictKind::Disjoint(
+                DisjointMergeDiscriminators::new(discriminators),
+            )),
         );
     }
 
@@ -333,9 +392,8 @@ impl WriteBatch {
         let is_first_operation = !self.ops.contains_key(&key);
         let existing_kind = self
             .compatible_merge_keys
-            .as_ref()
-            .and_then(|keys| keys.keys.get(&key))
-            .cloned();
+            .as_mut()
+            .and_then(|keys| keys.keys.remove(&key));
         let combined_kind = match (is_first_operation, existing_kind, conflict_kind) {
             (true, _, conflict_kind) => conflict_kind,
             (false, Some(MergeConflictKind::Commutative), Some(MergeConflictKind::Commutative)) => {
@@ -1033,39 +1091,46 @@ mod tests {
     #[test]
     fn disjoint_merge_classification_unions_discriminators() {
         let mut batch = WriteBatch::new();
-        batch.merge_disjoint(
-            b"key",
-            b"first",
-            [Bytes::from_static(b"member-a")].into_iter().collect(),
-        );
+        batch.merge_disjoint(b"key", b"first", [Bytes::from_static(b"member-a")]);
         batch.merge_disjoint(
             b"key",
             b"second",
             [
                 Bytes::from_static(b"member-a"),
                 Bytes::from_static(b"member-b"),
-            ]
-            .into_iter()
-            .collect(),
+            ],
         );
 
         assert_eq!(
             batch.merge_conflict_kind(b"key"),
             Some(&MergeConflictKind::Disjoint(
-                [
+                DisjointMergeDiscriminators::new([
                     Bytes::from_static(b"member-a"),
                     Bytes::from_static(b"member-b"),
-                ]
-                .into_iter()
-                .collect()
+                ])
             ))
         );
         assert_eq!(batch.op_count(), 2);
     }
 
     #[test]
+    fn disjoint_merge_metadata_keeps_short_members_inline_and_shares_clones() {
+        let discriminators =
+            DisjointMergeDiscriminators::new([[1_u8; 8].as_slice(), [2_u8; 9].as_slice()]);
+        assert!(discriminators.all_inline());
+        assert_eq!(discriminators.strong_count(), 1);
+
+        let shared = discriminators.clone();
+        assert_eq!(discriminators.strong_count(), 2);
+        assert_eq!(shared.strong_count(), 2);
+
+        let spilled = DisjointMergeDiscriminators::new([[3_u8; 17]]);
+        assert!(!spilled.all_inline());
+    }
+
+    #[test]
     fn mixed_merge_compatibility_is_exclusive_in_every_order() {
-        let discriminator = || [Bytes::from_static(b"member")].into_iter().collect();
+        let discriminator = || [Bytes::from_static(b"member")];
 
         let mut disjoint_then_ordinary = WriteBatch::new();
         disjoint_then_ordinary.merge_disjoint(b"key", b"first", discriminator());
@@ -1090,7 +1155,7 @@ mod tests {
 
     #[test]
     fn put_and_delete_make_disjoint_merges_exclusive() {
-        let discriminator = || [Bytes::from_static(b"member")].into_iter().collect();
+        let discriminator = || [Bytes::from_static(b"member")];
 
         let mut put_after_merge = WriteBatch::new();
         put_after_merge.merge_disjoint(b"key", b"merge", discriminator());
@@ -1116,13 +1181,13 @@ mod tests {
     #[test]
     #[should_panic(expected = "disjoint merge discriminators cannot be empty")]
     fn disjoint_merge_rejects_empty_discriminator_set() {
-        WriteBatch::new().merge_disjoint(b"key", b"operand", HashSet::new());
+        WriteBatch::new().merge_disjoint(b"key", b"operand", HashSet::<Bytes>::new());
     }
 
     #[test]
     #[should_panic(expected = "disjoint merge discriminators cannot be empty")]
     fn disjoint_merge_rejects_empty_discriminator() {
-        WriteBatch::new().merge_disjoint(b"key", b"operand", [Bytes::new()].into_iter().collect());
+        WriteBatch::new().merge_disjoint(b"key", b"operand", [Bytes::new()]);
     }
 
     #[test]

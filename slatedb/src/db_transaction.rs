@@ -786,10 +786,6 @@ impl DbTransaction {
             return Err(SlateDBError::MergeOperatorMissing.into());
         }
 
-        let discriminators = discriminators
-            .into_iter()
-            .map(|discriminator| Bytes::copy_from_slice(discriminator.as_ref()))
-            .collect();
         self.write_batch
             .write()
             .merge_disjoint(key, operand, discriminators);
