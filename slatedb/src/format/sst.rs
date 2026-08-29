@@ -1019,6 +1019,9 @@ impl SsTableFormat {
 
     /// validate checksum and return the actual data bytes
     pub(crate) fn validate_checksum(&self, bytes: Bytes) -> Result<Bytes, SlateDBError> {
+        if bytes.len() < CHECKSUM_SIZE {
+            return Err(SlateDBError::ChecksumMismatch { path: None });
+        }
         let data_bytes = bytes.slice(..bytes.len() - CHECKSUM_SIZE);
         let mut checksum_bytes = bytes.slice(bytes.len() - CHECKSUM_SIZE..);
         let checksum = crc32fast::hash(&data_bytes);
