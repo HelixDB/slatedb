@@ -32,10 +32,16 @@ struct MergeDiscriminator(SmallVec<[u8; INLINE_MERGE_DISCRIMINATOR_LEN]>);
 /// A non-empty, immutable discriminator set shared between batch and
 /// transaction conflict tracking.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct DisjointMergeDiscriminators(Arc<HashSet<MergeDiscriminator>>);
+pub(crate) struct DisjointMergeDiscriminators(DisjointMergeDiscriminatorSet);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DisjointMergeDiscriminatorSet {
+    Bytes(Arc<HashSet<MergeDiscriminator>>),
+    Tokens(Arc<HashSet<u128>>),
+}
 
 impl DisjointMergeDiscriminators {
-    pub(crate) fn new<D, I>(discriminators: I) -> Self
+    pub(crate) fn from_bytes<D, I>(discriminators: I) -> Self
     where
         D: AsRef<[u8]>,
         I: IntoIterator<Item = D>,
@@ -55,31 +61,101 @@ impl DisjointMergeDiscriminators {
             !discriminators.is_empty(),
             "disjoint merge discriminators cannot be empty"
         );
-        Self(Arc::new(discriminators))
+        Self(DisjointMergeDiscriminatorSet::Bytes(Arc::new(
+            discriminators,
+        )))
     }
 
-    fn extend(&mut self, newer: Self) {
-        Arc::make_mut(&mut self.0).extend(Arc::unwrap_or_clone(newer.0));
+    pub(crate) fn from_tokens(tokens: impl IntoIterator<Item = u128>) -> Self {
+        let tokens = tokens.into_iter().collect::<HashSet<_>>();
+        assert!(
+            !tokens.is_empty(),
+            "disjoint merge discriminators cannot be empty"
+        );
+        Self(DisjointMergeDiscriminatorSet::Tokens(Arc::new(tokens)))
     }
 
-    pub(crate) fn extend_from(&mut self, newer: &Self) {
-        Arc::make_mut(&mut self.0).extend(newer.0.iter().cloned());
+    fn extend(&mut self, newer: Self) -> bool {
+        match (&mut self.0, newer.0) {
+            (
+                DisjointMergeDiscriminatorSet::Bytes(existing),
+                DisjointMergeDiscriminatorSet::Bytes(newer),
+            ) => {
+                Arc::make_mut(existing).extend(Arc::unwrap_or_clone(newer));
+                true
+            }
+            (
+                DisjointMergeDiscriminatorSet::Tokens(existing),
+                DisjointMergeDiscriminatorSet::Tokens(newer),
+            ) => {
+                Arc::make_mut(existing).extend(Arc::unwrap_or_clone(newer));
+                true
+            }
+            (DisjointMergeDiscriminatorSet::Bytes(_), DisjointMergeDiscriminatorSet::Tokens(_))
+            | (DisjointMergeDiscriminatorSet::Tokens(_), DisjointMergeDiscriminatorSet::Bytes(_)) => {
+                false
+            }
+        }
+    }
+
+    pub(crate) fn extend_from(&mut self, newer: &Self) -> bool {
+        match (&mut self.0, &newer.0) {
+            (
+                DisjointMergeDiscriminatorSet::Bytes(existing),
+                DisjointMergeDiscriminatorSet::Bytes(newer),
+            ) => {
+                Arc::make_mut(existing).extend(newer.iter().cloned());
+                true
+            }
+            (
+                DisjointMergeDiscriminatorSet::Tokens(existing),
+                DisjointMergeDiscriminatorSet::Tokens(newer),
+            ) => {
+                Arc::make_mut(existing).extend(newer.iter().copied());
+                true
+            }
+            (DisjointMergeDiscriminatorSet::Bytes(_), DisjointMergeDiscriminatorSet::Tokens(_))
+            | (DisjointMergeDiscriminatorSet::Tokens(_), DisjointMergeDiscriminatorSet::Bytes(_)) => {
+                false
+            }
+        }
     }
 
     pub(crate) fn is_disjoint(&self, other: &Self) -> bool {
-        self.0.is_disjoint(&other.0)
+        match (&self.0, &other.0) {
+            (
+                DisjointMergeDiscriminatorSet::Bytes(current),
+                DisjointMergeDiscriminatorSet::Bytes(other),
+            ) => current.is_disjoint(other),
+            (
+                DisjointMergeDiscriminatorSet::Tokens(current),
+                DisjointMergeDiscriminatorSet::Tokens(other),
+            ) => current.is_disjoint(other),
+            (DisjointMergeDiscriminatorSet::Bytes(_), DisjointMergeDiscriminatorSet::Tokens(_))
+            | (DisjointMergeDiscriminatorSet::Tokens(_), DisjointMergeDiscriminatorSet::Bytes(_)) => {
+                false
+            }
+        }
     }
 
     #[cfg(test)]
     fn all_inline(&self) -> bool {
-        self.0
-            .iter()
-            .all(|discriminator| !discriminator.0.spilled())
+        match &self.0 {
+            DisjointMergeDiscriminatorSet::Bytes(discriminators) => discriminators
+                .iter()
+                .all(|discriminator| !discriminator.0.spilled()),
+            DisjointMergeDiscriminatorSet::Tokens(_) => true,
+        }
     }
 
     #[cfg(test)]
     fn strong_count(&self) -> usize {
-        Arc::strong_count(&self.0)
+        match &self.0 {
+            DisjointMergeDiscriminatorSet::Bytes(discriminators) => {
+                Arc::strong_count(discriminators)
+            }
+            DisjointMergeDiscriminatorSet::Tokens(tokens) => Arc::strong_count(tokens),
+        }
     }
 }
 
@@ -369,7 +445,23 @@ impl WriteBatch {
             value,
             &MergeOptions::default(),
             Some(MergeConflictKind::Disjoint(
-                DisjointMergeDiscriminators::new(discriminators),
+                DisjointMergeDiscriminators::from_bytes(discriminators),
+            )),
+        );
+    }
+
+    pub(crate) fn merge_disjoint_tokens<K, V, I>(&mut self, key: K, value: V, tokens: I)
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+        I: IntoIterator<Item = u128>,
+    {
+        self.merge_with_conflict_kind(
+            key,
+            value,
+            &MergeOptions::default(),
+            Some(MergeConflictKind::Disjoint(
+                DisjointMergeDiscriminators::from_tokens(tokens),
             )),
         );
     }
@@ -403,10 +495,9 @@ impl WriteBatch {
                 false,
                 Some(MergeConflictKind::Disjoint(mut existing)),
                 Some(MergeConflictKind::Disjoint(next)),
-            ) => {
-                existing.extend(next);
-                Some(MergeConflictKind::Disjoint(existing))
-            }
+            ) => existing
+                .extend(next)
+                .then_some(MergeConflictKind::Disjoint(existing)),
             _ => None,
         };
 
@@ -1104,7 +1195,7 @@ mod tests {
         assert_eq!(
             batch.merge_conflict_kind(b"key"),
             Some(&MergeConflictKind::Disjoint(
-                DisjointMergeDiscriminators::new([
+                DisjointMergeDiscriminators::from_bytes([
                     Bytes::from_static(b"member-a"),
                     Bytes::from_static(b"member-b"),
                 ])
@@ -1116,7 +1207,7 @@ mod tests {
     #[test]
     fn disjoint_merge_metadata_keeps_short_members_inline_and_shares_clones() {
         let discriminators =
-            DisjointMergeDiscriminators::new([[1_u8; 8].as_slice(), [2_u8; 9].as_slice()]);
+            DisjointMergeDiscriminators::from_bytes([[1_u8; 8].as_slice(), [2_u8; 9].as_slice()]);
         assert!(discriminators.all_inline());
         assert_eq!(discriminators.strong_count(), 1);
 
@@ -1124,8 +1215,26 @@ mod tests {
         assert_eq!(discriminators.strong_count(), 2);
         assert_eq!(shared.strong_count(), 2);
 
-        let spilled = DisjointMergeDiscriminators::new([[3_u8; 17]]);
+        let spilled = DisjointMergeDiscriminators::from_bytes([[3_u8; 17]]);
         assert!(!spilled.all_inline());
+    }
+
+    #[test]
+    fn token_discriminators_union_without_changing_byte_discriminator_safety() {
+        let mut tokens = WriteBatch::new();
+        tokens.merge_disjoint_tokens(b"key", b"first", [1, 2]);
+        tokens.merge_disjoint_tokens(b"key", b"second", [2, 3]);
+        assert_eq!(
+            tokens.merge_conflict_kind(b"key"),
+            Some(&MergeConflictKind::Disjoint(
+                DisjointMergeDiscriminators::from_tokens([1, 2, 3])
+            ))
+        );
+
+        let mut mixed = WriteBatch::new();
+        mixed.merge_disjoint_tokens(b"key", b"token", [1]);
+        mixed.merge_disjoint(b"key", b"bytes", [1_u128.to_be_bytes()]);
+        assert_eq!(mixed.merge_conflict_kind(b"key"), None);
     }
 
     #[test]

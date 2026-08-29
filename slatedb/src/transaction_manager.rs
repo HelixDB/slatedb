@@ -64,16 +64,21 @@ impl TransactionState {
         for (key, kind) in writes {
             self.writes
                 .entry(key)
-                .and_modify(|existing| match (&mut *existing, &kind) {
-                    (
-                        TransactionWriteKind::CommutativeMerge,
-                        TransactionWriteKind::CommutativeMerge,
-                    ) => {}
-                    (
-                        TransactionWriteKind::DisjointMerge(existing),
-                        TransactionWriteKind::DisjointMerge(next),
-                    ) => existing.extend_from(next),
-                    _ => *existing = TransactionWriteKind::Exclusive,
+                .and_modify(|existing| {
+                    let compatible = match (&mut *existing, &kind) {
+                        (
+                            TransactionWriteKind::CommutativeMerge,
+                            TransactionWriteKind::CommutativeMerge,
+                        ) => true,
+                        (
+                            TransactionWriteKind::DisjointMerge(existing),
+                            TransactionWriteKind::DisjointMerge(next),
+                        ) => existing.extend_from(next),
+                        _ => false,
+                    };
+                    if !compatible {
+                        *existing = TransactionWriteKind::Exclusive;
+                    }
                 })
                 .or_insert(kind);
         }
@@ -500,9 +505,9 @@ mod tests {
     ) -> HashMap<Bytes, TransactionWriteKind> {
         [(
             Bytes::from(key),
-            TransactionWriteKind::DisjointMerge(
-                DisjointMergeDiscriminators::new(discriminators.into_iter().map(Bytes::from)),
-            ),
+            TransactionWriteKind::DisjointMerge(DisjointMergeDiscriminators::from_bytes(
+                discriminators.into_iter().map(Bytes::from),
+            )),
         )]
         .into_iter()
         .collect()
@@ -832,7 +837,7 @@ mod tests {
         assert_eq!(
             repeated_disjoint.writes.get(b"key".as_slice()),
             Some(&TransactionWriteKind::DisjointMerge(
-                DisjointMergeDiscriminators::new([
+                DisjointMergeDiscriminators::from_bytes([
                     Bytes::from_static(b"member-a"),
                     Bytes::from_static(b"member-b")
                 ])

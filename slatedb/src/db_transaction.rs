@@ -792,6 +792,33 @@ impl DbTransaction {
         Ok(())
     }
 
+    /// Buffers a disjoint merge using fixed-width logical member tokens.
+    ///
+    /// This has the same conflict semantics as [`Self::merge_disjoint`] while
+    /// avoiding per-member byte allocations for integer identities. Token and
+    /// byte discriminator representations on the same physical key conflict
+    /// conservatively, even when their logical values might correspond.
+    pub fn merge_disjoint_tokens<K, V, I>(
+        &self,
+        key: K,
+        tokens: I,
+        operand: V,
+    ) -> Result<(), crate::Error>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+        I: IntoIterator<Item = u128>,
+    {
+        if self.db_inner.flush_merge_operator.is_none() {
+            return Err(SlateDBError::MergeOperatorMissing.into());
+        }
+
+        self.write_batch
+            .write()
+            .merge_disjoint_tokens(key, operand, tokens);
+        Ok(())
+    }
+
     /// Merge a key-value pair into the transaction with custom options.
     ///
     /// ## Errors
@@ -1068,6 +1095,20 @@ impl DbTransactionOps for DbTransaction {
         I: IntoIterator<Item = D>,
     {
         DbTransaction::merge_disjoint(self, key, discriminators, operand)
+    }
+
+    fn merge_disjoint_tokens<K, V, I>(
+        &self,
+        key: K,
+        tokens: I,
+        operand: V,
+    ) -> Result<(), crate::Error>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+        I: IntoIterator<Item = u128>,
+    {
+        DbTransaction::merge_disjoint_tokens(self, key, tokens, operand)
     }
 
     fn mark_read<K, I>(&self, keys: I) -> Result<(), crate::Error>
@@ -2682,6 +2723,70 @@ mod tests {
         assert!(second.commit().await.is_err());
     }
 
+    #[tokio::test]
+    async fn test_disjoint_token_merges_preserve_compatibility_boundaries() {
+        const INCREMENT: [u8; 8] = 1u64.to_le_bytes();
+
+        for reverse_commit_order in [false, true] {
+            let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+            let db = crate::Db::builder(
+                format!("test_disjoint_token_order_{reverse_commit_order}"),
+                object_store,
+            )
+            .with_merge_operator(Arc::new(CounterMergeOperator))
+            .build()
+            .await
+            .unwrap();
+            let first = db.begin(IsolationLevel::Snapshot).await.unwrap();
+            let second = db.begin(IsolationLevel::Snapshot).await.unwrap();
+            first
+                .merge_disjoint_tokens(b"members", [1], INCREMENT)
+                .unwrap();
+            second
+                .merge_disjoint_tokens(b"members", [2], INCREMENT)
+                .unwrap();
+
+            if reverse_commit_order {
+                second.commit().await.unwrap();
+                first.commit().await.unwrap();
+            } else {
+                first.commit().await.unwrap();
+                second.commit().await.unwrap();
+            }
+            let value = db.get(b"members").await.unwrap().unwrap();
+            assert_eq!(u64::from_le_bytes(value.as_ref().try_into().unwrap()), 2);
+        }
+
+        for mixed_representation in [false, true] {
+            let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+            let db = crate::Db::builder(
+                format!("test_disjoint_token_conflict_{mixed_representation}"),
+                object_store,
+            )
+            .with_merge_operator(Arc::new(CounterMergeOperator))
+            .build()
+            .await
+            .unwrap();
+            let first = db.begin(IsolationLevel::Snapshot).await.unwrap();
+            let second = db.begin(IsolationLevel::Snapshot).await.unwrap();
+            first
+                .merge_disjoint_tokens(b"members", [1], INCREMENT)
+                .unwrap();
+            if mixed_representation {
+                second
+                    .merge_disjoint(b"members", [1_u128.to_be_bytes()], INCREMENT)
+                    .unwrap();
+            } else {
+                second
+                    .merge_disjoint_tokens(b"members", [1], INCREMENT)
+                    .unwrap();
+            }
+
+            first.commit().await.unwrap();
+            assert!(second.commit().await.is_err());
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_disjoint_merges_aggregate_under_high_concurrency() {
         const CONCURRENT_TXNS: usize = 64;
@@ -2944,6 +3049,11 @@ mod tests {
         let txn = db.begin(IsolationLevel::Snapshot).await.unwrap();
         let err = txn
             .merge_disjoint(b"members", [b"member"], b"operand")
+            .unwrap_err();
+        assert_eq!(err.kind(), crate::ErrorKind::Invalid);
+
+        let err = txn
+            .merge_disjoint_tokens(b"members", [1], b"operand")
             .unwrap_err();
         assert_eq!(err.kind(), crate::ErrorKind::Invalid);
     }
