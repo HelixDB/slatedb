@@ -2151,4 +2151,34 @@ object_store_cache_options:
         };
         assert!(settings.validate().is_ok());
     }
+
+    #[test]
+    fn test_validate_rejects_invalid_conflict_metadata_limits() {
+        let zero_transaction_limit = Settings {
+            max_transaction_conflict_metadata_bytes: 0,
+            ..Settings::default()
+        };
+        let error = zero_transaction_limit
+            .validate()
+            .expect_err("zero transaction conflict metadata limit is invalid");
+        assert!(
+            error
+                .to_string()
+                .contains("max_transaction_conflict_metadata_bytes")
+        );
+
+        let retained_below_transaction = Settings {
+            max_transaction_conflict_metadata_bytes: 2,
+            max_retained_conflict_metadata_bytes: 1,
+            ..Settings::default()
+        };
+        let error = retained_below_transaction
+            .validate()
+            .expect_err("retained conflict metadata limit cannot be below one transaction");
+        assert!(
+            error
+                .to_string()
+                .contains("max_retained_conflict_metadata_bytes")
+        );
+    }
 }
