@@ -25,7 +25,7 @@ use crate::error::SlateDBError;
 use crate::filter_policy::NamedFilter;
 use crate::flatbuffer_types::SsTableIndexOwned;
 use crate::format::block::Block;
-use crate::format::sst::{EncodedSsTable, EncodedSsTableBlock, SsTableFormat};
+use crate::format::sst::{EncodedSsTable, EncodedSsTableBlock, SsTableFormat, CHECKSUM_SIZE};
 use crate::object_store_tag::ObjectStoreCallTag;
 pub(crate) use crate::object_store_tag::TableStoreKind;
 use crate::object_stores::{ObjectStoreType, ObjectStores};
@@ -367,14 +367,56 @@ impl TableStore {
     }
 
     /// Fetches a WAL SST with one full-object GET.
-    pub(crate) async fn read_wal_sst_bytes(&self, wal_id: u64) -> Result<Bytes, SlateDBError> {
+    pub(crate) async fn read_wal_sst_bytes(
+        &self,
+        wal_id: u64,
+        expected_size: Option<u64>,
+    ) -> Result<Bytes, SlateDBError> {
         let id = SsTableId::Wal(wal_id);
         let obj = ReadOnlyObject {
             object_store: self.object_stores.store_for(&id),
             path: self.path(&id),
             tag: ObjectStoreCallTag::new(self.kind, SstType::Wal),
         };
-        obj.read().await.map_err(|err| err.with_path(&obj.path))
+        let opts = GetOptions {
+            extensions: obj.extensions(),
+            ..GetOptions::default()
+        };
+        let result = obj
+            .object_store
+            .get_opts(&obj.path, opts)
+            .await
+            .map_err(SlateDBError::from)
+            .map_err(|err| err.with_path(&obj.path))?;
+        if expected_size.is_some_and(|expected| result.meta.size != expected) {
+            return Err(invalid_wal_size(
+                &obj.path,
+                wal_id,
+                expected_size,
+                result.meta.size,
+            ));
+        }
+        let response_size = result.meta.size;
+        let bytes = result
+            .bytes()
+            .await
+            .map_err(SlateDBError::from)
+            .map_err(|err| err.with_path(&obj.path))?;
+        let actual_size = u64::try_from(bytes.len()).map_err(|err| {
+            SlateDBError::WalDataError(Arc::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                err,
+            )))
+        })?;
+        if actual_size != response_size {
+            return Err(invalid_wal_size(
+                &obj.path,
+                wal_id,
+                Some(response_size),
+                actual_size,
+            ));
+        }
+        Ok(bytes)
     }
 
     /// Decodes a fully fetched WAL locally. A validation failure refetches the
@@ -419,11 +461,12 @@ impl TableStore {
                         .read_info_and_version(&blob)
                         .await
                         .map_err(|err| err.with_path(&path))?;
+                    validate_wal_sst_info_layout(&info, object_len, &path)?;
                     let index = sst_format
                         .read_index(&info, &blob)
                         .await
                         .map_err(|err| err.with_path(&path))?;
-                    validate_wal_sst_layout(&info, &index, object_len, &path)?;
+                    validate_wal_sst_index_layout(&info, &index, &path)?;
                     let block_count = index.borrow().block_meta().len();
                     let blocks = sst_format
                         .read_blocks(&info, &index, 0..block_count, &blob)
@@ -1228,9 +1271,8 @@ impl TableStore {
     }
 }
 
-fn validate_wal_sst_layout(
+fn validate_wal_sst_info_layout(
     info: &SsTableInfo,
-    index: &SsTableIndexOwned,
     object_len: u64,
     path: &Path,
 ) -> Result<(), SlateDBError> {
@@ -1250,10 +1292,92 @@ fn validate_wal_sst_layout(
         }
     }
 
+    let filter_end = info
+        .filter_offset
+        .checked_add(info.filter_len)
+        .ok_or_else(|| invalid_wal_layout(path, "filter range overflow".to_string()))?;
+    if filter_end != info.index_offset {
+        return Err(invalid_wal_layout(
+            path,
+            format!(
+                "filter end {filter_end} does not equal index offset {}",
+                info.index_offset
+            ),
+        ));
+    }
+    let index_end = info
+        .index_offset
+        .checked_add(info.index_len)
+        .ok_or_else(|| invalid_wal_layout(path, "index range overflow".to_string()))?;
+    let checksum_size = CHECKSUM_SIZE as u64;
+    if info.index_len < checksum_size {
+        return Err(invalid_wal_layout(
+            path,
+            format!(
+                "index length {} is smaller than its checksum",
+                info.index_len
+            ),
+        ));
+    }
+    if info.filter_len > 0 && info.filter_len < checksum_size {
+        return Err(invalid_wal_layout(
+            path,
+            format!(
+                "filter length {} is smaller than its checksum",
+                info.filter_len
+            ),
+        ));
+    }
+    if info.stats_len > 0 {
+        if info.stats_len < checksum_size {
+            return Err(invalid_wal_layout(
+                path,
+                format!(
+                    "stats length {} is smaller than its checksum",
+                    info.stats_len
+                ),
+            ));
+        }
+        if info.stats_offset != index_end {
+            return Err(invalid_wal_layout(
+                path,
+                format!(
+                    "index end {index_end} does not equal stats offset {}",
+                    info.stats_offset
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_wal_sst_index_layout(
+    info: &SsTableInfo,
+    index: &SsTableIndexOwned,
+    path: &Path,
+) -> Result<(), SlateDBError> {
     let block_meta = index.borrow().block_meta();
+    if block_meta.is_empty() {
+        if info.filter_offset != 0 {
+            return Err(invalid_wal_layout(
+                path,
+                format!(
+                    "empty block index has nonzero data length {}",
+                    info.filter_offset
+                ),
+            ));
+        }
+        return Ok(());
+    }
     let mut previous_offset = None;
     for block in 0..block_meta.len() {
         let offset = block_meta.get(block).offset();
+        if block == 0 && offset != 0 {
+            return Err(invalid_wal_layout(
+                path,
+                format!("first block offset {offset} is not zero"),
+            ));
+        }
         if offset >= info.filter_offset {
             return Err(invalid_wal_layout(
                 path,
@@ -1278,6 +1402,23 @@ fn invalid_wal_layout(path: &Path, reason: String) -> SlateDBError {
     SlateDBError::WalDataError(Arc::new(std::io::Error::new(
         std::io::ErrorKind::InvalidData,
         format!("invalid WAL SST layout at {path}: {reason}"),
+    )))
+}
+
+fn invalid_wal_size(
+    path: &Path,
+    wal_id: u64,
+    expected_size: Option<u64>,
+    actual_size: u64,
+) -> SlateDBError {
+    SlateDBError::WalDataError(Arc::new(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "WAL {wal_id} size changed at {path}: expected {}, got {actual_size}",
+            expected_size
+                .map(|size| size.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        ),
     )))
 }
 
@@ -1501,15 +1642,86 @@ mod tests {
     use crate::object_stores::ObjectStores;
     use crate::retrying_object_store::RetryingObjectStore;
     use crate::sst_iter::{SstIterator, SstIteratorOptions};
-    use crate::tablestore::{TableStore, TableStoreKind};
+    use crate::tablestore::{
+        validate_wal_sst_index_layout, validate_wal_sst_info_layout, TableStore, TableStoreKind,
+    };
     use crate::test_utils::FlakyObjectStore;
     use crate::test_utils::{assert_iterator, build_test_sst};
     use crate::types::{RowEntry, ValueDeletable};
-    use crate::{block_iterator::BlockIteratorLatest, db_state::SsTableId, iter::RowEntryIterator};
+    use crate::{
+        block_iterator::BlockIteratorLatest,
+        db_state::{SsTableId, SsTableInfo},
+        iter::RowEntryIterator,
+    };
     use slatedb_common::clock::DefaultSystemClock;
     use slatedb_common::DbRand;
 
     const ROOT: &str = "/root";
+
+    #[test]
+    fn should_reject_invalid_wal_section_layouts_before_reading_index_bytes() {
+        let path = Path::from("/root/wal/00000000000000000001.sst");
+        let valid = SsTableInfo {
+            filter_offset: 16,
+            filter_len: 4,
+            index_offset: 20,
+            index_len: 8,
+            ..SsTableInfo::default()
+        };
+        assert!(validate_wal_sst_info_layout(&valid, 128, &path).is_ok());
+
+        let invalid = [
+            SsTableInfo {
+                index_offset: u64::MAX,
+                index_len: 8,
+                ..valid.clone()
+            },
+            SsTableInfo {
+                index_offset: 21,
+                ..valid.clone()
+            },
+            SsTableInfo {
+                index_len: 3,
+                ..valid.clone()
+            },
+            SsTableInfo {
+                filter_len: 3,
+                index_offset: 19,
+                ..valid.clone()
+            },
+            SsTableInfo {
+                stats_offset: 28,
+                stats_len: 3,
+                ..valid.clone()
+            },
+            SsTableInfo {
+                stats_offset: 29,
+                stats_len: 4,
+                ..valid.clone()
+            },
+        ];
+        for info in invalid {
+            assert!(
+                validate_wal_sst_info_layout(&info, 128, &path).is_err(),
+                "invalid WAL layout was accepted: {info:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn should_reject_unindexed_wal_data() {
+        let path = Path::from("/root/wal/00000000000000000001.sst");
+        let encoded = SsTableFormat::default()
+            .wal_table_builder()
+            .build()
+            .await
+            .unwrap();
+        let mut info = encoded.info.clone();
+        info.filter_offset = 1;
+        info.index_offset = 1;
+
+        assert!(validate_wal_sst_index_layout(&info, &encoded.index, &path).is_err());
+    }
 
     /// Wraps an object store: counts range-bounded `get_opts` calls and pauses the first
     /// one until `release` is notified. Other methods just delegate. Shared by the
