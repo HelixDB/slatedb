@@ -142,11 +142,11 @@ impl DisjointMergeDiscriminators {
 
     pub(crate) fn payload_bytes(&self) -> usize {
         match &self.0 {
-            DisjointMergeDiscriminatorSet::Bytes(discriminators) => {
-                discriminators.iter().map(|value| value.0.len()).sum()
-            }
+            DisjointMergeDiscriminatorSet::Bytes(discriminators) => discriminators
+                .iter()
+                .fold(0, |bytes, value| bytes.saturating_add(value.0.len())),
             DisjointMergeDiscriminatorSet::Tokens(tokens) => {
-                tokens.len() * core::mem::size_of::<u128>()
+                tokens.len().saturating_mul(core::mem::size_of::<u128>())
             }
         }
     }

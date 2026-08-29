@@ -2852,6 +2852,28 @@ mod tests {
             .is_err());
         pending.rollback();
         assert_eq!(db.get(b"pending").await.unwrap(), None);
+
+        let pending_merge = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        pending_merge.merge(b"pending-merge", b"corrupt").unwrap();
+        assert!(pending_merge
+            .merge_disjoint_tokens_checked(b"pending-merge", [3], INCREMENT)
+            .await
+            .is_err());
+        pending_merge.rollback();
+        assert_eq!(db.get(b"pending-merge").await.unwrap(), None);
+
+        let composed = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        composed
+            .merge_disjoint_tokens_checked(b"composed", [4], INCREMENT)
+            .await
+            .unwrap();
+        composed
+            .merge_disjoint_tokens_checked(b"composed", [5], INCREMENT)
+            .await
+            .unwrap();
+        composed.commit().await.unwrap();
+        let value = db.get(b"composed").await.unwrap().unwrap();
+        assert_eq!(u64::from_le_bytes(value.as_ref().try_into().unwrap()), 2);
     }
 
     #[tokio::test]
@@ -2938,8 +2960,11 @@ mod tests {
 
     #[tokio::test]
     async fn disjoint_conflict_metadata_limits_reject_before_writing_and_recycle() {
+        use slatedb_common::metrics::{lookup_metric, DefaultMetricsRecorder};
+
         const INCREMENT: [u8; 8] = 1_u64.to_le_bytes();
         let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let metrics = Arc::new(DefaultMetricsRecorder::new());
         let settings = crate::config::Settings {
             max_transaction_conflict_metadata_bytes: core::mem::size_of::<u128>(),
             max_retained_conflict_metadata_bytes: 2 * core::mem::size_of::<u128>(),
@@ -2947,16 +2972,28 @@ mod tests {
         };
         let db = crate::Db::builder("disjoint_metadata_limits", object_store)
             .with_settings(settings)
+            .with_metrics_recorder(metrics.clone())
             .with_merge_operator(Arc::new(StrictCounterMergeOperator))
             .build()
             .await
             .unwrap();
 
         let old = db.begin(IsolationLevel::Snapshot).await.unwrap();
-        for (key, token) in [(b"first".as_slice(), 1), (b"second".as_slice(), 2)] {
+        for (ordinal, (key, token)) in [(b"first".as_slice(), 1), (b"second".as_slice(), 2)]
+            .into_iter()
+            .enumerate()
+        {
             let txn = db.begin(IsolationLevel::Snapshot).await.unwrap();
             txn.merge_disjoint_tokens(key, [token], INCREMENT).unwrap();
             txn.commit().await.unwrap();
+            assert_eq!(
+                lookup_metric(&metrics, crate::db_stats::CONFLICT_METADATA_RETAINED_BYTES),
+                Some(((ordinal + 1) * core::mem::size_of::<u128>()) as i64)
+            );
+            assert_eq!(
+                lookup_metric(&metrics, crate::db_stats::CONFLICT_METADATA_RETAINED_TOKENS),
+                Some((ordinal + 1) as i64)
+            );
         }
 
         let rejected = db.begin(IsolationLevel::Snapshot).await.unwrap();
@@ -2969,8 +3006,23 @@ mod tests {
             Some(crate::ErrorCode::ConflictMetadataLimitExceeded)
         );
         assert_eq!(db.get(b"rejected").await.unwrap(), None);
+        assert_eq!(
+            lookup_metric(
+                &metrics,
+                crate::db_stats::CONFLICT_METADATA_QUOTA_REJECTIONS
+            ),
+            Some(1)
+        );
 
         old.rollback();
+        assert_eq!(
+            lookup_metric(&metrics, crate::db_stats::CONFLICT_METADATA_RETAINED_BYTES),
+            Some(0)
+        );
+        assert_eq!(
+            lookup_metric(&metrics, crate::db_stats::CONFLICT_METADATA_RETAINED_TOKENS),
+            Some(0)
+        );
         let recycled = db.begin(IsolationLevel::Snapshot).await.unwrap();
         recycled
             .merge_disjoint_tokens(b"recycled", [4], INCREMENT)
@@ -2988,6 +3040,13 @@ mod tests {
             Some(crate::ErrorCode::ConflictMetadataLimitExceeded)
         );
         assert_eq!(db.get(b"oversized").await.unwrap(), None);
+        assert_eq!(
+            lookup_metric(
+                &metrics,
+                crate::db_stats::CONFLICT_METADATA_QUOTA_REJECTIONS
+            ),
+            Some(2)
+        );
     }
 
     #[tokio::test]

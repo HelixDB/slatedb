@@ -65,8 +65,8 @@ impl TransactionState {
                 return (bytes, tokens);
             };
             (
-                bytes + discriminators.payload_bytes(),
-                tokens + discriminators.len(),
+                bytes.saturating_add(discriminators.payload_bytes()),
+                tokens.saturating_add(discriminators.len()),
             )
         })
     }
@@ -215,8 +215,12 @@ impl TransactionManager {
             return;
         };
         let (bytes, tokens) = inner.conflict_metadata_usage();
-        metrics.retained_bytes.set(bytes as i64);
-        metrics.retained_tokens.set(tokens as i64);
+        metrics
+            .retained_bytes
+            .set(i64::try_from(bytes).unwrap_or(i64::MAX));
+        metrics
+            .retained_tokens
+            .set(i64::try_from(tokens).unwrap_or(i64::MAX));
     }
 
     /// Register a read-write transaction state.
@@ -298,7 +302,9 @@ impl TransactionManager {
 
         let (retained_bytes, _) = inner.conflict_metadata_usage();
         let (current_bytes, _) = txn_state.conflict_metadata_usage();
-        let requested_bytes = retained_bytes - current_bytes + proposed_bytes;
+        let requested_bytes = retained_bytes
+            .saturating_sub(current_bytes)
+            .saturating_add(proposed_bytes);
         if requested_bytes > self.max_retained_conflict_metadata_bytes {
             if let Some(metrics) = &self.conflict_metadata_metrics {
                 metrics.quota_rejections.increment(1);
@@ -444,7 +450,10 @@ impl TransactionManagerInner {
             .chain(self.recent_committed_txns.iter())
             .fold((0, 0), |(bytes, tokens), state| {
                 let (state_bytes, state_tokens) = state.conflict_metadata_usage();
-                (bytes + state_bytes, tokens + state_tokens)
+                (
+                    bytes.saturating_add(state_bytes),
+                    tokens.saturating_add(state_tokens),
+                )
             })
     }
 
