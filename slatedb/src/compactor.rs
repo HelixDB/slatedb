@@ -2622,8 +2622,8 @@ mod tests {
         assert_iterator(
             &mut iter,
             vec![
-                RowEntry::new_merge(b"key1", b"abc", 4).with_create_ts(0),
-                RowEntry::new_merge(b"key2", b"x", 5).with_create_ts(0),
+                RowEntry::new_value(b"key1", b"abc", 4).with_create_ts(0),
+                RowEntry::new_value(b"key2", b"x", 5).with_create_ts(0),
                 RowEntry::new_value(&[b'x'; 16], &[b'p'; 128], 3).with_create_ts(0),
                 RowEntry::new_value(&[b'y'; 16], &[b'p'; 128], 6).with_create_ts(0),
             ],
@@ -2842,7 +2842,7 @@ mod tests {
         assert_iterator(
             &mut iter,
             vec![
-                RowEntry::new_merge(b"key1", b"abcd", 5).with_create_ts(expected_tick),
+                RowEntry::new_value(b"key1", b"abcd", 5).with_create_ts(expected_tick),
                 RowEntry::new_value(&[b'x'; 16], &[b'p'; 128], 3).with_create_ts(0),
                 RowEntry::new_value(&[b'y'; 16], &[b'p'; 128], 6).with_create_ts(expected_tick),
             ],
@@ -2964,7 +2964,7 @@ mod tests {
         assert_iterator(
             &mut iter,
             vec![
-                RowEntry::new_merge(b"key1", b"xyz", 4).with_create_ts(0),
+                RowEntry::new_value(b"key1", b"xyz", 4).with_create_ts(0),
                 RowEntry::new_value(&[b'x'; 16], &[b'p'; 128], 2).with_create_ts(0),
                 RowEntry::new_value(&[b'y'; 16], &[b'p'; 128], 5).with_create_ts(0),
             ],
@@ -3103,7 +3103,7 @@ mod tests {
                 RowEntry::new_value(&[b'a'; 16], &[b'p'; 128], 2).with_create_ts(0),
                 RowEntry::new_value(&[b'b'; 16], &[b'p'; 128], 4).with_create_ts(0),
                 RowEntry::new_value(&[b'c'; 16], &[b'p'; 128], 6).with_create_ts(0),
-                RowEntry::new_merge(b"key1", b"123", 5).with_create_ts(0),
+                RowEntry::new_value(b"key1", b"123", 5).with_create_ts(0),
             ],
         )
         .await;
@@ -3408,7 +3408,9 @@ mod tests {
             "compaction should have occurred"
         );
 
-        // The compacted sorted run should contain both merge operations separately
+        // The terminal sorted run must not combine operations whose expiration
+        // timestamps differ. With no active snapshot, retention keeps only the
+        // newest canonical value.
         let compacted = &db_state.tree.compacted.first().unwrap().sst_views;
         assert_eq!(compacted.len(), 1);
         let handle = compacted.first().unwrap();
@@ -3423,29 +3425,20 @@ mod tests {
         .unwrap()
         .expect("Expected Some(iter) but got None");
 
-        // merge operations should be kept separate due to different expire times
+        // The retained value must be only the newer operand, not "ab".
         let mut key1_entries = vec![];
         while let Some(entry) = iter.next().await.unwrap() {
             if entry.key.as_ref() == b"key1" {
                 key1_entries.push(entry);
             }
         }
-        // We should have at least 1 merge operation for key1
+        assert_eq!(key1_entries.len(), 1);
         assert!(
-            !key1_entries.is_empty(),
-            "should have merge operations for key1"
+            matches!(&key1_entries[0].value, crate::types::ValueDeletable::Value(value) if value.as_ref() == b"b"),
+            "expected only the newer value 'b', got {:?}",
+            key1_entries[0].value,
         );
-        // All entries for key1 should be merge operations
-        assert!(key1_entries
-            .iter()
-            .all(|e| matches!(e.value, crate::types::ValueDeletable::Merge(_))));
-        // If there are 2 entries, they should have different expire times
-        if key1_entries.len() == 2 {
-            assert_ne!(
-                key1_entries[0].expire_ts, key1_entries[1].expire_ts,
-                "separate merge operations should have different expire times"
-            );
-        }
+        assert_eq!(key1_entries[0].expire_ts, Some(200));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3558,7 +3551,7 @@ mod tests {
         let merged = &key1_entries[0];
         assert_eq!(merged.expire_ts, Some(1000));
         assert!(
-            matches!(&merged.value, crate::types::ValueDeletable::Merge(v) if v.as_ref() == b"ab"),
+            matches!(&merged.value, crate::types::ValueDeletable::Value(v) if v.as_ref() == b"ab"),
             "expected merged value 'ab', got {:?}",
             merged.value
         );
