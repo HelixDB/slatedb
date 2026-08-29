@@ -639,6 +639,34 @@ pub(crate) fn decode_varint(buf: &mut impl Buf) -> u32 {
     result
 }
 
+/// Decode a bounded u32 LEB128 value from untrusted storage bytes.
+pub(crate) fn decode_varint_checked(buf: &mut impl Buf) -> Result<u32, SlateDBError> {
+    let mut result = 0u32;
+    for byte_index in 0..5 {
+        if !buf.has_remaining() {
+            return Err(SlateDBError::CorruptSst {
+                reason: "truncated row varint",
+                path: None,
+            });
+        }
+        let byte = buf.get_u8();
+        if byte_index == 4 && (byte & 0xf0) != 0 {
+            return Err(SlateDBError::CorruptSst {
+                reason: "row varint overflows u32",
+                path: None,
+            });
+        }
+        result |= u32::from(byte & 0x7f) << (byte_index * 7);
+        if byte & 0x80 == 0 {
+            return Ok(result);
+        }
+    }
+    Err(SlateDBError::CorruptSst {
+        reason: "row varint exceeds five bytes",
+        path: None,
+    })
+}
+
 /// Calculate the encoded length of a u32 varint without actually encoding it.
 #[allow(dead_code)]
 pub(crate) fn varint_len(mut value: u32) -> usize {

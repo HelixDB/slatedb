@@ -34,6 +34,24 @@ pub(crate) enum SlateDBError {
     #[error("empty block")]
     EmptyBlock,
 
+    #[error(
+        "corrupt SST data: {reason}{}",
+        .path.as_ref().map(|path| format!(" in {path}")).unwrap_or_default()
+    )]
+    CorruptSst {
+        reason: &'static str,
+        path: Option<Path>,
+    },
+
+    #[error(
+        "WAL replay memory limit exceeded: {kind} requires {required_bytes} bytes, limit is {limit_bytes} bytes"
+    )]
+    WalReplayMemoryLimitExceeded {
+        kind: &'static str,
+        required_bytes: usize,
+        limit_bytes: usize,
+    },
+
     #[error("empty RowEntry key")]
     EmptyKey,
 
@@ -333,6 +351,10 @@ impl SlateDBError {
             SlateDBError::ChecksumMismatch { path: None } => SlateDBError::ChecksumMismatch {
                 path: Some(path.clone()),
             },
+            SlateDBError::CorruptSst { reason, path: None } => SlateDBError::CorruptSst {
+                reason,
+                path: Some(path.clone()),
+            },
             other => other,
         }
     }
@@ -381,6 +403,7 @@ impl SlateDBError {
             SlateDBError::InvalidFlatbuffer(_)
             | SlateDBError::EmptyBlock
             | SlateDBError::EmptyBlockMeta
+            | SlateDBError::CorruptSst { .. }
             | SlateDBError::InvalidFilterBlock
             | SlateDBError::BlockTransformError => Some(RetryReason::BlockDecodeError),
             _ => None,
@@ -772,6 +795,8 @@ impl From<SlateDBError> for Error {
             SlateDBError::InvalidTransactionalObjectState => Error::data(msg),
             SlateDBError::EmptyManifest => Error::data(msg),
             SlateDBError::EmptyBlock => Error::data(msg),
+            SlateDBError::CorruptSst { .. } => Error::data(msg),
+            SlateDBError::WalReplayMemoryLimitExceeded { .. } => Error::data(msg),
             SlateDBError::EmptyKey => Error::data(msg),
             SlateDBError::EmptyBlockMeta => Error::data(msg),
             SlateDBError::InvalidFilterBlock => Error::data(msg),

@@ -127,7 +127,7 @@ impl SsTableInfoCodec for FlatBufferSsTableInfoCodec {
 
     fn decode(&self, bytes: &Bytes) -> Result<SsTableInfo, SlateDBError> {
         let info = flatbuffers::root_with_opts::<FbSsTableInfo>(&verifier_options(), bytes)?;
-        Ok(Self::sst_info(&info))
+        Self::sst_info_checked(&info)
     }
 
     fn clone_box(&self) -> Box<dyn SsTableInfoCodec> {
@@ -137,6 +137,10 @@ impl SsTableInfoCodec for FlatBufferSsTableInfoCodec {
 
 impl FlatBufferSsTableInfoCodec {
     pub(crate) fn sst_info(info: &FbSsTableInfo) -> SsTableInfo {
+        Self::sst_info_checked(info).expect("validated manifest contains invalid SST info enum")
+    }
+
+    fn sst_info_checked(info: &FbSsTableInfo) -> Result<SsTableInfo, SlateDBError> {
         let first_entry: Option<Bytes> = info
             .first_entry()
             .map(|entry| Bytes::copy_from_slice(entry.bytes()));
@@ -144,19 +148,42 @@ impl FlatBufferSsTableInfoCodec {
             .last_entry()
             .map(|entry| Bytes::copy_from_slice(entry.bytes()));
 
-        SsTableInfo {
+        let compression_codec = match info.compression_format() {
+            CompressionFormat::None => None,
+            #[cfg(feature = "snappy")]
+            CompressionFormat::Snappy => Some(CompressionCodec::Snappy),
+            #[cfg(feature = "lz4")]
+            CompressionFormat::Lz4 => Some(CompressionCodec::Lz4),
+            #[cfg(feature = "zlib")]
+            CompressionFormat::Zlib => Some(CompressionCodec::Zlib),
+            #[cfg(feature = "zstd")]
+            CompressionFormat::Zstd => Some(CompressionCodec::Zstd),
+            _ => return Err(corrupt_sst_info("unknown or unavailable compression codec")),
+        };
+        let sst_type = match info.sst_type() {
+            FbSstType::Compacted => SstType::Compacted,
+            FbSstType::Wal => SstType::Wal,
+            _ => return Err(corrupt_sst_info("unknown SST type")),
+        };
+        let filter_format = match info.filter_format() {
+            FbFilterFormat::Legacy => FilterFormat::Legacy,
+            FbFilterFormat::Composite => FilterFormat::Composite,
+            _ => return Err(corrupt_sst_info("unknown filter format")),
+        };
+
+        Ok(SsTableInfo {
             first_entry,
             last_entry,
             index_offset: info.index_offset(),
             index_len: info.index_len(),
             filter_offset: info.filter_offset(),
             filter_len: info.filter_len(),
-            compression_codec: info.compression_format().into(),
-            sst_type: info.sst_type().into(),
+            compression_codec,
+            sst_type,
             stats_offset: info.stats_offset(),
             stats_len: info.stats_len(),
-            filter_format: info.filter_format().into(),
-        }
+            filter_format,
+        })
     }
 
     pub(crate) fn create_from_sst_info(info: &SsTableInfo) -> Bytes {
@@ -1475,16 +1502,6 @@ impl From<SstType> for FbSstType {
     }
 }
 
-impl From<FbSstType> for SstType {
-    fn from(value: FbSstType) -> Self {
-        match value {
-            FbSstType::Compacted => SstType::Compacted,
-            FbSstType::Wal => SstType::Wal,
-            _ => unreachable!("unknown SstType value: {:?}", value),
-        }
-    }
-}
-
 impl From<FilterFormat> for FbFilterFormat {
     fn from(value: FilterFormat) -> Self {
         match value {
@@ -1494,30 +1511,8 @@ impl From<FilterFormat> for FbFilterFormat {
     }
 }
 
-impl From<FbFilterFormat> for FilterFormat {
-    fn from(value: FbFilterFormat) -> Self {
-        match value {
-            FbFilterFormat::Legacy => FilterFormat::Legacy,
-            FbFilterFormat::Composite => FilterFormat::Composite,
-            _ => unreachable!("unknown FilterFormat value: {:?}", value),
-        }
-    }
-}
-
-impl From<CompressionFormat> for Option<CompressionCodec> {
-    fn from(value: CompressionFormat) -> Self {
-        match value {
-            #[cfg(feature = "snappy")]
-            CompressionFormat::Snappy => Some(CompressionCodec::Snappy),
-            #[cfg(feature = "lz4")]
-            CompressionFormat::Lz4 => Some(CompressionCodec::Lz4),
-            #[cfg(feature = "zlib")]
-            CompressionFormat::Zlib => Some(CompressionCodec::Zlib),
-            #[cfg(feature = "zstd")]
-            CompressionFormat::Zstd => Some(CompressionCodec::Zstd),
-            _ => None,
-        }
-    }
+fn corrupt_sst_info(reason: &'static str) -> SlateDBError {
+    SlateDBError::CorruptSst { reason, path: None }
 }
 
 impl From<CompactionStatus> for FbCompactionStatus {

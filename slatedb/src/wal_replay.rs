@@ -1,11 +1,10 @@
 use crate::block_iterator::DataBlockIterator;
 use crate::config::WalReplaySettings;
 use crate::error::SlateDBError;
-use crate::format::block::Block;
 use crate::iter::{IterationOrder, RowEntryIterator};
 use crate::manifest::ManifestCore;
 use crate::mem_table::WritableKVTable;
-use crate::tablestore::{DecodedWalSst, TableStore};
+use crate::tablestore::{DecodedWalSst, DecodedWalSstData, TableStore};
 use crate::types::RowEntry;
 use crate::utils::panic_string;
 use async_trait::async_trait;
@@ -71,18 +70,42 @@ struct PendingWal {
 }
 
 struct WalBlocksIterator {
-    format_version: u16,
-    blocks: VecDeque<Block>,
-    current: Option<DataBlockIterator<Block>>,
+    table_store: Arc<TableStore>,
+    wal: Option<DecodedWalSstData>,
+    next_block: usize,
+    current: Option<DataBlockIterator<crate::format::block::Block>>,
+    encoded_byte_limit: usize,
+    working_memory_limit: usize,
+    block_working_memory_limit: usize,
+    validation_retried: bool,
+    yielded_rows: bool,
 }
 
 impl WalBlocksIterator {
-    fn new(format_version: u16, blocks: VecDeque<Block>) -> Self {
-        Self {
-            format_version,
-            blocks,
+    fn new(
+        table_store: Arc<TableStore>,
+        wal: DecodedWalSstData,
+        encoded_byte_limit: usize,
+        working_memory_limit: usize,
+    ) -> Result<Self, SlateDBError> {
+        let block_working_memory_limit = working_memory_limit
+            .checked_sub(wal.retained_decode_bytes)
+            .ok_or(SlateDBError::WalReplayMemoryLimitExceeded {
+                kind: "WAL metadata, index, and block",
+                required_bytes: wal.retained_decode_bytes,
+                limit_bytes: working_memory_limit,
+            })?;
+        Ok(Self {
+            table_store,
+            wal: Some(wal),
+            next_block: 0,
             current: None,
-        }
+            encoded_byte_limit,
+            working_memory_limit,
+            block_working_memory_limit,
+            validation_retried: false,
+            yielded_rows: false,
+        })
     }
 }
 
@@ -96,15 +119,66 @@ impl RowEntryIterator for WalBlocksIterator {
         loop {
             if let Some(current) = &mut self.current {
                 if let Some(entry) = current.next().await? {
+                    self.yielded_rows = true;
                     return Ok(Some(entry));
                 }
             }
-            let Some(block) = self.blocks.pop_front() else {
+            let wal = self.wal.as_ref().ok_or(SlateDBError::InvalidDBState)?;
+            let block_count = wal.index.borrow().block_meta().len();
+            if self.next_block >= block_count {
                 return Ok(None);
+            }
+            let decoded = self
+                .table_store
+                .decode_wal_block(wal, self.next_block, self.block_working_memory_limit)
+                .await;
+            let block = match decoded {
+                Ok(block) => block,
+                Err(error) => {
+                    let Some(reason) = error.maybe_validation_retry_reason() else {
+                        return Err(error);
+                    };
+                    if self.validation_retried || self.yielded_rows {
+                        return Err(error);
+                    }
+                    let old_wal = self.wal.take().ok_or(SlateDBError::InvalidDBState)?;
+                    let wal_id = old_wal.wal_id;
+                    let expected_size = old_wal.object_bytes.len();
+                    drop(old_wal);
+                    self.validation_retried = true;
+                    let replacement = self
+                        .table_store
+                        .refetch_wal_sst_after_validation(
+                            wal_id,
+                            expected_size,
+                            self.encoded_byte_limit,
+                            self.working_memory_limit,
+                            reason,
+                        )
+                        .await?;
+                    let DecodedWalSst::Data(replacement) = replacement else {
+                        return Err(SlateDBError::CorruptSst {
+                            reason: "nonempty WAL changed into a fence during validation retry",
+                            path: None,
+                        });
+                    };
+                    self.block_working_memory_limit = self
+                        .working_memory_limit
+                        .checked_sub(replacement.retained_decode_bytes)
+                        .ok_or(SlateDBError::WalReplayMemoryLimitExceeded {
+                            kind: "WAL metadata, index, and block",
+                            required_bytes: replacement.retained_decode_bytes,
+                            limit_bytes: self.working_memory_limit,
+                        })?;
+                    self.wal = Some(*replacement);
+                    continue;
+                }
             };
+            self.next_block += 1;
+            let wal = self.wal.as_ref().ok_or(SlateDBError::InvalidDBState)?;
             self.current = Some(DataBlockIterator::new(
                 block,
-                self.format_version,
+                wal.format_version,
                 IterationOrder::Ascending,
             )?);
         }
@@ -160,6 +234,8 @@ pub(crate) struct WalReplayIterator {
     listed_sizes: VecDeque<(u64, u64)>,
     pending_fetches: VecDeque<PendingWal>,
     byte_semaphore: Arc<Semaphore>,
+    encoded_byte_limit: usize,
+    working_memory_limit: usize,
     last_tick: i64,
     last_seq: u64,
     min_seq: u64,
@@ -204,7 +280,17 @@ impl WalReplayIterator {
             previous_listed_wal_id = Some(wal_id);
             listed_sizes.push_back((wal_id, metadata.metadata.size));
         }
-        let byte_semaphore = Arc::new(Semaphore::new(options.prefetch.max_inflight_bytes));
+        const MAX_DECODE_WORKING_BYTES: usize = 64 * 1024 * 1024;
+        let working_memory_limit =
+            (options.prefetch.max_inflight_bytes / 4).min(MAX_DECODE_WORKING_BYTES);
+        let encoded_byte_limit = options
+            .prefetch
+            .max_inflight_bytes
+            .checked_sub(working_memory_limit)
+            .ok_or(SlateDBError::InvalidConfiguration(
+                "wal replay memory budget cannot reserve decode working memory".into(),
+            ))?;
+        let byte_semaphore = Arc::new(Semaphore::new(encoded_byte_limit));
         let next_wal_id = wal_id_range.start;
 
         let mut replay_iter = WalReplayIterator {
@@ -216,6 +302,8 @@ impl WalReplayIterator {
             listed_sizes,
             pending_fetches: VecDeque::new(),
             byte_semaphore,
+            encoded_byte_limit,
+            working_memory_limit,
             last_tick,
             last_seq,
             min_seq,
@@ -270,12 +358,28 @@ impl WalReplayIterator {
                     .filter(|(wal_id, _)| *wal_id == self.next_wal_id)
                     .map(|(_, size)| *size),
             };
-            let byte_limit = self.options.prefetch.max_inflight_bytes;
+            let byte_limit = self.encoded_byte_limit;
             let reserved_bytes = plan
                 .expected_size
                 .and_then(|size| usize::try_from(size).ok())
                 .unwrap_or(byte_limit)
-                .clamp(1, byte_limit);
+                .max(1);
+            if reserved_bytes > byte_limit {
+                let required_bytes = reserved_bytes;
+                let wal_id = plan.wal_id;
+                self.next_wal_id += 1;
+                self.pending_fetches.push_back(PendingWal {
+                    wal_id,
+                    handle: tokio::spawn(async move {
+                        Err(SlateDBError::WalReplayMemoryLimitExceeded {
+                            kind: "encoded WAL object",
+                            required_bytes,
+                            limit_bytes: byte_limit,
+                        })
+                    }),
+                });
+                break;
+            }
             let permit_count = u32::try_from(reserved_bytes)
                 .expect("validated WAL replay byte limit must fit in u32");
             let Ok(permit) = Arc::clone(&self.byte_semaphore).try_acquire_many_owned(permit_count)
@@ -289,7 +393,7 @@ impl WalReplayIterator {
             let table_store = Arc::clone(&self.table_store);
             let handle = tokio::spawn(async move {
                 let bytes = table_store
-                    .read_wal_sst_bytes(plan.wal_id, plan.expected_size)
+                    .read_wal_sst_bytes(plan.wal_id, plan.expected_size, byte_limit)
                     .await?;
                 Ok(FetchedWal {
                     wal_id: plan.wal_id,
@@ -304,9 +408,7 @@ impl WalReplayIterator {
             self.peak_concurrent_objects =
                 self.peak_concurrent_objects.max(self.pending_fetches.len());
             self.peak_reserved_bytes = self.peak_reserved_bytes.max(
-                self.options
-                    .prefetch
-                    .max_inflight_bytes
+                self.encoded_byte_limit
                     .saturating_sub(self.byte_semaphore.available_permits()),
             );
         }
@@ -332,31 +434,63 @@ impl WalReplayIterator {
                     return Err(self.fail(SlateDBError::BackgroundTaskCancelled(task_name)));
                 }
             };
-            assert_eq!(pending.wal_id, fetched.wal_id);
+            if pending.wal_id != fetched.wal_id {
+                return Err(self.fail(SlateDBError::InvalidDBState));
+            }
+            let FetchedWal {
+                wal_id,
+                bytes,
+                permit,
+            } = fetched;
             self.fetched_objects = self.fetched_objects.saturating_add(1);
             self.fetched_bytes = self
                 .fetched_bytes
-                .saturating_add(u64::try_from(fetched.bytes.len()).unwrap_or(u64::MAX));
-            let decoded = match self
+                .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+            let expected_size = bytes.len();
+            let initial_decode = self
                 .table_store
-                .decode_wal_sst(fetched.wal_id, fetched.bytes)
-                .await
-            {
+                .decode_wal_sst(wal_id, bytes, self.working_memory_limit)
+                .await;
+            let decoded = match initial_decode {
                 Ok(decoded) => decoded,
-                Err(error) => return Err(self.fail(error)),
+                Err(error) => {
+                    let Some(reason) = error.maybe_validation_retry_reason() else {
+                        return Err(self.fail(error));
+                    };
+                    match self
+                        .table_store
+                        .refetch_wal_sst_after_validation(
+                            wal_id,
+                            expected_size,
+                            self.encoded_byte_limit,
+                            self.working_memory_limit,
+                            reason,
+                        )
+                        .await
+                    {
+                        Ok(decoded) => decoded,
+                        Err(error) => return Err(self.fail(error)),
+                    }
+                }
             };
             self.decoded_objects = self.decoded_objects.saturating_add(1);
             let iter: Box<dyn RowEntryIterator + 'static> = match decoded {
-                DecodedWalSst::Fence => Box::new(WalBlocksIterator::new(0, VecDeque::new())),
-                DecodedWalSst::Data {
-                    format_version,
-                    blocks,
-                } => Box::new(WalBlocksIterator::new(format_version, blocks)),
+                DecodedWalSst::Fence => Box::new(crate::iter::EmptyIterator::new()),
+                DecodedWalSst::Data(wal) => {
+                    let iterator = WalBlocksIterator::new(
+                        Arc::clone(&self.table_store),
+                        *wal,
+                        self.encoded_byte_limit,
+                        self.working_memory_limit,
+                    )
+                    .map_err(|error| self.fail(error))?;
+                    Box::new(iterator)
+                }
             };
             Some(WalIdAndIter {
-                wal_id: fetched.wal_id,
+                wal_id,
                 iter,
-                _permit: fetched.permit,
+                _permit: permit,
             })
         } else {
             None
@@ -500,7 +634,7 @@ mod tests {
     use crate::bytes_range::BytesRange;
     use crate::config::WalReplaySettings;
     use crate::db_state::SsTableId;
-    use crate::format::sst::SsTableFormat;
+    use crate::format::sst::{BlockTransformer, SsTableFormat};
     use crate::iter::{IterationOrder, RowEntryIterator};
     use crate::manifest::ManifestCore;
     use crate::mem_table::WritableKVTable;
@@ -508,7 +642,7 @@ mod tests {
     use crate::proptest_util::{rng, sample};
     use crate::tablestore::{DecodedWalSst, TableStore, TableStoreKind};
     use crate::test_utils::{GatedObjectStore, RecordingObjectStore};
-    use crate::types::RowEntry;
+    use crate::types::{RowEntry, ValueDeletable};
     use crate::{error::SlateDBError, test_utils};
     use async_trait::async_trait;
     use bytes::Bytes;
@@ -520,6 +654,7 @@ mod tests {
         CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
         ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
     };
+    use proptest::prelude::*;
     use proptest::test_runner::TestRng;
     use rand::Rng;
     use std::cmp::min;
@@ -529,6 +664,45 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::Notify;
+
+    struct HistoricalXorTransformer;
+
+    #[async_trait]
+    impl BlockTransformer for HistoricalXorTransformer {
+        fn max_decoded_len(&self, encoded_len: usize) -> Option<usize> {
+            Some(encoded_len)
+        }
+
+        async fn encode(&self, data: Bytes) -> Result<Bytes, crate::Error> {
+            Ok(Bytes::from(
+                data.iter().map(|byte| byte ^ 0xa5).collect::<Vec<_>>(),
+            ))
+        }
+
+        async fn decode(&self, data: Bytes) -> Result<Bytes, crate::Error> {
+            self.encode(data).await
+        }
+    }
+
+    struct UnboundedTransformer {
+        decode_called: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl BlockTransformer for UnboundedTransformer {
+        fn max_decoded_len(&self, _encoded_len: usize) -> Option<usize> {
+            None
+        }
+
+        async fn encode(&self, data: Bytes) -> Result<Bytes, crate::Error> {
+            Ok(data)
+        }
+
+        async fn decode(&self, data: Bytes) -> Result<Bytes, crate::Error> {
+            self.decode_called.store(true, Ordering::SeqCst);
+            Ok(data)
+        }
+    }
 
     #[cfg(test)]
     use crate::sst_builder::BlockFormat;
@@ -850,6 +1024,147 @@ mod tests {
         assert_eq!(replayed.last_seq, 2);
     }
 
+    #[tokio::test]
+    async fn historical_wal_goldens_match_range_and_full_object_decoders() {
+        for (name, bytes) in historical_wal_fixtures() {
+            let mut format = SsTableFormat::default();
+            if name.ends_with("-xor") {
+                format.block_transformer = Some(Arc::new(HistoricalXorTransformer));
+            }
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let table_store =
+                test_table_store_with_format_and_object_store(format, Arc::clone(&store));
+            let path = Path::from("/tmp/test_kv_store/wal/00000000000000000001.sst");
+            store.put(&path, bytes.clone().into()).await.unwrap();
+
+            let handle = table_store.open_sst(&SsTableId::Wal(1)).await.unwrap();
+            let index = table_store.read_index(&handle, false).await.unwrap();
+            let block_count = index.borrow().block_meta().len();
+            let range_blocks = table_store
+                .read_blocks_using_index(&handle, index, 0..block_count, false)
+                .await
+                .unwrap();
+            let mut range_rows = Vec::new();
+            for block in range_blocks {
+                let mut iterator = crate::block_iterator::DataBlockIterator::new(
+                    block,
+                    handle.format_version,
+                    IterationOrder::Ascending,
+                )
+                .unwrap();
+                while let Some(row) = iterator.next().await.unwrap() {
+                    range_rows.push(row);
+                }
+            }
+
+            let decoded = table_store
+                .decode_wal_sst(1, bytes, 64 * 1024 * 1024)
+                .await
+                .unwrap();
+            let DecodedWalSst::Data(wal) = decoded else {
+                panic!("historical fixture {name} decoded as a fence");
+            };
+            let mut iterator = super::WalBlocksIterator::new(
+                Arc::clone(&table_store),
+                *wal,
+                192 * 1024 * 1024,
+                64 * 1024 * 1024,
+            )
+            .unwrap();
+            let mut full_rows = Vec::new();
+            while let Some(row) = iterator.next().await.unwrap() {
+                full_rows.push(row);
+            }
+
+            assert_eq!(full_rows, range_rows, "fixture {name}");
+            assert_historical_rows(name, &full_rows);
+
+            let expected_filtered = range_rows
+                .iter()
+                .filter(|row| row.seq > 8)
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut replay = WalReplayIterator::range(
+                1..2,
+                &ManifestCore::new(),
+                WalReplayOptions {
+                    min_seq: Some(8),
+                    ..WalReplayOptions::default()
+                },
+                Arc::clone(&table_store),
+            )
+            .await
+            .unwrap();
+            let replayed = replay.next().await.unwrap().unwrap();
+            let mut replayed_rows = Vec::new();
+            let mut replayed_iter = replayed.table.table().iter();
+            while let Some(row) = replayed_iter.next().await.unwrap() {
+                replayed_rows.push(row);
+            }
+            assert_eq!(replayed_rows, expected_filtered, "filtered fixture {name}");
+            assert!(replay.next().await.unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn historical_wal_goldens_report_identical_checksum_errors() {
+        for (name, bytes) in historical_wal_fixtures() {
+            let mut format = SsTableFormat::default();
+            if name.ends_with("-xor") {
+                format.block_transformer = Some(Arc::new(HistoricalXorTransformer));
+            }
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let table_store =
+                test_table_store_with_format_and_object_store(format, Arc::clone(&store));
+            let path = Path::from("/tmp/test_kv_store/wal/00000000000000000001.sst");
+            let mut corrupted = bytes.to_vec();
+            corrupted[0] ^= 1;
+            let corrupted = Bytes::from(corrupted);
+            store.put(&path, corrupted.clone().into()).await.unwrap();
+
+            let handle = table_store.open_sst(&SsTableId::Wal(1)).await.unwrap();
+            let index = table_store.read_index(&handle, false).await.unwrap();
+            let range_error = table_store
+                .read_blocks_using_index(
+                    &handle,
+                    index.clone(),
+                    0..index.borrow().block_meta().len(),
+                    false,
+                )
+                .await;
+            let Err(range_error) = range_error else {
+                panic!("corrupted historical fixture {name} passed range decoding");
+            };
+
+            let decoded = table_store
+                .decode_wal_sst(1, corrupted, 64 * 1024 * 1024)
+                .await
+                .unwrap();
+            let DecodedWalSst::Data(wal) = decoded else {
+                panic!("corrupted historical fixture {name} decoded as a fence");
+            };
+            let mut full_iterator = super::WalBlocksIterator::new(
+                Arc::clone(&table_store),
+                *wal,
+                192 * 1024 * 1024,
+                64 * 1024 * 1024,
+            )
+            .unwrap();
+            let full_error = full_iterator.next().await.unwrap_err();
+
+            assert_eq!(
+                full_error.maybe_validation_retry_reason(),
+                range_error.maybe_validation_retry_reason(),
+                "fixture {name}"
+            );
+            assert_eq!(
+                full_error.maybe_validation_retry_reason(),
+                Some(crate::error::RetryReason::CrcMismatch),
+                "fixture {name}"
+            );
+        }
+    }
+
     #[cfg(feature = "snappy")]
     #[tokio::test]
     async fn should_replay_compressed_wal() {
@@ -1089,12 +1404,35 @@ mod tests {
 
         let mut corrupted = valid.to_vec();
         corrupted[0] ^= 1;
+        let initially_decoded = table_store
+            .decode_wal_sst(1, Bytes::from(corrupted), 64 * 1024 * 1024)
+            .await
+            .unwrap();
+        let DecodedWalSst::Data(initially_decoded) = initially_decoded else {
+            panic!("nonempty WAL decoded as a fence");
+        };
+        let Err(initial_error) = table_store
+            .decode_wal_block(&initially_decoded, 0, 64 * 1024 * 1024)
+            .await
+        else {
+            panic!("corrupt initial WAL block unexpectedly decoded");
+        };
+        drop(initially_decoded);
+        let reason = initial_error
+            .maybe_validation_retry_reason()
+            .expect("corruption must be classified for a validation retry");
         let decoded = table_store
-            .decode_wal_sst(1, Bytes::from(corrupted))
+            .refetch_wal_sst_after_validation(
+                1,
+                valid.len(),
+                192 * 1024 * 1024,
+                64 * 1024 * 1024,
+                reason,
+            )
             .await
             .unwrap();
 
-        assert!(matches!(decoded, DecodedWalSst::Data { .. }));
+        assert!(matches!(decoded, DecodedWalSst::Data(_)));
         assert_eq!(recording.get_kinds(false).len(), 1);
         assert!(recording.get_retries(false)[0].is_some());
     }
@@ -1124,9 +1462,13 @@ mod tests {
                 .put(&location, truncated.clone().into())
                 .await
                 .unwrap();
-            let result = std::panic::AssertUnwindSafe(table_store.decode_wal_sst(1, truncated))
-                .catch_unwind()
-                .await;
+            let result = std::panic::AssertUnwindSafe(table_store.decode_wal_sst(
+                1,
+                truncated,
+                64 * 1024 * 1024,
+            ))
+            .catch_unwind()
+            .await;
             let decode = result
                 .unwrap_or_else(|_| panic!("WAL decoder panicked for prefix length {prefix_len}"));
             assert!(
@@ -1321,6 +1663,378 @@ mod tests {
         gated.get_opts_gate.release();
         while replay_iter.next().await.unwrap().is_some() {}
         assert_eq!(gated.get_opts_gate.arrivals(), 4);
+    }
+
+    #[cfg(any(
+        feature = "snappy",
+        feature = "zlib",
+        feature = "lz4",
+        feature = "zstd"
+    ))]
+    #[tokio::test]
+    async fn compressed_wals_cannot_expand_past_total_replay_memory_budget() {
+        let mut codecs = Vec::new();
+        #[cfg(feature = "snappy")]
+        codecs.push(crate::config::CompressionCodec::Snappy);
+        #[cfg(feature = "zlib")]
+        codecs.push(crate::config::CompressionCodec::Zlib);
+        #[cfg(feature = "lz4")]
+        codecs.push(crate::config::CompressionCodec::Lz4);
+        #[cfg(feature = "zstd")]
+        codecs.push(crate::config::CompressionCodec::Zstd);
+
+        for codec in codecs {
+            let inner = Arc::new(InMemory::new());
+            let recording = Arc::new(RecordingObjectStore::new(inner));
+            let format = SsTableFormat {
+                compression_codec: Some(codec),
+                ..SsTableFormat::default()
+            };
+            let table_store =
+                test_table_store_with_format_and_object_store(format, recording.clone());
+            let mut builder = table_store.wal_table_builder();
+            builder
+                .add(RowEntry::new_value(b"large", &vec![b'x'; 1024 * 1024], 1))
+                .await
+                .unwrap();
+            let encoded = builder.build().await.unwrap();
+            table_store
+                .write_sst(&SsTableId::Wal(1), &encoded)
+                .await
+                .unwrap();
+            recording.clear();
+
+            let total_budget = 256 * 1024;
+            let mut replay = WalReplayIterator::range(
+                1..2,
+                &ManifestCore::new(),
+                WalReplayOptions {
+                    prefetch: WalReplaySettings {
+                        max_concurrent_objects: 64,
+                        max_inflight_bytes: total_budget,
+                    },
+                    ..WalReplayOptions::default()
+                },
+                table_store,
+            )
+            .await
+            .unwrap();
+            assert!(replay.peak_reserved_bytes + replay.working_memory_limit <= total_budget);
+            let Err(first_error) = replay.next().await else {
+                panic!("{codec:?} WAL expanded past its memory budget");
+            };
+            let Err(second_error) = replay.next().await else {
+                panic!("{codec:?} memory-limit failure was not sticky");
+            };
+            assert!(matches!(
+                first_error,
+                SlateDBError::WalReplayMemoryLimitExceeded { .. }
+            ));
+            assert!(matches!(
+                second_error,
+                SlateDBError::WalReplayMemoryLimitExceeded { .. }
+            ));
+            assert_eq!(recording.get_kinds(false).len(), 1, "{codec:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_encoded_wal_is_rejected_before_get() {
+        let inner = Arc::new(InMemory::new());
+        let recording = Arc::new(RecordingObjectStore::new(inner));
+        let table_store = test_table_store_with_object_store(recording.clone());
+        let mut builder = table_store.wal_table_builder();
+        builder
+            .add(RowEntry::new_value(b"large", &vec![b'x'; 128 * 1024], 1))
+            .await
+            .unwrap();
+        let encoded = builder.build().await.unwrap();
+        table_store
+            .write_sst(&SsTableId::Wal(1), &encoded)
+            .await
+            .unwrap();
+        recording.clear();
+
+        let mut replay = WalReplayIterator::range(
+            1..2,
+            &ManifestCore::new(),
+            WalReplayOptions {
+                prefetch: WalReplaySettings {
+                    max_concurrent_objects: 64,
+                    max_inflight_bytes: 64 * 1024,
+                },
+                ..WalReplayOptions::default()
+            },
+            table_store,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            replay.next().await,
+            Err(SlateDBError::WalReplayMemoryLimitExceeded { .. })
+        ));
+        assert!(recording.get_kinds(false).is_empty());
+    }
+
+    #[tokio::test]
+    async fn unbounded_transform_is_rejected_before_decode() {
+        let decode_called = Arc::new(AtomicBool::new(false));
+        let format = SsTableFormat {
+            block_transformer: Some(Arc::new(UnboundedTransformer {
+                decode_called: Arc::clone(&decode_called),
+            })),
+            ..SsTableFormat::default()
+        };
+        let table_store = test_table_store_with_format(format);
+        let mut builder = table_store.wal_table_builder();
+        builder
+            .add(RowEntry::new_value(b"key", b"value", 1))
+            .await
+            .unwrap();
+        let encoded = builder.build().await.unwrap();
+        table_store
+            .write_sst(&SsTableId::Wal(1), &encoded)
+            .await
+            .unwrap();
+
+        let mut replay = WalReplayIterator::range(
+            1..2,
+            &ManifestCore::new(),
+            WalReplayOptions::default(),
+            table_store,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            replay.next().await,
+            Err(SlateDBError::BlockTransformError)
+        ));
+        assert!(!decode_called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn later_checksum_valid_structural_corruption_returns_no_partial_wal() {
+        let inner = Arc::new(InMemory::new());
+        let recording = Arc::new(RecordingObjectStore::new(inner.clone()));
+        let table_store = test_table_store_with_object_store(recording.clone());
+        let mut builder = table_store.wal_table_builder();
+        for seq in 1..=12 {
+            builder
+                .add(RowEntry::new_value(
+                    format!("key-{seq:02}").as_bytes(),
+                    &[b'x'; 1024],
+                    seq,
+                ))
+                .await
+                .unwrap();
+        }
+        let encoded = builder.build().await.unwrap();
+        let mut bytes = encoded.remaining_as_bytes().to_vec();
+        let decoded = table_store
+            .decode_wal_sst(1, Bytes::copy_from_slice(&bytes), 64 * 1024 * 1024)
+            .await
+            .unwrap();
+        let DecodedWalSst::Data(wal) = decoded else {
+            panic!("data WAL decoded as a fence");
+        };
+        let block_meta = wal.index.borrow().block_meta();
+        assert!(block_meta.len() >= 2);
+        let block_index = block_meta.len() - 1;
+        let start = block_meta.get(block_index).offset() as usize;
+        let end = wal.info.filter_offset as usize;
+        drop(wal);
+        let payload_end = end - crate::format::sst::CHECKSUM_SIZE;
+        bytes[payload_end - 2..payload_end].copy_from_slice(&0u16.to_be_bytes());
+        let checksum = crc32fast::hash(&bytes[start..payload_end]);
+        bytes[payload_end..end].copy_from_slice(&checksum.to_be_bytes());
+        let path = Path::from("/tmp/test_kv_store/wal/00000000000000000001.sst");
+        inner.put(&path, Bytes::from(bytes).into()).await.unwrap();
+        recording.clear();
+
+        let mut replay = WalReplayIterator::range(
+            1..2,
+            &ManifestCore::new(),
+            WalReplayOptions::default(),
+            table_store,
+        )
+        .await
+        .unwrap();
+        assert!(replay.next().await.is_err());
+        assert!(replay.next().await.is_err());
+        assert_eq!(recording.get_kinds(false).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn checksum_valid_metadata_index_block_and_row_mutations_never_panic() {
+        let table_store = test_table_store();
+        let mut builder = table_store.wal_table_builder();
+        for seq in 1..=16 {
+            builder
+                .add(RowEntry::new(
+                    format!("key-{seq:02}").into(),
+                    if seq % 3 == 0 {
+                        ValueDeletable::Merge(Bytes::from_static(b"merge"))
+                    } else if seq % 5 == 0 {
+                        ValueDeletable::Tombstone
+                    } else {
+                        ValueDeletable::Value(Bytes::from(vec![seq as u8; 256]))
+                    },
+                    seq,
+                    (seq % 2 == 0).then_some(seq as i64),
+                    (seq % 4 == 0).then_some((seq * 10) as i64),
+                ))
+                .await
+                .unwrap();
+        }
+        let encoded = builder.build().await.unwrap().remaining_as_bytes();
+        let decoded = table_store
+            .decode_wal_sst(1, encoded.clone(), 64 * 1024 * 1024)
+            .await
+            .unwrap();
+        let DecodedWalSst::Data(wal) = decoded else {
+            panic!("data WAL decoded as a fence");
+        };
+        let metadata_start = u64::from_be_bytes(
+            encoded[encoded.len() - 10..encoded.len() - 2]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let metadata_end = encoded.len() - 10;
+        let index_start = wal.info.index_offset as usize;
+        let index_end = index_start + wal.info.index_len as usize;
+        let block_meta = wal.index.borrow().block_meta();
+        let block_start = block_meta.get(0).offset() as usize;
+        let block_end = if block_meta.len() > 1 {
+            block_meta.get(1).offset() as usize
+        } else {
+            wal.info.filter_offset as usize
+        };
+        drop(wal);
+
+        let sections = [
+            ("metadata", metadata_start, metadata_end),
+            ("index", index_start, index_end),
+            ("block-and-row", block_start, block_end),
+        ];
+        for (section_name, start, end) in sections {
+            let payload_end = end - crate::format::sst::CHECKSUM_SIZE;
+            assert!(payload_end > start);
+            let mut structural_errors = 0;
+            for mutation in 0..256usize {
+                let mut mutated = encoded.to_vec();
+                let position = start + mutation % (payload_end - start);
+                mutated[position] ^= 1u8 << (mutation % 8);
+                let checksum = crc32fast::hash(&mutated[start..payload_end]);
+                mutated[payload_end..end].copy_from_slice(&checksum.to_be_bytes());
+                let table_store = Arc::clone(&table_store);
+                let decode = std::panic::AssertUnwindSafe(async move {
+                    let decoded = table_store
+                        .decode_wal_sst(1, Bytes::from(mutated), 64 * 1024 * 1024)
+                        .await?;
+                    let DecodedWalSst::Data(wal) = decoded else {
+                        return Err(SlateDBError::CorruptSst {
+                            reason: "mutated data WAL decoded as a fence",
+                            path: None,
+                        });
+                    };
+                    let mut iterator = super::WalBlocksIterator::new(
+                        Arc::clone(&table_store),
+                        *wal,
+                        192 * 1024 * 1024,
+                        64 * 1024 * 1024,
+                    )?;
+                    while iterator.next().await?.is_some() {}
+                    Ok::<(), SlateDBError>(())
+                })
+                .catch_unwind()
+                .await;
+                let result = decode.unwrap_or_else(|_| {
+                    panic!("checksum-valid {section_name} mutation {mutation} panicked")
+                });
+                if result.is_err() {
+                    structural_errors += 1;
+                }
+            }
+            assert!(
+                structural_errors > 0,
+                "{section_name} mutations never reached a structural error"
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        #[test]
+        fn checksum_valid_wal_structural_fuzz_never_panics(
+            section in 0usize..3,
+            mutations in prop::collection::vec((any::<usize>(), any::<u8>()), 1..=16),
+        ) {
+            let (_, encoded) = historical_wal_fixtures()
+                .into_iter()
+                .find(|(name, _)| *name == "v2-none")
+                .unwrap();
+            let table_store = test_table_store();
+            let decoded = futures::executor::block_on(
+                table_store.decode_wal_sst(1, encoded.clone(), 64 * 1024 * 1024),
+            )
+            .unwrap();
+            let DecodedWalSst::Data(wal) = decoded else {
+                panic!("historical data WAL decoded as a fence");
+            };
+            let metadata_start = u64::from_be_bytes(
+                encoded[encoded.len() - 10..encoded.len() - 2]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            let metadata_end = encoded.len() - 10;
+            let index_start = wal.info.index_offset as usize;
+            let index_end = index_start + wal.info.index_len as usize;
+            let block_meta = wal.index.borrow().block_meta();
+            let block_start = block_meta.get(0).offset() as usize;
+            let block_end = if block_meta.len() > 1 {
+                block_meta.get(1).offset() as usize
+            } else {
+                wal.info.filter_offset as usize
+            };
+            let sections = [
+                (metadata_start, metadata_end),
+                (index_start, index_end),
+                (block_start, block_end),
+            ];
+            let (start, end) = sections[section];
+            let payload_end = end - crate::format::sst::CHECKSUM_SIZE;
+            let mut mutated = encoded.to_vec();
+            for (offset, value) in mutations {
+                let position = start + offset % (payload_end - start);
+                mutated[position] ^= value.max(1);
+            }
+            let checksum = crc32fast::hash(&mutated[start..payload_end]);
+            mutated[payload_end..end].copy_from_slice(&checksum.to_be_bytes());
+
+            let decode = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                futures::executor::block_on(async {
+                    let decoded = table_store
+                        .decode_wal_sst(1, Bytes::from(mutated), 64 * 1024 * 1024)
+                        .await?;
+                    let DecodedWalSst::Data(wal) = decoded else {
+                        return Err(SlateDBError::CorruptSst {
+                            reason: "mutated data WAL decoded as a fence",
+                            path: None,
+                        });
+                    };
+                    let mut iterator = super::WalBlocksIterator::new(
+                        Arc::clone(&table_store),
+                        *wal,
+                        192 * 1024 * 1024,
+                        64 * 1024 * 1024,
+                    )?;
+                    while iterator.next().await?.is_some() {}
+                    Ok::<(), SlateDBError>(())
+                })
+            }));
+            prop_assert!(decode.is_ok());
+        }
     }
 
     #[tokio::test]
@@ -1596,23 +2310,42 @@ mod tests {
     async fn should_hold_byte_permits_until_the_wal_is_consumed() {
         let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let gated = Arc::new(GatedObjectStore::new(inner));
-        let table_store = test_table_store_with_object_store(gated.clone());
+        let table_store = test_table_store_with_format_and_object_store(
+            SsTableFormat {
+                block_size: 256,
+                ..SsTableFormat::default()
+            },
+            gated.clone(),
+        );
         for wal_id in 1..=2 {
             let mut builder = table_store.wal_table_builder();
-            builder
-                .add(RowEntry::new_value(
-                    format!("key-{wal_id}").as_bytes(),
-                    &[b'x'; 128],
-                    wal_id,
-                ))
-                .await
-                .unwrap();
+            for row_id in 0..16 {
+                builder
+                    .add(RowEntry::new_value(
+                        format!("key-{wal_id}-{row_id:02}").as_bytes(),
+                        &[b'x'; 128],
+                        wal_id * 16 + row_id,
+                    ))
+                    .await
+                    .unwrap();
+            }
             let encoded = builder.build().await.unwrap();
             table_store
                 .write_sst(&SsTableId::Wal(wal_id), &encoded)
                 .await
                 .unwrap();
         }
+        let listed = table_store.list_wal_ssts_for_replay(1..3).await.unwrap();
+        let largest_object = listed
+            .iter()
+            .map(|entry| usize::try_from(entry.metadata.size).unwrap())
+            .max()
+            .unwrap();
+        let total_budget = largest_object.checked_mul(4).unwrap().div_ceil(3);
+        let working_budget = total_budget / 4;
+        let encoded_budget = total_budget - working_budget;
+        assert!(encoded_budget >= largest_object);
+        assert!(encoded_budget < largest_object * 2);
         gated.get_opts_gate.close();
 
         let mut replay_iter = WalReplayIterator::range(
@@ -1621,7 +2354,7 @@ mod tests {
             WalReplayOptions {
                 prefetch: WalReplaySettings {
                     max_concurrent_objects: 2,
-                    max_inflight_bytes: 1,
+                    max_inflight_bytes: total_budget,
                 },
                 max_memtable_bytes: 1,
                 ..WalReplayOptions::default()
@@ -1974,6 +2707,63 @@ mod tests {
             total += 1;
         }
         assert_eq!(total, 500);
+    }
+
+    fn historical_wal_fixtures() -> Vec<(&'static str, Bytes)> {
+        let source = include_str!("../testdata/historical-wal-fixtures.hex");
+        source
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .filter_map(|line| {
+                let (name, encoded) = line.split_once(' ')?;
+                let feature_enabled = match name.rsplit_once('-').map(|(_, suffix)| suffix) {
+                    Some("snappy") => cfg!(feature = "snappy"),
+                    Some("zlib") => cfg!(feature = "zlib"),
+                    Some("lz4") => cfg!(feature = "lz4"),
+                    Some("zstd") => cfg!(feature = "zstd"),
+                    _ => true,
+                };
+                feature_enabled.then(|| (name, Bytes::from(decode_hex(encoded))))
+            })
+            .collect()
+    }
+
+    fn decode_hex(encoded: &str) -> Vec<u8> {
+        assert!(encoded.len().is_multiple_of(2));
+        encoded
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let high = (pair[0] as char).to_digit(16).unwrap();
+                let low = (pair[1] as char).to_digit(16).unwrap();
+                ((high << 4) | low) as u8
+            })
+            .collect()
+    }
+
+    fn assert_historical_rows(name: &str, rows: &[RowEntry]) {
+        assert_eq!(rows.len(), 5, "fixture {name}");
+        assert_eq!(
+            rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
+            vec![7, 8, 9, 10, 11]
+        );
+        assert_eq!(rows[0].key, Bytes::from_static(b"alpha"));
+        assert_eq!(
+            rows[0].value,
+            ValueDeletable::Value(Bytes::from_static(b"value-a"))
+        );
+        assert_eq!(
+            (rows[0].create_ts, rows[0].expire_ts),
+            (Some(100), Some(200))
+        );
+        assert_eq!(rows[1].key, Bytes::from_static(b"dup"));
+        assert_eq!(
+            rows[1].value,
+            ValueDeletable::Merge(Bytes::from_static(b"merge-1"))
+        );
+        assert_eq!(rows[2].key, Bytes::from_static(b"dup"));
+        assert_eq!(rows[3].value, ValueDeletable::Tombstone);
+        assert_eq!(rows[4].value.len(), 20);
     }
 
     fn test_table_store() -> Arc<TableStore> {

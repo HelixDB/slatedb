@@ -1115,9 +1115,12 @@ pub struct WalReplaySettings {
     /// Maximum number of WAL objects fetched concurrently.
     pub max_concurrent_objects: usize,
 
-    /// Maximum encoded WAL bytes retained by concurrent prefetches.
+    /// Maximum WAL payload memory used by full-object replay.
     ///
-    /// A single object larger than this limit is fetched alone.
+    /// Replay reserves `min(max_inflight_bytes / 4, 64 MiB)` for metadata, the
+    /// index, and one lazily decoded block. It uses the remainder for retained
+    /// encoded objects. A single object, transformed section, or decoded block
+    /// that cannot fit its partition is rejected instead of bypassing the bound.
     pub max_inflight_bytes: usize,
 }
 

@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 
 use crate::block_iterator::BlockLike;
 use crate::error::SlateDBError;
@@ -32,24 +32,16 @@ pub(crate) struct BlockIteratorV2<B: BlockLike> {
 impl<B: BlockLike> BlockIteratorV2<B> {
     pub(crate) fn new(block: B, ordering: IterationOrder) -> Self {
         match ordering {
-            IterationOrder::Ascending => {
-                let initial_key = if block.offsets().is_empty() {
-                    Bytes::new()
-                } else {
-                    Self::decode_first_key_at_restart(&block, 0)
-                };
-
-                BlockIteratorV2 {
-                    inner: BlockIteratorInner::Ascending(AscendingState {
-                        block,
-                        current_restart_idx: 0,
-                        offset_in_block: 0,
-                        entries_since_restart: 0,
-                        current_key: initial_key,
-                        exhausted: false,
-                    }),
-                }
-            }
+            IterationOrder::Ascending => BlockIteratorV2 {
+                inner: BlockIteratorInner::Ascending(AscendingState {
+                    block,
+                    current_restart_idx: 0,
+                    offset_in_block: 0,
+                    entries_since_restart: 0,
+                    current_key: Bytes::new(),
+                    exhausted: false,
+                }),
+            },
             IterationOrder::Descending => BlockIteratorV2 {
                 inner: BlockIteratorInner::Descending(DescendingBlockIteratorV2::new(block)),
             },
@@ -68,36 +60,66 @@ impl<B: BlockLike> BlockIteratorV2<B> {
         }
     }
 
-    fn decode_first_key_at_restart(block: &B, restart_idx: usize) -> Bytes {
-        let restart_offset = block.offsets()[restart_idx] as usize;
-        let mut data = block.data().slice(restart_offset..);
+    fn decode_first_key_at_restart(block: &B, restart_idx: usize) -> Result<Bytes, SlateDBError> {
+        let Some(&restart_offset) = block.offsets().get(restart_idx) else {
+            return Err(corrupt_block("V2 restart index is out of range"));
+        };
+        let restart_offset = usize::from(restart_offset);
+        let region_end = block
+            .offsets()
+            .get(restart_idx + 1)
+            .map(|offset| usize::from(*offset))
+            .unwrap_or_else(|| block.data().len());
+        if restart_offset >= region_end || region_end > block.data().len() {
+            return Err(corrupt_block("invalid V2 restart region"));
+        }
+        let mut data = block.data().slice(restart_offset..region_end);
         let codec = SstRowCodecV2::new();
-        let (shared_bytes, key_suffix) = codec.decode_key_only(&mut data);
-        assert_eq!(shared_bytes, 0, "restart point should have shared_bytes=0");
-        key_suffix
+        let (shared_bytes, key_suffix) = codec.decode_key_only(&mut data)?;
+        if shared_bytes != 0 {
+            return Err(corrupt_block("V2 restart key has a shared prefix"));
+        }
+        Ok(key_suffix)
     }
 }
 
 impl<B: BlockLike> AscendingState<B> {
-    fn seek_to_restart(&mut self, restart_idx: usize) {
+    fn seek_to_restart(&mut self, restart_idx: usize) -> Result<(), SlateDBError> {
         if restart_idx >= self.block.offsets().len() {
             self.exhausted = true;
-            return;
+            return Ok(());
         }
 
         self.current_restart_idx = restart_idx;
         self.offset_in_block = self.block.offsets()[restart_idx] as usize;
         self.entries_since_restart = 0;
-        self.current_key = BlockIteratorV2::decode_first_key_at_restart(&self.block, restart_idx);
+        self.current_key = BlockIteratorV2::decode_first_key_at_restart(&self.block, restart_idx)?;
         self.exhausted = false;
+        Ok(())
     }
 
     fn decode_entry_at_current_offset(&self) -> Result<(RowEntry, usize), SlateDBError> {
-        let mut data = self.block.data().slice(self.offset_in_block..);
+        let region_end = self.restart_region_end(self.current_restart_idx);
+        if self.offset_in_block >= region_end || region_end > self.block.data().len() {
+            return Err(corrupt_block("invalid V2 row boundary"));
+        }
+        let mut data = self.block.data().slice(self.offset_in_block..region_end);
+        let initial_len = data.len();
         let codec = SstRowCodecV2::new();
         let entry = codec.decode(&mut data)?;
-        let bytes_consumed = self.block.data().len() - self.offset_in_block - data.len();
-        let new_offset = self.offset_in_block + bytes_consumed;
+        let bytes_consumed = initial_len
+            .checked_sub(data.remaining())
+            .ok_or_else(|| corrupt_block("V2 row cursor moved backwards"))?;
+        if bytes_consumed == 0 {
+            return Err(corrupt_block("V2 row consumed no bytes"));
+        }
+        let new_offset = self
+            .offset_in_block
+            .checked_add(bytes_consumed)
+            .ok_or_else(|| corrupt_block("V2 row offset overflow"))?;
+        if usize::try_from(entry.shared_bytes).unwrap_or(usize::MAX) > self.current_key.len() {
+            return Err(corrupt_block("V2 row shared prefix exceeds previous key"));
+        }
         let full_key = entry.restore_full_key(&self.current_key);
 
         Ok((
@@ -112,16 +134,30 @@ impl<B: BlockLike> AscendingState<B> {
         ))
     }
 
-    fn decode_key_at_offset(&self, offset: usize, prev_key: &[u8]) -> Bytes {
-        let mut data = self.block.data().slice(offset..);
+    fn decode_key_at_offset(
+        &self,
+        offset: usize,
+        region_end: usize,
+        prev_key: &[u8],
+    ) -> Result<Bytes, SlateDBError> {
+        if offset >= region_end || region_end > self.block.data().len() {
+            return Err(corrupt_block("invalid V2 key boundary"));
+        }
+        let mut data = self.block.data().slice(offset..region_end);
         let codec = SstRowCodecV2::new();
-        let (shared_bytes, key_suffix) = codec.decode_key_only(&mut data);
+        let (shared_bytes, key_suffix) = codec.decode_key_only(&mut data)?;
         let shared = shared_bytes as usize;
+        if shared > prev_key.len() {
+            return Err(corrupt_block("V2 key shared prefix exceeds previous key"));
+        }
 
-        let mut full_key = BytesMut::with_capacity(shared + key_suffix.len());
+        let key_len = shared
+            .checked_add(key_suffix.len())
+            .ok_or_else(|| corrupt_block("V2 key length overflow"))?;
+        let mut full_key = BytesMut::with_capacity(key_len);
         full_key.extend_from_slice(&prev_key[..shared]);
         full_key.extend_from_slice(&key_suffix);
-        full_key.freeze()
+        Ok(full_key.freeze())
     }
 
     fn is_empty(&self) -> bool {
@@ -135,14 +171,14 @@ impl<B: BlockLike> AscendingState<B> {
     /// exist before the found restart point.
     /// Binary search for the first restart index where key >= target.
     /// Returns `restarts.len()` if no such restart exists.
-    fn binary_search_restarts(&self, target: &[u8]) -> usize {
+    fn binary_search_restarts(&self, target: &[u8]) -> Result<usize, SlateDBError> {
         let restarts = self.block.offsets();
         let mut low = 0;
         let mut high = restarts.len();
 
         while low < high {
             let mid = low + (high - low) / 2;
-            let restart_key = BlockIteratorV2::decode_first_key_at_restart(&self.block, mid);
+            let restart_key = BlockIteratorV2::decode_first_key_at_restart(&self.block, mid)?;
 
             if restart_key.as_ref() < target {
                 low = mid + 1;
@@ -151,60 +187,60 @@ impl<B: BlockLike> AscendingState<B> {
             }
         }
 
-        low
+        Ok(low)
     }
 
     /// Find the restart region to begin an ascending scan for `target`.
     /// Backs up one position when target exactly matches a restart point's first key,
     /// so that duplicate keys straddling restart boundaries aren't missed.
-    fn find_restart_for_key_ascending(&self, target: &[u8]) -> usize {
+    fn find_restart_for_key_ascending(&self, target: &[u8]) -> Result<usize, SlateDBError> {
         let restarts = self.block.offsets();
         if restarts.is_empty() {
-            return 0;
+            return Ok(0);
         }
 
-        let low = self.binary_search_restarts(target);
+        let low = self.binary_search_restarts(target)?;
 
         if low < restarts.len() {
-            let restart_key = BlockIteratorV2::decode_first_key_at_restart(&self.block, low);
+            let restart_key = BlockIteratorV2::decode_first_key_at_restart(&self.block, low)?;
             if restart_key.as_ref() == target {
-                return low.saturating_sub(1);
+                return Ok(low.saturating_sub(1));
             }
         }
 
-        low.saturating_sub(1)
+        Ok(low.saturating_sub(1))
     }
 
     /// Find the restart region to begin a descending scan for `target`.
     /// Returns the last restart whose first key <= target, so that for duplicate keys
     /// spanning multiple restart regions we start from the last one.
-    fn find_restart_for_key_descending(&self, target: &[u8]) -> usize {
+    fn find_restart_for_key_descending(&self, target: &[u8]) -> Result<usize, SlateDBError> {
         let restarts = self.block.offsets();
         if restarts.is_empty() {
-            return 0;
+            return Ok(0);
         }
 
         // binary_search_restarts finds the first restart with key >= target.
-        let low = self.binary_search_restarts(target);
+        let low = self.binary_search_restarts(target)?;
 
         if low < restarts.len() {
-            let restart_key = BlockIteratorV2::decode_first_key_at_restart(&self.block, low);
+            let restart_key = BlockIteratorV2::decode_first_key_at_restart(&self.block, low)?;
             if restart_key.as_ref() == target {
                 // Scan forward to find the last restart with the same first key.
                 let mut last = low;
                 while last + 1 < restarts.len() {
                     let next_key =
-                        BlockIteratorV2::decode_first_key_at_restart(&self.block, last + 1);
+                        BlockIteratorV2::decode_first_key_at_restart(&self.block, last + 1)?;
                     if next_key.as_ref() != target {
                         break;
                     }
                     last += 1;
                 }
-                return last;
+                return Ok(last);
             }
         }
 
-        low.saturating_sub(1)
+        Ok(low.saturating_sub(1))
     }
 
     fn restart_region_end(&self, restart_idx: usize) -> usize {
@@ -216,11 +252,24 @@ impl<B: BlockLike> AscendingState<B> {
     }
 
     fn advance_past_current_entry(&mut self) -> Result<(), SlateDBError> {
-        let mut data = self.block.data().slice(self.offset_in_block..);
+        let region_end = self.restart_region_end(self.current_restart_idx);
+        if self.offset_in_block >= region_end || region_end > self.block.data().len() {
+            return Err(corrupt_block("invalid V2 row boundary"));
+        }
+        let mut data = self.block.data().slice(self.offset_in_block..region_end);
+        let initial_len = data.len();
         let codec = SstRowCodecV2::new();
         codec.decode(&mut data)?;
-        let bytes_consumed = self.block.data().len() - self.offset_in_block - data.len();
-        self.offset_in_block += bytes_consumed;
+        let bytes_consumed = initial_len
+            .checked_sub(data.remaining())
+            .ok_or_else(|| corrupt_block("V2 row cursor moved backwards"))?;
+        if bytes_consumed == 0 {
+            return Err(corrupt_block("V2 row consumed no bytes"));
+        }
+        self.offset_in_block = self
+            .offset_in_block
+            .checked_add(bytes_consumed)
+            .ok_or_else(|| corrupt_block("V2 row offset overflow"))?;
         self.entries_since_restart += 1;
         Ok(())
     }
@@ -274,11 +323,11 @@ impl<B: BlockLike> RowEntryIterator for BlockIteratorV2<B> {
                     return Ok(());
                 }
 
-                let start_restart_idx = state.find_restart_for_key_ascending(next_key);
+                let start_restart_idx = state.find_restart_for_key_ascending(next_key)?;
 
                 // Iterate through restart regions starting from binary search result.
                 for restart_idx in start_restart_idx..state.block.offsets().len() {
-                    state.seek_to_restart(restart_idx);
+                    state.seek_to_restart(restart_idx)?;
 
                     if state.exhausted || state.current_key.as_ref() >= next_key {
                         return Ok(());
@@ -291,8 +340,11 @@ impl<B: BlockLike> RowEntryIterator for BlockIteratorV2<B> {
                     while state.offset_in_block < region_end
                         && state.offset_in_block < state.block.data().len()
                     {
-                        let current_key =
-                            state.decode_key_at_offset(state.offset_in_block, &prev_key);
+                        let current_key = state.decode_key_at_offset(
+                            state.offset_in_block,
+                            region_end,
+                            &prev_key,
+                        )?;
 
                         if current_key.as_ref() >= next_key {
                             state.current_key = prev_key;
@@ -331,19 +383,13 @@ impl<B: BlockLike> DescendingBlockIteratorV2<B> {
 
     pub(crate) fn new(block: B) -> Self {
         let num_restarts = block.offsets().len();
-        let initial_key = if num_restarts == 0 {
-            Bytes::new()
-        } else {
-            BlockIteratorV2::decode_first_key_at_restart(&block, 0)
-        };
-
         DescendingBlockIteratorV2 {
             ascending: AscendingState {
                 block,
                 current_restart_idx: 0,
                 offset_in_block: 0,
                 entries_since_restart: 0,
-                current_key: initial_key,
+                current_key: Bytes::new(),
                 exhausted: false,
             },
             current_restart_idx: num_restarts as isize - 1,
@@ -362,7 +408,7 @@ impl<B: BlockLike> DescendingBlockIteratorV2<B> {
             return Ok(());
         }
 
-        self.ascending.seek_to_restart(restart_idx);
+        self.ascending.seek_to_restart(restart_idx)?;
         let region_end = self.ascending.restart_region_end(restart_idx);
 
         while self.ascending.offset_in_block < region_end && !self.ascending.is_empty() {
@@ -436,7 +482,7 @@ impl<B: BlockLike> RowEntryIterator for DescendingBlockIteratorV2<B> {
         }
 
         // Find the last restart region whose first key <= next_key, then scan backwards.
-        let start_restart_idx = self.ascending.find_restart_for_key_descending(next_key);
+        let start_restart_idx = self.ascending.find_restart_for_key_descending(next_key)?;
 
         for restart_idx in (0..=start_restart_idx).rev() {
             self.current_restart_idx = restart_idx as isize;
@@ -466,6 +512,10 @@ impl<B: BlockLike> RowEntryIterator for DescendingBlockIteratorV2<B> {
         self.exhausted = true;
         Ok(())
     }
+}
+
+fn corrupt_block(reason: &'static str) -> SlateDBError {
+    SlateDBError::CorruptSst { reason, path: None }
 }
 
 #[cfg(feature = "bench-internal")]

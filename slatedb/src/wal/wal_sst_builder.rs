@@ -902,6 +902,10 @@ mod tests {
 
         #[async_trait]
         impl BlockTransformer for MockBlockTransformer {
+            fn max_decoded_len(&self, encoded_len: usize) -> Option<usize> {
+                Some(encoded_len)
+            }
+
             async fn encode(&self, data: Bytes) -> Result<Bytes, crate::error::Error> {
                 self.encode_call_count.fetch_add(1, Ordering::SeqCst);
                 Ok(data)
