@@ -51,6 +51,7 @@ pub(crate) struct WalBufferManager {
     stats: Arc<WalBufferStats>,
     table_store: Arc<TableStore>,
     max_wal_bytes_size: usize,
+    max_replay_block_bytes: usize,
     /// The largest flush_epoch for which a size-triggered flush request has been
     /// sent. Compared against `flush_epoch` in the inner struct to avoid sending
     /// redundant flush requests for the same WAL.
@@ -113,6 +114,7 @@ impl WalBufferManager {
         last_flushed_wal_id: u64,
         table_store: Arc<TableStore>,
         max_wal_bytes_size: usize,
+        max_replay_block_bytes: usize,
         max_flush_interval: Option<Duration>,
         task_executor: Arc<MessageHandlerExecutor>,
     ) -> Result<Self, SlateDBError> {
@@ -133,6 +135,7 @@ impl WalBufferManager {
         let stats = Arc::new(WalBufferStats::new(recorder));
         let wal_flush_handler = WalFlushHandler {
             max_flush_interval,
+            max_replay_block_bytes,
             inner: inner.clone(),
             table_store: table_store.clone(),
             stats: stats.clone(),
@@ -149,6 +152,7 @@ impl WalBufferManager {
             stats,
             table_store,
             max_wal_bytes_size,
+            max_replay_block_bytes,
             last_flush_requested_epoch: AtomicU64::new(0),
             task_executor,
         })
@@ -210,6 +214,25 @@ impl WalWriter for WalBufferManager {
 
     /// Append row entries to the current WAL. Returns a watcher for durability notification.
     async fn append(&mut self, entries: &[RowEntry]) -> Result<(), WalError> {
+        for entry in entries {
+            let encoded_row_bytes = entry.encoded_size(0);
+            let required_bytes = encoded_row_bytes
+                .checked_mul(2)
+                .and_then(|size| size.checked_add(14))
+                .ok_or(SlateDBError::WalReplayMemoryLimitExceeded {
+                    kind: "decoded WAL row block",
+                    required_bytes: usize::MAX,
+                    limit_bytes: self.max_replay_block_bytes,
+                })?;
+            if required_bytes > self.max_replay_block_bytes {
+                return Err(SlateDBError::WalReplayMemoryLimitExceeded {
+                    kind: "decoded WAL row block",
+                    required_bytes,
+                    limit_bytes: self.max_replay_block_bytes,
+                }
+                .into());
+            }
+        }
         self.inner.write().append(entries)?;
         self.maybe_trigger_flush()?;
         Ok(())
@@ -481,6 +504,7 @@ impl Debug for WalFlushWork {
 
 struct WalFlushHandler {
     max_flush_interval: Option<Duration>,
+    max_replay_block_bytes: usize,
     inner: Arc<parking_lot::RwLock<WalBufferManagerInner>>,
     table_store: Arc<TableStore>,
     stats: Arc<WalBufferStats>,
@@ -540,6 +564,39 @@ impl WalFlushHandler {
         }
 
         let encoded_sst = sst_builder.build().await?;
+        for block in &encoded_sst.unconsumed_blocks {
+            let offsets_bytes = block
+                .block
+                .offsets
+                .len()
+                .checked_mul(std::mem::size_of::<u16>())
+                .ok_or(SlateDBError::WalReplayMemoryLimitExceeded {
+                    kind: "encoded and decoded WAL block",
+                    required_bytes: usize::MAX,
+                    limit_bytes: self.max_replay_block_bytes,
+                })?;
+            let decoded_bytes = block.block.size().checked_add(offsets_bytes).ok_or(
+                SlateDBError::WalReplayMemoryLimitExceeded {
+                    kind: "encoded and decoded WAL block",
+                    required_bytes: usize::MAX,
+                    limit_bytes: self.max_replay_block_bytes,
+                },
+            )?;
+            let required_bytes = decoded_bytes.checked_add(block.encoded_bytes.len()).ok_or(
+                SlateDBError::WalReplayMemoryLimitExceeded {
+                    kind: "encoded and decoded WAL block",
+                    required_bytes: usize::MAX,
+                    limit_bytes: self.max_replay_block_bytes,
+                },
+            )?;
+            if required_bytes > self.max_replay_block_bytes {
+                return Err(SlateDBError::WalReplayMemoryLimitExceeded {
+                    kind: "encoded and decoded WAL block",
+                    required_bytes,
+                    limit_bytes: self.max_replay_block_bytes,
+                });
+            }
+        }
         let written_bytes = encoded_sst.remaining_len() as u64;
         self.table_store
             .write_sst(&SsTableId::Wal(wal_id), &encoded_sst)
@@ -928,6 +985,7 @@ mod tests {
             0, // recent_flushed_wal_id
             table_store.clone(),
             1000,                 // max_wal_bytes_size
+            32 * 1024 * 1024,     // max_replay_block_bytes
             Some(flush_interval), // max_flush_interval
             task_executor.clone(),
         )
@@ -1015,6 +1073,20 @@ mod tests {
             .unwrap();
 
         assert_eq!(wal_buffer.status().unwrap().last_flushed_wal_id, 1);
+    }
+
+    #[tokio::test]
+    async fn oversized_single_entry_is_rejected_before_wal_append() {
+        let (mut wal_buffer, _, _, _) = setup_wal_buffer().await;
+        wal_buffer.max_replay_block_bytes = 1024;
+        let entry = make_entry("key", &"v".repeat(1024), 1, None);
+
+        let error = wal_buffer.append(&[entry]).await.unwrap_err();
+
+        assert!(matches!(error, WalError::DataError(_)));
+        let status = wal_buffer.status().unwrap();
+        assert_eq!(status.buffered_wal_entries_count, 0);
+        assert_eq!(status.last_flushed_wal_id, 0);
     }
 
     #[tokio::test]

@@ -10363,6 +10363,63 @@ mod tests {
         recovered.close().await.unwrap();
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn acknowledged_wal_larger_than_full_object_limit_recovers_on_reopen() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = "/tmp/acknowledged_oversized_wal_range_replay";
+        let mut settings = test_db_options(0, 1024 * 1024, None);
+        settings.flush_interval = Some(Duration::from_millis(10));
+        settings.wal_replay = crate::config::WalReplaySettings {
+            max_concurrent_objects: 4,
+            max_inflight_bytes: 128 * 1024,
+        };
+        let source = Db::builder(path, object_store.clone())
+            .with_settings(settings.clone())
+            .build()
+            .await
+            .unwrap();
+        let mut batch = WriteBatch::new();
+        for id in 0..64 {
+            batch.put(format!("oversized-{id:03}"), vec![id as u8; 2048]);
+        }
+
+        source
+            .write(batch)
+            .await
+            .expect("the large multi-block WAL was not acknowledged");
+        let last_flushed_wal_id = source
+            .inner
+            .wal_observer
+            .status()
+            .unwrap()
+            .last_flushed_wal_id;
+        assert!(last_flushed_wal_id > 0);
+        let listed = source
+            .inner
+            .table_store
+            .list_wal_ssts_for_replay(1..last_flushed_wal_id + 1)
+            .await
+            .unwrap();
+        assert!(listed.iter().any(|wal| wal.metadata.size > 96 * 1024));
+
+        // Keep the source open to model a crash. The replacement writer must
+        // recover the acknowledged WAL rather than relying on clean shutdown.
+        let recovered = Db::builder(path, object_store)
+            .with_settings(settings)
+            .build()
+            .await
+            .expect("replacement writer could not range-replay the oversized WAL");
+        for id in 0..64 {
+            assert_eq!(
+                recovered.get(format!("oversized-{id:03}")).await.unwrap(),
+                Some(Bytes::from(vec![id as u8; 2048]))
+            );
+        }
+
+        recovered.close().await.unwrap();
+        drop(source);
+    }
+
     /// RFC-0024: WAL replay through a conforming extractor preserves the
     /// keys and lets segment-aware writes resume after the next open.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

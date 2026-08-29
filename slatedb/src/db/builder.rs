@@ -547,6 +547,9 @@ impl<P: Into<Path>> DbBuilder<P> {
             block_format,
             ..SsTableFormat::default()
         };
+        self.settings
+            .wal_replay
+            .validate_wal_block_size(sst_format.block_size)?;
 
         // Setup the manifest store and load latest manifest
         let manifest_store = Arc::new(ManifestStore::new(
@@ -1961,6 +1964,9 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
             block_transformer: self.block_transformer,
             ..SsTableFormat::default()
         };
+        self.options
+            .wal_replay
+            .validate_wal_block_size(sst_format.block_size)?;
         let path_resolver = PathResolver::new_with_external_ssts(path.clone(), external_ssts);
         let table_store = Arc::new(TableStore::new_with_fp_registry(
             ObjectStores::new(retrying_object_store, retrying_wal_object_store),
