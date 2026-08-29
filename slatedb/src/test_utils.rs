@@ -16,8 +16,9 @@ use futures::stream::BoxStream;
 use futures::{stream, StreamExt};
 use object_store::path::Path;
 use object_store::{
-    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions as OS_PutOptions, PutPayload, PutResult, RenameOptions,
+    CopyOptions, GetOptions, GetRange, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore, PutMultipartOptions, PutOptions as OS_PutOptions, PutPayload, PutResult,
+    RenameOptions,
 };
 use rand::{Rng, RngCore};
 use std::cmp::Ordering as CmpOrdering;
@@ -1549,6 +1550,7 @@ mod tests {
 pub(crate) enum RecordedCall {
     Get {
         head: bool,
+        range_bytes: Option<u64>,
         kind: Option<TableStoreKind>,
         sst_type: Option<SstType>,
         retry: Option<RetryReason>,
@@ -1618,6 +1620,20 @@ impl RecordingObjectStore {
             .collect()
     }
 
+    pub(crate) fn get_range_sizes(&self) -> Vec<u64> {
+        self.calls
+            .lock()
+            .iter()
+            .filter_map(|call| match call {
+                RecordedCall::Get {
+                    range_bytes: Some(range_bytes),
+                    ..
+                } => Some(*range_bytes),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub(crate) fn write_kinds(&self) -> Vec<Option<TableStoreKind>> {
         self.calls
             .lock()
@@ -1660,6 +1676,10 @@ impl ObjectStore for RecordingObjectStore {
         let tag = ObjectStoreCallTag::from_extensions(&options.extensions);
         self.calls.lock().push(RecordedCall::Get {
             head: options.head,
+            range_bytes: match &options.range {
+                Some(GetRange::Bounded(range)) => range.end.checked_sub(range.start),
+                _ => None,
+            },
             kind: tag.map(|t| t.kind),
             sst_type: tag.map(|t| t.sst_type),
             retry: tag.and_then(|t| t.retry),

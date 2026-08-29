@@ -767,6 +767,81 @@ impl SsTableFormat {
         SsTableInfo::decode(sst_metadata_bytes, &*self.sst_codec).map(|info| (info, version))
     }
 
+    pub(crate) async fn read_wal_info_and_version_bounded(
+        &self,
+        obj: &impl ReadOnlyBlob,
+        object_len: u64,
+        metadata_offset: u64,
+        version: u16,
+        working_memory_limit: usize,
+    ) -> Result<TableInfoAndVersion, SlateDBError> {
+        self.validate_version(version)?;
+        let metadata_end = object_len
+            .checked_sub(NUM_FOOTER_BYTES_LONG)
+            .ok_or(SlateDBError::EmptySSTable)?;
+        let encoded_len = usize::try_from(metadata_end.checked_sub(metadata_offset).ok_or(
+            SlateDBError::CorruptSst {
+                reason: "WAL metadata range is outside the object",
+                path: None,
+            },
+        )?)
+        .map_err(|_| SlateDBError::WalReplayMemoryLimitExceeded {
+            kind: "encoded and decoded WAL metadata",
+            required_bytes: usize::MAX,
+            limit_bytes: working_memory_limit,
+        })?;
+        // The FlatBuffer decoder copies first/last entries. Their combined
+        // bytes cannot exceed the encoded metadata that contains them.
+        let conservative_bytes =
+            encoded_len
+                .checked_mul(2)
+                .ok_or(SlateDBError::WalReplayMemoryLimitExceeded {
+                    kind: "encoded and decoded WAL metadata",
+                    required_bytes: usize::MAX,
+                    limit_bytes: working_memory_limit,
+                })?;
+        if conservative_bytes > working_memory_limit {
+            return Err(SlateDBError::WalReplayMemoryLimitExceeded {
+                kind: "encoded and decoded WAL metadata",
+                required_bytes: conservative_bytes,
+                limit_bytes: working_memory_limit,
+            });
+        }
+        let metadata = obj.read_range(metadata_offset..metadata_end).await?;
+        if metadata.len() != encoded_len {
+            return Err(SlateDBError::CorruptSst {
+                reason: "WAL metadata range returned an unexpected length",
+                path: None,
+            });
+        }
+        let info = SsTableInfo::decode(metadata, &*self.sst_codec)?;
+        let retained_bytes = info
+            .first_entry
+            .as_ref()
+            .map_or(0, Bytes::len)
+            .checked_add(info.last_entry.as_ref().map_or(0, Bytes::len))
+            .ok_or(SlateDBError::WalReplayMemoryLimitExceeded {
+                kind: "encoded and decoded WAL metadata",
+                required_bytes: usize::MAX,
+                limit_bytes: working_memory_limit,
+            })?;
+        let actual_bytes = encoded_len.checked_add(retained_bytes).ok_or(
+            SlateDBError::WalReplayMemoryLimitExceeded {
+                kind: "encoded and decoded WAL metadata",
+                required_bytes: usize::MAX,
+                limit_bytes: working_memory_limit,
+            },
+        )?;
+        if actual_bytes > working_memory_limit {
+            return Err(SlateDBError::WalReplayMemoryLimitExceeded {
+                kind: "encoded and decoded WAL metadata",
+                required_bytes: actual_bytes,
+                limit_bytes: working_memory_limit,
+            });
+        }
+        Ok((info, version))
+    }
+
     pub(crate) async fn read_filters(
         &self,
         info: &SsTableInfo,
@@ -904,6 +979,44 @@ impl SsTableFormat {
                 })?;
         let index_bytes = obj.read_range(info.index_offset..index_end).await?;
         self.decode_index_bounded(index_bytes, info.compression_codec, working_memory_limit)
+            .await
+    }
+
+    pub(crate) async fn read_ranged_wal_index_bounded(
+        &self,
+        info: &SsTableInfo,
+        obj: &impl ReadOnlyBlob,
+        working_memory_limit: usize,
+    ) -> Result<SsTableIndexOwned, SlateDBError> {
+        let index_end =
+            info.index_offset
+                .checked_add(info.index_len)
+                .ok_or(SlateDBError::CorruptSst {
+                    reason: "WAL index range overflow",
+                    path: None,
+                })?;
+        let encoded_len = usize::try_from(info.index_len).map_err(|_| {
+            SlateDBError::WalReplayMemoryLimitExceeded {
+                kind: "encoded and decoded WAL index",
+                required_bytes: usize::MAX,
+                limit_bytes: working_memory_limit,
+            }
+        })?;
+        let decode_memory_limit = working_memory_limit.checked_sub(encoded_len).ok_or(
+            SlateDBError::WalReplayMemoryLimitExceeded {
+                kind: "encoded and decoded WAL index",
+                required_bytes: encoded_len,
+                limit_bytes: working_memory_limit,
+            },
+        )?;
+        let index_bytes = obj.read_range(info.index_offset..index_end).await?;
+        if index_bytes.len() != encoded_len {
+            return Err(SlateDBError::CorruptSst {
+                reason: "WAL index range returned an unexpected length",
+                path: None,
+            });
+        }
+        self.decode_index_bounded(index_bytes, info.compression_codec, decode_memory_limit)
             .await
     }
 
