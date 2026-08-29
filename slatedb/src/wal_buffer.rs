@@ -114,6 +114,7 @@ impl WalBufferManager {
         last_flushed_wal_id: u64,
         table_store: Arc<TableStore>,
         max_wal_bytes_size: usize,
+        max_replay_metadata_bytes: usize,
         max_replay_block_bytes: usize,
         max_flush_interval: Option<Duration>,
         task_executor: Arc<MessageHandlerExecutor>,
@@ -135,6 +136,7 @@ impl WalBufferManager {
         let stats = Arc::new(WalBufferStats::new(recorder));
         let wal_flush_handler = WalFlushHandler {
             max_flush_interval,
+            max_replay_metadata_bytes,
             max_replay_block_bytes,
             inner: inner.clone(),
             table_store: table_store.clone(),
@@ -504,6 +506,7 @@ impl Debug for WalFlushWork {
 
 struct WalFlushHandler {
     max_flush_interval: Option<Duration>,
+    max_replay_metadata_bytes: usize,
     max_replay_block_bytes: usize,
     inner: Arc<parking_lot::RwLock<WalBufferManagerInner>>,
     table_store: Arc<TableStore>,
@@ -564,39 +567,11 @@ impl WalFlushHandler {
         }
 
         let encoded_sst = sst_builder.build().await?;
-        for block in &encoded_sst.unconsumed_blocks {
-            let offsets_bytes = block
-                .block
-                .offsets
-                .len()
-                .checked_mul(std::mem::size_of::<u16>())
-                .ok_or(SlateDBError::WalReplayMemoryLimitExceeded {
-                    kind: "encoded and decoded WAL block",
-                    required_bytes: usize::MAX,
-                    limit_bytes: self.max_replay_block_bytes,
-                })?;
-            let decoded_bytes = block.block.size().checked_add(offsets_bytes).ok_or(
-                SlateDBError::WalReplayMemoryLimitExceeded {
-                    kind: "encoded and decoded WAL block",
-                    required_bytes: usize::MAX,
-                    limit_bytes: self.max_replay_block_bytes,
-                },
-            )?;
-            let required_bytes = decoded_bytes.checked_add(block.encoded_bytes.len()).ok_or(
-                SlateDBError::WalReplayMemoryLimitExceeded {
-                    kind: "encoded and decoded WAL block",
-                    required_bytes: usize::MAX,
-                    limit_bytes: self.max_replay_block_bytes,
-                },
-            )?;
-            if required_bytes > self.max_replay_block_bytes {
-                return Err(SlateDBError::WalReplayMemoryLimitExceeded {
-                    kind: "encoded and decoded WAL block",
-                    required_bytes,
-                    limit_bytes: self.max_replay_block_bytes,
-                });
-            }
-        }
+        self.table_store.validate_wal_sst_replay_memory(
+            &encoded_sst,
+            self.max_replay_metadata_bytes,
+            self.max_replay_block_bytes,
+        )?;
         let written_bytes = encoded_sst.remaining_len() as u64;
         self.table_store
             .write_sst(&SsTableId::Wal(wal_id), &encoded_sst)
@@ -961,6 +936,26 @@ mod tests {
         Arc<DbStatusManager>,
         Arc<DefaultMetricsRecorder>,
     ) {
+        setup_wal_buffer_with_replay_limits(
+            flush_interval,
+            listener,
+            32 * 1024 * 1024,
+            32 * 1024 * 1024,
+        )
+        .await
+    }
+
+    async fn setup_wal_buffer_with_replay_limits(
+        flush_interval: Duration,
+        listener: wal::WalStatusListener,
+        max_replay_metadata_bytes: usize,
+        max_replay_block_bytes: usize,
+    ) -> (
+        WalBufferManager,
+        Arc<TableStore>,
+        Arc<DbStatusManager>,
+        Arc<DefaultMetricsRecorder>,
+    ) {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let table_store = Arc::new(TableStore::new(
             ObjectStores::new(object_store, None),
@@ -984,8 +979,9 @@ mod tests {
             &helper,
             0, // recent_flushed_wal_id
             table_store.clone(),
-            1000,                 // max_wal_bytes_size
-            32 * 1024 * 1024,     // max_replay_block_bytes
+            1000, // max_wal_bytes_size
+            max_replay_metadata_bytes,
+            max_replay_block_bytes,
             Some(flush_interval), // max_flush_interval
             task_executor.clone(),
         )
@@ -1087,6 +1083,31 @@ mod tests {
         let status = wal_buffer.status().unwrap();
         assert_eq!(status.buffered_wal_entries_count, 0);
         assert_eq!(status.last_flushed_wal_id, 0);
+    }
+
+    #[tokio::test]
+    async fn wal_with_unreplayable_metadata_is_rejected_before_object_write() {
+        let (mut wal_buffer, table_store, _, _) = setup_wal_buffer_with_replay_limits(
+            Duration::MAX,
+            Arc::new(|_status| {}),
+            1,
+            32 * 1024 * 1024,
+        )
+        .await;
+        wal_buffer
+            .append(&[make_entry("key", "value", 1, None)])
+            .await
+            .unwrap();
+
+        let flush = wal_buffer.flush().await.unwrap();
+        let error = flush.await.unwrap_err();
+
+        assert!(matches!(error, WalError::DataError(_)));
+        assert!(table_store
+            .list_wal_ssts_for_replay(1..2)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

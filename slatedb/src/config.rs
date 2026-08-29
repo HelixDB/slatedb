@@ -1121,7 +1121,9 @@ pub struct WalReplaySettings {
     /// index, and one lazily decoded block. Half of that working partition is
     /// reserved for metadata/index and half for the current decoded block. It
     /// uses the remainder for retained normal-sized encoded objects. Oversized
-    /// objects use bounded range replay instead of bypassing the limit.
+    /// objects use bounded range replay instead of bypassing the limit. Writers
+    /// reject a WAL before durable acknowledgement when one of its sections
+    /// cannot be recovered within these partitions.
     pub max_inflight_bytes: usize,
 }
 
@@ -1160,6 +1162,10 @@ impl WalReplaySettings {
     }
 
     pub(crate) fn block_working_memory_limit(&self) -> usize {
+        self.working_memory_limit() / 2
+    }
+
+    pub(crate) fn metadata_working_memory_limit(&self) -> usize {
         self.working_memory_limit() / 2
     }
 

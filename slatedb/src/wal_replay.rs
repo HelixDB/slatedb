@@ -2011,6 +2011,91 @@ mod tests {
         assert_eq!(row_count, 64);
         assert!(replay.next().await.unwrap().is_none());
         assert!(recording.get_kinds(false).len() > 1);
+        assert!(
+            recording
+                .get_range_sizes()
+                .into_iter()
+                .all(|range_bytes| range_bytes <= 8 * 1024),
+            "range replay must not fetch a section larger than its working partition"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_range_replay_rejects_large_metadata_before_fetching_it() {
+        let inner = Arc::new(InMemory::new());
+        let recording = Arc::new(RecordingObjectStore::new(inner.clone()));
+        let table_store = test_table_store_with_object_store(recording.clone());
+        let mut builder = table_store.wal_table_builder();
+        for seq in 1..=64 {
+            builder
+                .add(RowEntry::new_value(
+                    format!("large-metadata-{seq:03}").as_bytes(),
+                    &[b'x'; 2048],
+                    seq,
+                ))
+                .await
+                .unwrap();
+        }
+        let encoded = builder.build().await.unwrap();
+        table_store
+            .write_sst(&SsTableId::Wal(1), &encoded)
+            .await
+            .unwrap();
+        let metadata = table_store
+            .list_wal_ssts_for_replay(1..2)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap()
+            .metadata;
+        let mut bytes = inner
+            .get(&metadata.location)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap()
+            .to_vec();
+        let footer_start = bytes.len() - 10;
+        bytes[footer_start..footer_start + 8].copy_from_slice(&0_u64.to_be_bytes());
+        inner
+            .put(&metadata.location, Bytes::from(bytes).into())
+            .await
+            .unwrap();
+        recording.clear();
+
+        let mut replay = WalReplayIterator::range(
+            1..2,
+            &ManifestCore::new(),
+            WalReplayOptions {
+                prefetch: WalReplaySettings {
+                    max_concurrent_objects: 4,
+                    max_inflight_bytes: 64 * 1024,
+                },
+                ..WalReplayOptions::default()
+            },
+            table_store,
+        )
+        .await
+        .unwrap();
+        let Err(error) = replay.next().await else {
+            panic!("oversized metadata was not rejected");
+        };
+
+        assert!(matches!(
+            error,
+            SlateDBError::WalReplayMemoryLimitExceeded {
+                kind: "encoded and decoded WAL metadata",
+                ..
+            }
+        ));
+        assert!(
+            recording
+                .get_range_sizes()
+                .into_iter()
+                .all(|range_bytes| range_bytes <= 8 * 1024),
+            "metadata validation must reject before an oversized range GET"
+        );
     }
 
     #[tokio::test]

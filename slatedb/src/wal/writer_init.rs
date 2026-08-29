@@ -15,6 +15,7 @@ use std::time::Duration;
 #[derive(Clone, Copy)]
 pub(crate) struct WalWriterInitOptions {
     max_wal_bytes_size: usize,
+    max_replay_metadata_bytes: usize,
     max_replay_block_bytes: usize,
     max_flush_interval: Option<Duration>,
 }
@@ -23,6 +24,7 @@ impl From<&Settings> for WalWriterInitOptions {
     fn from(settings: &Settings) -> Self {
         Self {
             max_wal_bytes_size: settings.l0_sst_size_bytes,
+            max_replay_metadata_bytes: settings.wal_replay.metadata_working_memory_limit(),
             max_replay_block_bytes: settings.wal_replay.block_working_memory_limit(),
             max_flush_interval: settings.flush_interval,
         }
@@ -34,6 +36,7 @@ pub(crate) struct WalWriterInit {
     recorder: MetricsRecorderHelper,
     table_store: Arc<TableStore>,
     max_wal_bytes_size: usize,
+    max_replay_metadata_bytes: usize,
     max_replay_block_bytes: usize,
     max_flush_interval: Option<Duration>,
     empty_wal_id: u64,
@@ -61,6 +64,7 @@ impl WalWriterInit {
             recorder,
             table_store,
             max_wal_bytes_size: options.max_wal_bytes_size,
+            max_replay_metadata_bytes: options.max_replay_metadata_bytes,
             max_replay_block_bytes: options.max_replay_block_bytes,
             max_flush_interval: options.max_flush_interval,
             empty_wal_id,
@@ -119,6 +123,7 @@ impl wal::WriterInit for WalWriterInit {
                     empty_wal_id,
                     self.table_store.clone(),
                     self.max_wal_bytes_size,
+                    self.max_replay_metadata_bytes,
                     self.max_replay_block_bytes,
                     self.max_flush_interval,
                     self.task_executor.clone(),

@@ -197,6 +197,129 @@ impl TableStore {
         bytes.div_ceil(self.sst_format.block_size)
     }
 
+    pub(crate) fn validate_wal_sst_replay_memory(
+        &self,
+        encoded_sst: &EncodedSsTable,
+        metadata_memory_limit: usize,
+        block_memory_limit: usize,
+    ) -> Result<(), SlateDBError> {
+        let index_encoded_bytes = usize::try_from(encoded_sst.info.index_len).map_err(|_| {
+            SlateDBError::WalReplayMemoryLimitExceeded {
+                kind: "encoded and decoded WAL index",
+                required_bytes: usize::MAX,
+                limit_bytes: metadata_memory_limit,
+            }
+        })?;
+        let metadata_encoded_bytes = encoded_sst
+            .footer
+            .len()
+            .checked_sub(METADATA_OFFSET_SIZE + VERSION_SIZE)
+            .and_then(|footer_bytes| footer_bytes.checked_sub(index_encoded_bytes))
+            .ok_or(SlateDBError::InvalidDBState)?;
+        let retained_info_bytes = encoded_sst
+            .info
+            .first_entry
+            .as_ref()
+            .map_or(0, Bytes::len)
+            .checked_add(encoded_sst.info.last_entry.as_ref().map_or(0, Bytes::len))
+            .ok_or(SlateDBError::WalReplayMemoryLimitExceeded {
+                kind: "encoded and decoded WAL metadata",
+                required_bytes: usize::MAX,
+                limit_bytes: metadata_memory_limit,
+            })?;
+        let metadata_required_bytes = metadata_encoded_bytes
+            .checked_add(retained_info_bytes)
+            .ok_or(SlateDBError::WalReplayMemoryLimitExceeded {
+                kind: "encoded and decoded WAL metadata",
+                required_bytes: usize::MAX,
+                limit_bytes: metadata_memory_limit,
+            })?;
+        if metadata_required_bytes > metadata_memory_limit {
+            return Err(SlateDBError::WalReplayMemoryLimitExceeded {
+                kind: "encoded and decoded WAL metadata",
+                required_bytes: metadata_required_bytes,
+                limit_bytes: metadata_memory_limit,
+            });
+        }
+
+        let index_payload_bytes = index_encoded_bytes
+            .checked_sub(CHECKSUM_SIZE)
+            .ok_or(SlateDBError::InvalidDBState)?;
+        let transformed_index_bytes = match &self.sst_format.block_transformer {
+            Some(transformer) => transformer.max_decoded_len(index_payload_bytes).ok_or(
+                SlateDBError::WalReplayMemoryLimitExceeded {
+                    kind: "transformed WAL index",
+                    required_bytes: usize::MAX,
+                    limit_bytes: metadata_memory_limit,
+                },
+            )?,
+            None => 0,
+        };
+        let index_required_bytes = retained_info_bytes
+            .checked_add(index_encoded_bytes)
+            .and_then(|bytes| bytes.checked_add(transformed_index_bytes))
+            .and_then(|bytes| bytes.checked_add(encoded_sst.index.size()))
+            .ok_or(SlateDBError::WalReplayMemoryLimitExceeded {
+                kind: "encoded and decoded WAL index",
+                required_bytes: usize::MAX,
+                limit_bytes: metadata_memory_limit,
+            })?;
+        if index_required_bytes > metadata_memory_limit {
+            return Err(SlateDBError::WalReplayMemoryLimitExceeded {
+                kind: "encoded and decoded WAL index",
+                required_bytes: index_required_bytes,
+                limit_bytes: metadata_memory_limit,
+            });
+        }
+
+        for block in &encoded_sst.unconsumed_blocks {
+            let encoded_payload_bytes = block
+                .encoded_bytes
+                .len()
+                .checked_sub(CHECKSUM_SIZE)
+                .ok_or(SlateDBError::InvalidDBState)?;
+            let transformed_block_bytes = match &self.sst_format.block_transformer {
+                Some(transformer) => transformer.max_decoded_len(encoded_payload_bytes).ok_or(
+                    SlateDBError::WalReplayMemoryLimitExceeded {
+                        kind: "transformed WAL block",
+                        required_bytes: usize::MAX,
+                        limit_bytes: block_memory_limit,
+                    },
+                )?,
+                None => 0,
+            };
+            let offsets_bytes = block
+                .block
+                .offsets
+                .len()
+                .checked_mul(std::mem::size_of::<u16>())
+                .ok_or(SlateDBError::WalReplayMemoryLimitExceeded {
+                    kind: "encoded and decoded WAL block",
+                    required_bytes: usize::MAX,
+                    limit_bytes: block_memory_limit,
+                })?;
+            let required_bytes = block
+                .encoded_bytes
+                .len()
+                .checked_add(transformed_block_bytes)
+                .and_then(|bytes| bytes.checked_add(block.block.size()))
+                .and_then(|bytes| bytes.checked_add(offsets_bytes))
+                .ok_or(SlateDBError::WalReplayMemoryLimitExceeded {
+                    kind: "encoded and decoded WAL block",
+                    required_bytes: usize::MAX,
+                    limit_bytes: block_memory_limit,
+                })?;
+            if required_bytes > block_memory_limit {
+                return Err(SlateDBError::WalReplayMemoryLimitExceeded {
+                    kind: "encoded and decoded WAL block",
+                    required_bytes,
+                    limit_bytes: block_memory_limit,
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Find the highest WAL SST id present in the object store at or above
     /// `start_after + 1`, returning `start_after` if none exist.
     ///
@@ -527,9 +650,26 @@ impl TableStore {
             .await
             .map_err(|error| error.with_path(&path))?;
         validate_wal_sst_info_layout(&info, object_len, metadata_offset, &path)?;
+        let retained_info_bytes = info
+            .first_entry
+            .as_ref()
+            .map_or(0, Bytes::len)
+            .checked_add(info.last_entry.as_ref().map_or(0, Bytes::len))
+            .ok_or(SlateDBError::WalReplayMemoryLimitExceeded {
+                kind: "WAL metadata and index",
+                required_bytes: usize::MAX,
+                limit_bytes: metadata_memory_limit,
+            })?;
+        let index_memory_limit = metadata_memory_limit
+            .checked_sub(retained_info_bytes)
+            .ok_or(SlateDBError::WalReplayMemoryLimitExceeded {
+                kind: "WAL metadata and index",
+                required_bytes: retained_info_bytes,
+                limit_bytes: metadata_memory_limit,
+            })?;
         let index = self
             .sst_format
-            .read_wal_index_bounded(&info, &blob, metadata_memory_limit)
+            .read_wal_index_bounded(&info, &blob, index_memory_limit)
             .await
             .map_err(|error| error.with_path(&path))?;
         validate_wal_sst_index_layout(&info, &index, &path)?;
@@ -590,15 +730,50 @@ impl TableStore {
                 .ok_or(SlateDBError::EmptySSTable)?;
             let footer = obj.read_range(footer_start..object_len).await?;
             let metadata_offset = u64::from_be_bytes(
-                footer[..METADATA_OFFSET_SIZE]
+                footer
+                    .get(..METADATA_OFFSET_SIZE)
+                    .ok_or(SlateDBError::EmptySSTable)?
                     .try_into()
                     .map_err(|_| SlateDBError::EmptySSTable)?,
             );
-            let (info, format_version) = self.sst_format.read_info_and_version(&obj).await?;
+            let version = u16::from_be_bytes(
+                footer
+                    .get(METADATA_OFFSET_SIZE..METADATA_OFFSET_SIZE + VERSION_SIZE)
+                    .ok_or(SlateDBError::EmptySSTable)?
+                    .try_into()
+                    .map_err(|_| SlateDBError::EmptySSTable)?,
+            );
+            let (info, format_version) = self
+                .sst_format
+                .read_wal_info_and_version_bounded(
+                    &obj,
+                    object_len,
+                    metadata_offset,
+                    version,
+                    metadata_memory_limit,
+                )
+                .await?;
             validate_wal_sst_info_layout(&info, object_len, metadata_offset, &obj.path)?;
+            let retained_info_bytes = info
+                .first_entry
+                .as_ref()
+                .map_or(0, Bytes::len)
+                .checked_add(info.last_entry.as_ref().map_or(0, Bytes::len))
+                .ok_or(SlateDBError::WalReplayMemoryLimitExceeded {
+                    kind: "WAL metadata and index",
+                    required_bytes: usize::MAX,
+                    limit_bytes: metadata_memory_limit,
+                })?;
+            let index_memory_limit = metadata_memory_limit
+                .checked_sub(retained_info_bytes)
+                .ok_or(SlateDBError::WalReplayMemoryLimitExceeded {
+                    kind: "WAL metadata and index",
+                    required_bytes: retained_info_bytes,
+                    limit_bytes: metadata_memory_limit,
+                })?;
             let index = self
                 .sst_format
-                .read_wal_index_bounded(&info, &obj, metadata_memory_limit)
+                .read_ranged_wal_index_bounded(&info, &obj, index_memory_limit)
                 .await?;
             validate_wal_sst_index_layout(&info, &index, &obj.path)?;
             let retained_decode_bytes = index
