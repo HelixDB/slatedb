@@ -1034,14 +1034,14 @@ impl SsTableFormat {
     fn decompress_bounded(
         #[allow(unused_variables)] compressed_data: Bytes,
         compression_option: CompressionCodec,
-        max_output_bytes: usize,
+        _max_output_bytes: usize,
     ) -> Result<Bytes, SlateDBError> {
         match compression_option {
             #[cfg(feature = "snappy")]
             CompressionCodec::Snappy => {
                 let decoded_len = snap::raw::decompress_len(&compressed_data)
                     .map_err(|_| SlateDBError::BlockDecompressionError)?;
-                validate_decoded_size(decoded_len, max_output_bytes)?;
+                validate_decoded_size(decoded_len, _max_output_bytes)?;
                 Ok(Bytes::from(
                     snap::raw::Decoder::new()
                         .decompress_vec(&compressed_data)
@@ -1050,7 +1050,7 @@ impl SsTableFormat {
             }
             #[cfg(feature = "zlib")]
             CompressionCodec::Zlib => {
-                if max_output_bytes == usize::MAX {
+                if _max_output_bytes == usize::MAX {
                     let mut decoder = flate2::read::ZlibDecoder::new(&compressed_data[..]);
                     let mut decompressed = Vec::new();
                     decoder
@@ -1059,7 +1059,7 @@ impl SsTableFormat {
                     return Ok(Bytes::from(decompressed));
                 }
                 let mut decoder = flate2::read::ZlibDecoder::new(&compressed_data[..]);
-                let decoded_len = measure_bounded_decompressed(&mut decoder, max_output_bytes)?;
+                let decoded_len = measure_bounded_decompressed(&mut decoder, _max_output_bytes)?;
                 let mut decoder = flate2::read::ZlibDecoder::new(&compressed_data[..]);
                 read_exact_decompressed(&mut decoder, decoded_len)
             }
@@ -1073,14 +1073,14 @@ impl SsTableFormat {
                         .try_into()
                         .map_err(|_| SlateDBError::BlockDecompressionError)?,
                 ) as usize;
-                validate_decoded_size(decoded_len, max_output_bytes)?;
+                validate_decoded_size(decoded_len, _max_output_bytes)?;
                 let decompressed = lz4_flex::block::decompress_size_prepended(&compressed_data)
                     .map_err(|_| SlateDBError::BlockDecompressionError)?;
                 Ok(Bytes::from(decompressed))
             }
             #[cfg(feature = "zstd")]
             CompressionCodec::Zstd => {
-                if max_output_bytes == usize::MAX {
+                if _max_output_bytes == usize::MAX {
                     let mut decoder = zstd::stream::read::Decoder::new(&compressed_data[..])
                         .map_err(|_| SlateDBError::BlockDecompressionError)?;
                     let mut decompressed = Vec::new();
@@ -1091,7 +1091,7 @@ impl SsTableFormat {
                 }
                 let mut decoder = zstd::stream::read::Decoder::new(&compressed_data[..])
                     .map_err(|_| SlateDBError::BlockDecompressionError)?;
-                let decoded_len = measure_bounded_decompressed(&mut decoder, max_output_bytes)?;
+                let decoded_len = measure_bounded_decompressed(&mut decoder, _max_output_bytes)?;
                 let mut decoder = zstd::stream::read::Decoder::new(&compressed_data[..])
                     .map_err(|_| SlateDBError::BlockDecompressionError)?;
                 read_exact_decompressed(&mut decoder, decoded_len)
