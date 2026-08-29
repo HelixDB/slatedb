@@ -11,6 +11,7 @@ use crate::iter::{IterationOrder, RowEntryIterator};
 use crate::merge_operator::{MergeOperatorIterator, MergeOperatorType};
 use crate::prefix_extractor::PrefixExtractor;
 use crate::types::{RowEntry, ValueDeletable};
+use ahash::AHashSet;
 use async_trait::async_trait;
 use bytes::Bytes;
 use smallvec::{smallvec, SmallVec};
@@ -36,8 +37,8 @@ pub(crate) struct DisjointMergeDiscriminators(DisjointMergeDiscriminatorSet);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum DisjointMergeDiscriminatorSet {
-    Bytes(Arc<HashSet<MergeDiscriminator>>),
-    Tokens(Arc<HashSet<u128>>),
+    Bytes(Arc<AHashSet<MergeDiscriminator>>),
+    Tokens(Arc<AHashSet<u128>>),
 }
 
 impl DisjointMergeDiscriminators {
@@ -56,7 +57,7 @@ impl DisjointMergeDiscriminators {
                 );
                 MergeDiscriminator(SmallVec::from_slice(discriminator))
             })
-            .collect::<HashSet<_>>();
+            .collect::<AHashSet<_>>();
         assert!(
             !discriminators.is_empty(),
             "disjoint merge discriminators cannot be empty"
@@ -67,7 +68,7 @@ impl DisjointMergeDiscriminators {
     }
 
     pub(crate) fn from_tokens(tokens: impl IntoIterator<Item = u128>) -> Self {
-        let tokens = tokens.into_iter().collect::<HashSet<_>>();
+        let tokens = tokens.into_iter().collect::<AHashSet<_>>();
         assert!(
             !tokens.is_empty(),
             "disjoint merge discriminators cannot be empty"
@@ -1235,6 +1236,17 @@ mod tests {
         mixed.merge_disjoint_tokens(b"key", b"token", [1]);
         mixed.merge_disjoint(b"key", b"bytes", [1_u128.to_be_bytes()]);
         assert_eq!(mixed.merge_conflict_kind(b"key"), None);
+
+        let mut reverse_mixed = WriteBatch::new();
+        reverse_mixed.merge_disjoint(b"key", b"bytes", [2_u128.to_be_bytes()]);
+        reverse_mixed.merge_disjoint_tokens(b"key", b"token", [1]);
+        assert_eq!(reverse_mixed.merge_conflict_kind(b"key"), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "disjoint merge discriminators cannot be empty")]
+    fn disjoint_merge_rejects_empty_token_set() {
+        WriteBatch::new().merge_disjoint_tokens(b"key", b"operand", []);
     }
 
     #[test]

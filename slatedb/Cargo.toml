@@ -9,6 +9,7 @@ license.workspace = true
 homepage.workspace = true
 
 [dependencies]
+ahash = { workspace = true }
 async-channel = { workspace = true }
 async-trait = { workspace = true }
 atomic = { workspace = true }

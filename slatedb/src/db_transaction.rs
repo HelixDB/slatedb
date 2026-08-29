@@ -798,6 +798,12 @@ impl DbTransaction {
     /// avoiding per-member byte allocations for integer identities. Token and
     /// byte discriminator representations on the same physical key conflict
     /// conservatively, even when their logical values might correspond.
+    /// Tokens are transaction-only conflict metadata and are not persisted.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the token set is empty, or under the same key and operand
+    /// constraints as other write methods.
     pub fn merge_disjoint_tokens<K, V, I>(
         &self,
         key: K,
