@@ -1118,13 +1118,16 @@ pub struct WalReplaySettings {
     /// Maximum WAL payload memory used by full-object replay.
     ///
     /// Replay reserves `min(max_inflight_bytes / 4, 64 MiB)` for metadata, the
-    /// index, and one lazily decoded block. It uses the remainder for retained
-    /// encoded objects. A single object, transformed section, or decoded block
-    /// that cannot fit its partition is rejected instead of bypassing the bound.
+    /// index, and one lazily decoded block. Half of that working partition is
+    /// reserved for metadata/index and half for the current decoded block. It
+    /// uses the remainder for retained normal-sized encoded objects. Oversized
+    /// objects use bounded range replay instead of bypassing the limit.
     pub max_inflight_bytes: usize,
 }
 
 impl WalReplaySettings {
+    const MAX_DECODE_WORKING_BYTES: usize = 64 * 1024 * 1024;
+
     pub(crate) fn validate(&self) -> Result<(), SlateDBError> {
         if self.max_concurrent_objects == 0 {
             return Err(SlateDBError::InvalidConfiguration(
@@ -1140,6 +1143,40 @@ impl WalReplaySettings {
             return Err(SlateDBError::InvalidConfiguration(
                 "wal_replay.max_inflight_bytes must fit in a 32-bit semaphore permit count".into(),
             ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn working_memory_limit(&self) -> usize {
+        (self.max_inflight_bytes / 4).min(Self::MAX_DECODE_WORKING_BYTES)
+    }
+
+    pub(crate) fn encoded_byte_limit(&self) -> Result<usize, SlateDBError> {
+        self.max_inflight_bytes
+            .checked_sub(self.working_memory_limit())
+            .ok_or(SlateDBError::InvalidConfiguration(
+                "wal replay memory budget cannot reserve decode working memory".into(),
+            ))
+    }
+
+    pub(crate) fn block_working_memory_limit(&self) -> usize {
+        self.working_memory_limit() / 2
+    }
+
+    pub(crate) fn validate_wal_block_size(&self, block_size: usize) -> Result<(), SlateDBError> {
+        // In the worst uncompressed case range replay holds the encoded block,
+        // its decoded bytes, and a materialized `u16` offset vector together.
+        let required_bytes = block_size
+            .checked_mul(3)
+            .and_then(|size| size.checked_add(10))
+            .ok_or(SlateDBError::InvalidConfiguration(
+                "SST block size overflows WAL replay memory accounting".into(),
+            ))?;
+        let limit_bytes = self.block_working_memory_limit();
+        if required_bytes > limit_bytes {
+            return Err(SlateDBError::InvalidConfiguration(format!(
+                "SST block size requires {required_bytes} bytes of WAL replay working memory, limit is {limit_bytes} bytes"
+            )));
         }
         Ok(())
     }
@@ -2186,6 +2223,17 @@ object_store_cache_options:
             };
             assert!(settings.validate().is_err());
         }
+    }
+
+    #[test]
+    fn wal_replay_rejects_a_block_target_larger_than_its_working_partition() {
+        let settings = WalReplaySettings {
+            max_concurrent_objects: 1,
+            max_inflight_bytes: 64 * 1024,
+        };
+
+        assert!(settings.validate_wal_block_size(4096).is_err());
+        assert!(settings.validate_wal_block_size(1024).is_ok());
     }
 
     #[cfg(target_pointer_width = "64")]

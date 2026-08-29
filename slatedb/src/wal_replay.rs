@@ -4,7 +4,9 @@ use crate::error::SlateDBError;
 use crate::iter::{IterationOrder, RowEntryIterator};
 use crate::manifest::ManifestCore;
 use crate::mem_table::WritableKVTable;
-use crate::tablestore::{DecodedWalSst, DecodedWalSstData, TableStore};
+use crate::tablestore::{
+    DecodedWalSst, DecodedWalSstData, RangedWalSst, RangedWalSstData, TableStore,
+};
 use crate::types::RowEntry;
 use crate::utils::panic_string;
 use async_trait::async_trait;
@@ -50,7 +52,7 @@ pub(crate) struct ReplayedMemtable {
 struct WalIdAndIter {
     wal_id: u64,
     iter: Box<dyn RowEntryIterator + 'static>,
-    _permit: OwnedSemaphorePermit,
+    _permit: Option<OwnedSemaphorePermit>,
 }
 
 struct WalObjectPlan {
@@ -58,10 +60,24 @@ struct WalObjectPlan {
     expected_size: Option<u64>,
 }
 
-struct FetchedWal {
-    wal_id: u64,
-    bytes: Bytes,
-    permit: OwnedSemaphorePermit,
+enum FetchedWal {
+    Full {
+        wal_id: u64,
+        bytes: Bytes,
+        permit: OwnedSemaphorePermit,
+    },
+    Ranged {
+        wal_id: u64,
+        expected_size: u64,
+    },
+}
+
+impl FetchedWal {
+    fn wal_id(&self) -> u64 {
+        match self {
+            Self::Full { wal_id, .. } | Self::Ranged { wal_id, .. } => *wal_id,
+        }
+    }
 }
 
 struct PendingWal {
@@ -71,14 +87,91 @@ struct PendingWal {
 
 struct WalBlocksIterator {
     table_store: Arc<TableStore>,
-    wal: Option<DecodedWalSstData>,
+    wal: Option<WalBlockSource>,
     next_block: usize,
-    current: Option<DataBlockIterator<crate::format::block::Block>>,
+    current: Option<CurrentWalBlock>,
     encoded_byte_limit: usize,
     working_memory_limit: usize,
     block_working_memory_limit: usize,
     validation_retried: bool,
     yielded_rows: bool,
+    #[cfg(test)]
+    block_lifetime_probe: Option<Arc<BlockLifetimeProbe>>,
+}
+
+struct CurrentWalBlock {
+    iterator: DataBlockIterator<crate::format::block::Block>,
+    #[cfg(test)]
+    lifetime_probe: Option<Arc<BlockLifetimeProbe>>,
+}
+
+impl CurrentWalBlock {
+    fn new(
+        iterator: DataBlockIterator<crate::format::block::Block>,
+        #[cfg(test)] lifetime_probe: Option<Arc<BlockLifetimeProbe>>,
+    ) -> Self {
+        #[cfg(test)]
+        if let Some(probe) = &lifetime_probe {
+            let previous = probe
+                .active
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            probe
+                .peak
+                .fetch_max(previous + 1, std::sync::atomic::Ordering::SeqCst);
+        }
+        Self {
+            iterator,
+            #[cfg(test)]
+            lifetime_probe,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for CurrentWalBlock {
+    fn drop(&mut self) {
+        if let Some(probe) = &self.lifetime_probe {
+            let previous = probe
+                .active
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(previous, 1, "decoded WAL blocks overlapped");
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct BlockLifetimeProbe {
+    active: std::sync::atomic::AtomicUsize,
+    peak: std::sync::atomic::AtomicUsize,
+}
+
+enum WalBlockSource {
+    Full(DecodedWalSstData),
+    Ranged(RangedWalSstData),
+}
+
+impl WalBlockSource {
+    fn block_count(&self) -> usize {
+        match self {
+            Self::Full(wal) => wal.index.borrow().block_meta().len(),
+            Self::Ranged(wal) => wal.index.borrow().block_meta().len(),
+        }
+    }
+
+    fn format_version(&self) -> u16 {
+        match self {
+            Self::Full(wal) => wal.format_version,
+            Self::Ranged(wal) => wal.format_version,
+        }
+    }
+
+    fn retained_decode_bytes(&self) -> usize {
+        match self {
+            Self::Full(wal) => wal.retained_decode_bytes,
+            Self::Ranged(wal) => wal.retained_decode_bytes,
+        }
+    }
 }
 
 impl WalBlocksIterator {
@@ -88,13 +181,43 @@ impl WalBlocksIterator {
         encoded_byte_limit: usize,
         working_memory_limit: usize,
     ) -> Result<Self, SlateDBError> {
-        let block_working_memory_limit = working_memory_limit
-            .checked_sub(wal.retained_decode_bytes)
-            .ok_or(SlateDBError::WalReplayMemoryLimitExceeded {
-                kind: "WAL metadata, index, and block",
-                required_bytes: wal.retained_decode_bytes,
-                limit_bytes: working_memory_limit,
-            })?;
+        Self::from_source(
+            table_store,
+            WalBlockSource::Full(wal),
+            encoded_byte_limit,
+            working_memory_limit,
+        )
+    }
+
+    fn new_ranged(
+        table_store: Arc<TableStore>,
+        wal: RangedWalSstData,
+        encoded_byte_limit: usize,
+        working_memory_limit: usize,
+    ) -> Result<Self, SlateDBError> {
+        Self::from_source(
+            table_store,
+            WalBlockSource::Ranged(wal),
+            encoded_byte_limit,
+            working_memory_limit,
+        )
+    }
+
+    fn from_source(
+        table_store: Arc<TableStore>,
+        wal: WalBlockSource,
+        encoded_byte_limit: usize,
+        working_memory_limit: usize,
+    ) -> Result<Self, SlateDBError> {
+        let block_working_memory_limit = (working_memory_limit / 2).min(
+            working_memory_limit
+                .checked_sub(wal.retained_decode_bytes())
+                .ok_or(SlateDBError::WalReplayMemoryLimitExceeded {
+                    kind: "WAL metadata, index, and block",
+                    required_bytes: wal.retained_decode_bytes(),
+                    limit_bytes: working_memory_limit,
+                })?,
+        );
         Ok(Self {
             table_store,
             wal: Some(wal),
@@ -105,7 +228,15 @@ impl WalBlocksIterator {
             block_working_memory_limit,
             validation_retried: false,
             yielded_rows: false,
+            #[cfg(test)]
+            block_lifetime_probe: None,
         })
+    }
+
+    #[cfg(test)]
+    fn observe_block_lifetimes_with(mut self, probe: Arc<BlockLifetimeProbe>) -> Self {
+        self.block_lifetime_probe = Some(probe);
+        self
     }
 }
 
@@ -118,20 +249,37 @@ impl RowEntryIterator for WalBlocksIterator {
     async fn next(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
         loop {
             if let Some(current) = &mut self.current {
-                if let Some(entry) = current.next().await? {
+                if let Some(entry) = current.iterator.next().await? {
                     self.yielded_rows = true;
                     return Ok(Some(entry));
                 }
             }
+            self.current.take();
             let wal = self.wal.as_ref().ok_or(SlateDBError::InvalidDBState)?;
-            let block_count = wal.index.borrow().block_meta().len();
+            let block_count = wal.block_count();
             if self.next_block >= block_count {
                 return Ok(None);
             }
-            let decoded = self
-                .table_store
-                .decode_wal_block(wal, self.next_block, self.block_working_memory_limit)
-                .await;
+            debug_assert!(
+                self.current.is_none(),
+                "exhausted WAL block must be released before decoding the next block"
+            );
+            let decoded = match wal {
+                WalBlockSource::Full(wal) => {
+                    self.table_store
+                        .decode_wal_block(wal, self.next_block, self.block_working_memory_limit)
+                        .await
+                }
+                WalBlockSource::Ranged(wal) => {
+                    self.table_store
+                        .read_ranged_wal_block(
+                            wal,
+                            self.next_block,
+                            self.block_working_memory_limit,
+                        )
+                        .await
+                }
+            };
             let block = match decoded {
                 Ok(block) => block,
                 Err(error) => {
@@ -142,6 +290,9 @@ impl RowEntryIterator for WalBlocksIterator {
                         return Err(error);
                     }
                     let old_wal = self.wal.take().ok_or(SlateDBError::InvalidDBState)?;
+                    let WalBlockSource::Full(old_wal) = old_wal else {
+                        return Err(error);
+                    };
                     let wal_id = old_wal.wal_id;
                     let expected_size = old_wal.object_bytes.len();
                     drop(old_wal);
@@ -162,25 +313,26 @@ impl RowEntryIterator for WalBlocksIterator {
                             path: None,
                         });
                     };
-                    self.block_working_memory_limit = self
-                        .working_memory_limit
-                        .checked_sub(replacement.retained_decode_bytes)
-                        .ok_or(SlateDBError::WalReplayMemoryLimitExceeded {
-                            kind: "WAL metadata, index, and block",
-                            required_bytes: replacement.retained_decode_bytes,
-                            limit_bytes: self.working_memory_limit,
-                        })?;
-                    self.wal = Some(*replacement);
+                    self.block_working_memory_limit = (self.working_memory_limit / 2).min(
+                        self.working_memory_limit
+                            .checked_sub(replacement.retained_decode_bytes)
+                            .ok_or(SlateDBError::WalReplayMemoryLimitExceeded {
+                                kind: "WAL metadata, index, and block",
+                                required_bytes: replacement.retained_decode_bytes,
+                                limit_bytes: self.working_memory_limit,
+                            })?,
+                    );
+                    self.wal = Some(WalBlockSource::Full(*replacement));
                     continue;
                 }
             };
             self.next_block += 1;
             let wal = self.wal.as_ref().ok_or(SlateDBError::InvalidDBState)?;
-            self.current = Some(DataBlockIterator::new(
-                block,
-                wal.format_version,
-                IterationOrder::Ascending,
-            )?);
+            self.current = Some(CurrentWalBlock::new(
+                DataBlockIterator::new(block, wal.format_version(), IterationOrder::Ascending)?,
+                #[cfg(test)]
+                self.block_lifetime_probe.clone(),
+            ));
         }
     }
 
@@ -242,6 +394,7 @@ pub(crate) struct WalReplayIterator {
     fetched_objects: u64,
     fetched_bytes: u64,
     decoded_objects: u64,
+    ranged_objects: u64,
     peak_concurrent_objects: usize,
     peak_reserved_bytes: usize,
     completion_logged: bool,
@@ -280,16 +433,8 @@ impl WalReplayIterator {
             previous_listed_wal_id = Some(wal_id);
             listed_sizes.push_back((wal_id, metadata.metadata.size));
         }
-        const MAX_DECODE_WORKING_BYTES: usize = 64 * 1024 * 1024;
-        let working_memory_limit =
-            (options.prefetch.max_inflight_bytes / 4).min(MAX_DECODE_WORKING_BYTES);
-        let encoded_byte_limit = options
-            .prefetch
-            .max_inflight_bytes
-            .checked_sub(working_memory_limit)
-            .ok_or(SlateDBError::InvalidConfiguration(
-                "wal replay memory budget cannot reserve decode working memory".into(),
-            ))?;
+        let working_memory_limit = options.prefetch.working_memory_limit();
+        let encoded_byte_limit = options.prefetch.encoded_byte_limit()?;
         let byte_semaphore = Arc::new(Semaphore::new(encoded_byte_limit));
         let next_wal_id = wal_id_range.start;
 
@@ -310,6 +455,7 @@ impl WalReplayIterator {
             fetched_objects: 0,
             fetched_bytes: 0,
             decoded_objects: 0,
+            ranged_objects: 0,
             peak_concurrent_objects: 0,
             peak_reserved_bytes: 0,
             completion_logged: false,
@@ -318,7 +464,7 @@ impl WalReplayIterator {
 
         replay_iter.fill_prefetch();
         info!(
-            "SlateDB WAL full-object replay initialized [replay_start_wal_id={}, replay_end_wal_id={}, replay_wal_count={}, listed_wal_count={}, missing_size_count={}, max_concurrent_objects={}, max_inflight_bytes={}]",
+            "SlateDB WAL replay initialized [replay_start_wal_id={}, replay_end_wal_id={}, replay_wal_count={}, listed_wal_count={}, missing_size_count={}, max_concurrent_objects={}, max_inflight_bytes={}]",
             replay_iter.wal_id_range.start,
             replay_iter.wal_id_range.end,
             replay_iter
@@ -365,20 +511,24 @@ impl WalReplayIterator {
                 .unwrap_or(byte_limit)
                 .max(1);
             if reserved_bytes > byte_limit {
-                let required_bytes = reserved_bytes;
                 let wal_id = plan.wal_id;
+                let expected_size = plan
+                    .expected_size
+                    .expect("an oversized planned WAL must have a listed size");
+                self.listed_sizes.pop_front();
                 self.next_wal_id += 1;
                 self.pending_fetches.push_back(PendingWal {
                     wal_id,
                     handle: tokio::spawn(async move {
-                        Err(SlateDBError::WalReplayMemoryLimitExceeded {
-                            kind: "encoded WAL object",
-                            required_bytes,
-                            limit_bytes: byte_limit,
+                        Ok(FetchedWal::Ranged {
+                            wal_id,
+                            expected_size,
                         })
                     }),
                 });
-                break;
+                self.peak_concurrent_objects =
+                    self.peak_concurrent_objects.max(self.pending_fetches.len());
+                continue;
             }
             let permit_count = u32::try_from(reserved_bytes)
                 .expect("validated WAL replay byte limit must fit in u32");
@@ -392,14 +542,34 @@ impl WalReplayIterator {
             self.next_wal_id += 1;
             let table_store = Arc::clone(&self.table_store);
             let handle = tokio::spawn(async move {
-                let bytes = table_store
+                match table_store
                     .read_wal_sst_bytes(plan.wal_id, plan.expected_size, byte_limit)
-                    .await?;
-                Ok(FetchedWal {
-                    wal_id: plan.wal_id,
-                    bytes,
-                    permit,
-                })
+                    .await
+                {
+                    Ok(bytes) => Ok(FetchedWal::Full {
+                        wal_id: plan.wal_id,
+                        bytes,
+                        permit,
+                    }),
+                    Err(SlateDBError::WalReplayMemoryLimitExceeded {
+                        kind: "encoded WAL object",
+                        required_bytes,
+                        limit_bytes,
+                    }) if required_bytes > limit_bytes => {
+                        drop(permit);
+                        Ok(FetchedWal::Ranged {
+                            wal_id: plan.wal_id,
+                            expected_size: u64::try_from(required_bytes).map_err(|_| {
+                                SlateDBError::WalReplayMemoryLimitExceeded {
+                                    kind: "encoded WAL object",
+                                    required_bytes,
+                                    limit_bytes,
+                                }
+                            })?,
+                        })
+                    }
+                    Err(error) => Err(error),
+                }
             });
             self.pending_fetches.push_back(PendingWal {
                 wal_id: plan.wal_id,
@@ -434,59 +604,90 @@ impl WalReplayIterator {
                     return Err(self.fail(SlateDBError::BackgroundTaskCancelled(task_name)));
                 }
             };
-            if pending.wal_id != fetched.wal_id {
+            if pending.wal_id != fetched.wal_id() {
                 return Err(self.fail(SlateDBError::InvalidDBState));
             }
-            let FetchedWal {
-                wal_id,
-                bytes,
-                permit,
-            } = fetched;
-            self.fetched_objects = self.fetched_objects.saturating_add(1);
-            self.fetched_bytes = self
-                .fetched_bytes
-                .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
-            let expected_size = bytes.len();
-            let initial_decode = self
-                .table_store
-                .decode_wal_sst(wal_id, bytes, self.working_memory_limit)
-                .await;
-            let decoded = match initial_decode {
-                Ok(decoded) => decoded,
-                Err(error) => {
-                    let Some(reason) = error.maybe_validation_retry_reason() else {
-                        return Err(self.fail(error));
-                    };
-                    match self
+            let (wal_id, iter, permit): (_, Box<dyn RowEntryIterator + 'static>, _) = match fetched
+            {
+                FetchedWal::Full {
+                    wal_id,
+                    bytes,
+                    permit,
+                } => {
+                    self.fetched_objects = self.fetched_objects.saturating_add(1);
+                    self.fetched_bytes = self
+                        .fetched_bytes
+                        .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+                    let expected_size = bytes.len();
+                    let initial_decode = self
                         .table_store
-                        .refetch_wal_sst_after_validation(
-                            wal_id,
-                            expected_size,
-                            self.encoded_byte_limit,
-                            self.working_memory_limit,
-                            reason,
-                        )
+                        .decode_wal_sst(wal_id, bytes, self.working_memory_limit)
+                        .await;
+                    let decoded = match initial_decode {
+                        Ok(decoded) => decoded,
+                        Err(error) => {
+                            let Some(reason) = error.maybe_validation_retry_reason() else {
+                                return Err(self.fail(error));
+                            };
+                            match self
+                                .table_store
+                                .refetch_wal_sst_after_validation(
+                                    wal_id,
+                                    expected_size,
+                                    self.encoded_byte_limit,
+                                    self.working_memory_limit,
+                                    reason,
+                                )
+                                .await
+                            {
+                                Ok(decoded) => decoded,
+                                Err(error) => return Err(self.fail(error)),
+                            }
+                        }
+                    };
+                    let iter: Box<dyn RowEntryIterator + 'static> = match decoded {
+                        DecodedWalSst::Fence => Box::new(crate::iter::EmptyIterator::new()),
+                        DecodedWalSst::Data(wal) => Box::new(
+                            WalBlocksIterator::new(
+                                Arc::clone(&self.table_store),
+                                *wal,
+                                self.encoded_byte_limit,
+                                self.working_memory_limit,
+                            )
+                            .map_err(|error| self.fail(error))?,
+                        ),
+                    };
+                    (wal_id, iter, Some(permit))
+                }
+                FetchedWal::Ranged {
+                    wal_id,
+                    expected_size,
+                } => {
+                    self.ranged_objects = self.ranged_objects.saturating_add(1);
+                    let decoded = match self
+                        .table_store
+                        .open_ranged_wal_sst(wal_id, expected_size, self.working_memory_limit)
                         .await
                     {
                         Ok(decoded) => decoded,
                         Err(error) => return Err(self.fail(error)),
-                    }
+                    };
+                    let iter: Box<dyn RowEntryIterator + 'static> = match decoded {
+                        RangedWalSst::Fence => Box::new(crate::iter::EmptyIterator::new()),
+                        RangedWalSst::Data(wal) => Box::new(
+                            WalBlocksIterator::new_ranged(
+                                Arc::clone(&self.table_store),
+                                *wal,
+                                self.encoded_byte_limit,
+                                self.working_memory_limit,
+                            )
+                            .map_err(|error| self.fail(error))?,
+                        ),
+                    };
+                    (wal_id, iter, None)
                 }
             };
             self.decoded_objects = self.decoded_objects.saturating_add(1);
-            let iter: Box<dyn RowEntryIterator + 'static> = match decoded {
-                DecodedWalSst::Fence => Box::new(crate::iter::EmptyIterator::new()),
-                DecodedWalSst::Data(wal) => {
-                    let iterator = WalBlocksIterator::new(
-                        Arc::clone(&self.table_store),
-                        *wal,
-                        self.encoded_byte_limit,
-                        self.working_memory_limit,
-                    )
-                    .map_err(|error| self.fail(error))?;
-                    Box::new(iterator)
-                }
-            };
             Some(WalIdAndIter {
                 wal_id,
                 iter,
@@ -598,11 +799,12 @@ impl WalReplayIterator {
         }
         self.completion_logged = true;
         info!(
-            "SlateDB WAL full-object replay completed [replay_start_wal_id={}, replay_end_wal_id={}, fetched_objects={}, fetched_bytes={}, decoded_objects={}, peak_concurrent_objects={}, peak_reserved_bytes={}]",
+            "SlateDB WAL replay completed [replay_start_wal_id={}, replay_end_wal_id={}, fetched_objects={}, fetched_bytes={}, ranged_objects={}, decoded_objects={}, peak_concurrent_objects={}, peak_reserved_bytes={}]",
             self.wal_id_range.start,
             self.wal_id_range.end,
             self.fetched_objects,
             self.fetched_bytes,
+            self.ranged_objects,
             self.decoded_objects,
             self.peak_concurrent_objects,
             self.peak_reserved_bytes,
@@ -1076,7 +1278,27 @@ mod tests {
                 full_rows.push(row);
             }
 
+            let ranged = table_store
+                .open_ranged_wal_sst(1, store.head(&path).await.unwrap().size, 64 * 1024 * 1024)
+                .await
+                .unwrap();
+            let super::RangedWalSst::Data(wal) = ranged else {
+                panic!("historical fixture {name} range-decoded as a fence");
+            };
+            let mut iterator = super::WalBlocksIterator::new_ranged(
+                Arc::clone(&table_store),
+                *wal,
+                192 * 1024 * 1024,
+                64 * 1024 * 1024,
+            )
+            .unwrap();
+            let mut bounded_range_rows = Vec::new();
+            while let Some(row) = iterator.next().await.unwrap() {
+                bounded_range_rows.push(row);
+            }
+
             assert_eq!(full_rows, range_rows, "fixture {name}");
+            assert_eq!(bounded_range_rows, range_rows, "fixture {name}");
             assert_historical_rows(name, &full_rows);
 
             let expected_filtered = range_rows
@@ -1739,15 +1961,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_encoded_wal_is_rejected_before_get() {
+    async fn oversized_encoded_wal_uses_bounded_range_replay() {
         let inner = Arc::new(InMemory::new());
         let recording = Arc::new(RecordingObjectStore::new(inner));
         let table_store = test_table_store_with_object_store(recording.clone());
         let mut builder = table_store.wal_table_builder();
-        builder
-            .add(RowEntry::new_value(b"large", &vec![b'x'; 128 * 1024], 1))
-            .await
-            .unwrap();
+        for seq in 1..=64 {
+            builder
+                .add(RowEntry::new_value(
+                    format!("large-{seq:03}").as_bytes(),
+                    &[b'x'; 2048],
+                    seq,
+                ))
+                .await
+                .unwrap();
+        }
         let encoded = builder.build().await.unwrap();
         table_store
             .write_sst(&SsTableId::Wal(1), &encoded)
@@ -1769,11 +1997,302 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(matches!(
-            replay.next().await,
-            Err(SlateDBError::WalReplayMemoryLimitExceeded { .. })
-        ));
-        assert!(recording.get_kinds(false).is_empty());
+        let replayed = replay
+            .next()
+            .await
+            .expect("oversized WAL should remain recoverable")
+            .expect("oversized WAL should produce a replayed table");
+        let mut rows = replayed.table.table().iter();
+        let mut row_count = 0;
+        while let Some(row) = rows.next().await.unwrap() {
+            assert_eq!(row.value.len(), 2048);
+            row_count += 1;
+        }
+        assert_eq!(row_count, 64);
+        assert!(replay.next().await.unwrap().is_none());
+        assert!(recording.get_kinds(false).len() > 1);
+    }
+
+    #[tokio::test]
+    async fn oversized_range_replay_supports_codecs_and_block_transformations() {
+        let mut codecs = Vec::with_capacity(5);
+        codecs.push(None);
+        #[cfg(feature = "snappy")]
+        codecs.push(Some(crate::config::CompressionCodec::Snappy));
+        #[cfg(feature = "zlib")]
+        codecs.push(Some(crate::config::CompressionCodec::Zlib));
+        #[cfg(feature = "lz4")]
+        codecs.push(Some(crate::config::CompressionCodec::Lz4));
+        #[cfg(feature = "zstd")]
+        codecs.push(Some(crate::config::CompressionCodec::Zstd));
+
+        for codec in codecs {
+            for transformed in [false, true] {
+                let inner = Arc::new(InMemory::new());
+                let recording = Arc::new(RecordingObjectStore::new(inner));
+                let format = SsTableFormat {
+                    compression_codec: codec,
+                    block_transformer: transformed
+                        .then(|| Arc::new(HistoricalXorTransformer) as Arc<dyn BlockTransformer>),
+                    ..SsTableFormat::default()
+                };
+                let table_store =
+                    test_table_store_with_format_and_object_store(format, recording.clone());
+                let mut builder = table_store.wal_table_builder();
+                let mut test_rng = rng::new_test_rng(None);
+                for seq in 1..=64 {
+                    let mut value = vec![0_u8; 2048];
+                    test_rng.fill(value.as_mut_slice());
+                    builder
+                        .add(RowEntry::new_value(
+                            format!("codec-{seq:03}").as_bytes(),
+                            &value,
+                            seq,
+                        ))
+                        .await
+                        .unwrap();
+                }
+                let encoded = builder.build().await.unwrap();
+                assert!(encoded.remaining_len() > 96 * 1024, "{codec:?}");
+                table_store
+                    .write_sst(&SsTableId::Wal(1), &encoded)
+                    .await
+                    .unwrap();
+                recording.clear();
+
+                let mut replay = WalReplayIterator::range(
+                    1..2,
+                    &ManifestCore::new(),
+                    WalReplayOptions {
+                        prefetch: WalReplaySettings {
+                            max_concurrent_objects: 4,
+                            max_inflight_bytes: 128 * 1024,
+                        },
+                        ..WalReplayOptions::default()
+                    },
+                    table_store,
+                )
+                .await
+                .unwrap();
+                let replayed = replay.next().await.unwrap().unwrap();
+                assert_eq!(replayed.table.metadata().entry_num, 64, "{codec:?}");
+                assert!(replay.next().await.unwrap().is_none());
+                assert!(
+                    recording.get_kinds(false).len() > 1,
+                    "{codec:?}, transformed={transformed}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn exhausted_block_is_dropped_before_decoding_the_next_block() {
+        let format = SsTableFormat {
+            block_size: 64,
+            ..SsTableFormat::default()
+        };
+        let table_store = test_table_store_with_format(format);
+        let mut builder = table_store.wal_table_builder();
+        for seq in 1..=3 {
+            builder
+                .add(RowEntry::new_value(
+                    format!("key-{seq}").as_bytes(),
+                    &[b'x'; 48],
+                    seq,
+                ))
+                .await
+                .unwrap();
+        }
+        let encoded = builder.build().await.unwrap();
+        table_store
+            .write_sst(&SsTableId::Wal(1), &encoded)
+            .await
+            .unwrap();
+        let bytes = table_store
+            .read_wal_sst_bytes(1, None, encoded.remaining_len())
+            .await
+            .unwrap();
+        let DecodedWalSst::Data(wal) = table_store
+            .decode_wal_sst(1, bytes, 1024 * 1024)
+            .await
+            .unwrap()
+        else {
+            panic!("data WAL decoded as a fence");
+        };
+        let probe = Arc::new(super::BlockLifetimeProbe::default());
+        let mut iterator =
+            super::WalBlocksIterator::new(Arc::clone(&table_store), *wal, 1024 * 1024, 1024 * 1024)
+                .unwrap()
+                .observe_block_lifetimes_with(Arc::clone(&probe));
+
+        while iterator.next().await.unwrap().is_some() {}
+
+        assert_eq!(probe.active.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.peak.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelling_wal_block_iteration_releases_the_current_block() {
+        let format = SsTableFormat {
+            block_size: 64,
+            ..SsTableFormat::default()
+        };
+        let table_store = test_table_store_with_format(format);
+        let mut builder = table_store.wal_table_builder();
+        builder
+            .add(RowEntry::new_value(b"key", &[b'x'; 48], 1))
+            .await
+            .unwrap();
+        let encoded = builder.build().await.unwrap();
+        table_store
+            .write_sst(&SsTableId::Wal(1), &encoded)
+            .await
+            .unwrap();
+        let bytes = table_store
+            .read_wal_sst_bytes(1, None, encoded.remaining_len())
+            .await
+            .unwrap();
+        let DecodedWalSst::Data(wal) = table_store
+            .decode_wal_sst(1, bytes, 1024 * 1024)
+            .await
+            .unwrap()
+        else {
+            panic!("data WAL decoded as a fence");
+        };
+        let probe = Arc::new(super::BlockLifetimeProbe::default());
+        let mut iterator =
+            super::WalBlocksIterator::new(table_store, *wal, 1024 * 1024, 1024 * 1024)
+                .unwrap()
+                .observe_block_lifetimes_with(Arc::clone(&probe));
+        assert!(iterator.next().await.unwrap().is_some());
+        assert_eq!(probe.active.load(Ordering::SeqCst), 1);
+
+        drop(iterator);
+
+        assert_eq!(probe.active.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.peak.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn decoding_failure_drops_the_exhausted_block_first() {
+        let format = SsTableFormat {
+            block_size: 64,
+            ..SsTableFormat::default()
+        };
+        let table_store = test_table_store_with_format(format);
+        let mut builder = table_store.wal_table_builder();
+        for seq in 1..=3 {
+            builder
+                .add(RowEntry::new_value(
+                    format!("key-{seq}").as_bytes(),
+                    &[b'x'; 48],
+                    seq,
+                ))
+                .await
+                .unwrap();
+        }
+        let encoded = builder.build().await.unwrap();
+        let original = encoded.remaining_as_bytes();
+        let DecodedWalSst::Data(original_wal) = table_store
+            .decode_wal_sst(1, original.clone(), 1024 * 1024)
+            .await
+            .unwrap()
+        else {
+            panic!("data WAL decoded as a fence");
+        };
+        let second_block_offset = original_wal.index.borrow().block_meta().get(1).offset() as usize;
+        let mut corrupted = original.to_vec();
+        corrupted[second_block_offset] ^= 1;
+        let DecodedWalSst::Data(wal) = table_store
+            .decode_wal_sst(1, Bytes::from(corrupted), 1024 * 1024)
+            .await
+            .unwrap()
+        else {
+            panic!("data WAL decoded as a fence");
+        };
+        let probe = Arc::new(super::BlockLifetimeProbe::default());
+        let mut iterator =
+            super::WalBlocksIterator::new(table_store, *wal, 1024 * 1024, 1024 * 1024)
+                .unwrap()
+                .observe_block_lifetimes_with(Arc::clone(&probe));
+
+        assert!(iterator.next().await.unwrap().is_some());
+        let Err(error) = iterator.next().await else {
+            panic!("corrupt second block did not fail");
+        };
+
+        assert!(matches!(error, SlateDBError::ChecksumMismatch { .. }));
+        assert_eq!(probe.active.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.peak.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn oversized_range_replay_never_exposes_a_partial_wal_after_late_corruption() {
+        let inner = Arc::new(InMemory::new());
+        let table_store = test_table_store_with_object_store(inner.clone());
+        let mut builder = table_store.wal_table_builder();
+        for seq in 1..=64 {
+            builder
+                .add(RowEntry::new_value(
+                    format!("corrupt-{seq:03}").as_bytes(),
+                    &[b'x'; 2048],
+                    seq,
+                ))
+                .await
+                .unwrap();
+        }
+        let encoded = builder.build().await.unwrap();
+        assert!(encoded.remaining_len() > 96 * 1024);
+        table_store
+            .write_sst(&SsTableId::Wal(1), &encoded)
+            .await
+            .unwrap();
+        let handle = table_store.open_sst(&SsTableId::Wal(1)).await.unwrap();
+        let index = table_store.read_index(&handle, false).await.unwrap();
+        let second_block_offset = index.borrow().block_meta().get(1).offset() as usize;
+        let metadata = table_store
+            .list_wal_ssts_for_replay(1..2)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap()
+            .metadata;
+        let mut bytes = inner
+            .get(&metadata.location)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap()
+            .to_vec();
+        bytes[second_block_offset] ^= 1;
+        inner
+            .put(&metadata.location, Bytes::from(bytes).into())
+            .await
+            .unwrap();
+
+        let mut replay = WalReplayIterator::range(
+            1..2,
+            &ManifestCore::new(),
+            WalReplayOptions {
+                prefetch: WalReplaySettings {
+                    max_concurrent_objects: 4,
+                    max_inflight_bytes: 128 * 1024,
+                },
+                ..WalReplayOptions::default()
+            },
+            table_store,
+        )
+        .await
+        .unwrap();
+        let Err(first) = replay.next().await else {
+            panic!("corrupt oversized WAL was partially exposed");
+        };
+        let Err(second) = replay.next().await else {
+            panic!("corrupt oversized WAL failure was not sticky");
+        };
+        assert!(matches!(first, SlateDBError::ChecksumMismatch { .. }));
+        assert!(matches!(second, SlateDBError::ChecksumMismatch { .. }));
     }
 
     #[tokio::test]
@@ -2341,7 +2860,7 @@ mod tests {
             .map(|entry| usize::try_from(entry.metadata.size).unwrap())
             .max()
             .unwrap();
-        let total_budget = largest_object.checked_mul(4).unwrap().div_ceil(3);
+        let total_budget = largest_object.checked_mul(2).unwrap();
         let working_budget = total_budget / 4;
         let encoded_budget = total_budget - working_budget;
         assert!(encoded_budget >= largest_object);
