@@ -3115,7 +3115,7 @@ mod tests {
 
     #[cfg(feature = "wal_disable")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn should_not_compact_expired_merge_operations_in_last_run() {
+    async fn should_remove_expired_merge_operations_and_resolve_last_run() {
         use crate::test_utils::OnDemandCompactionSchedulerSupplier;
 
         // given:
@@ -3181,7 +3181,7 @@ mod tests {
         assert_eq!(db_state.tree.compacted.len(), 1);
         assert_eq!(db_state.last_l0_clock_tick, 20);
 
-        // then: the compacted SST should only contain the non-expired merge
+        // then: the compacted SST should only contain the non-expired logical value
         let compacted = &db_state.tree.compacted.first().unwrap().sst_views;
         assert_eq!(compacted.len(), 1);
         let handle = compacted.first().unwrap();
@@ -3196,10 +3196,11 @@ mod tests {
         .unwrap()
         .expect("Expected Some(iter) but got None");
 
-        // only the non-expired merge "b" should be present
+        // only the non-expired value "b" should be present; the terminal
+        // compaction can resolve it because no older run can contain a base.
         assert_iterator(
             &mut iter,
-            vec![RowEntry::new_merge(b"key1", &[b'b'; 32], 2).with_create_ts(20)],
+            vec![RowEntry::new_value(b"key1", &[b'b'; 32], 2).with_create_ts(20)],
         )
         .await;
     }
