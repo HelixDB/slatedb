@@ -1571,6 +1571,7 @@ pub(crate) enum RecordedCall {
 pub(crate) struct RecordingObjectStore {
     inner: Arc<dyn ObjectStore>,
     calls: parking_lot::Mutex<Vec<RecordedCall>>,
+    list_calls: AtomicUsize,
 }
 
 impl RecordingObjectStore {
@@ -1578,11 +1579,13 @@ impl RecordingObjectStore {
         Self {
             inner,
             calls: parking_lot::Mutex::new(Vec::new()),
+            list_calls: AtomicUsize::new(0),
         }
     }
 
     pub(crate) fn clear(&self) {
         self.calls.lock().clear();
+        self.list_calls.store(0, Ordering::SeqCst);
     }
 
     pub(crate) fn get_kinds(&self, head: bool) -> Vec<Option<TableStoreKind>> {
@@ -1632,6 +1635,10 @@ impl RecordingObjectStore {
                 _ => None,
             })
             .collect()
+    }
+
+    pub(crate) fn list_calls(&self) -> usize {
+        self.list_calls.load(Ordering::SeqCst)
     }
 
     pub(crate) fn write_kinds(&self) -> Vec<Option<TableStoreKind>> {
@@ -1722,6 +1729,7 @@ impl ObjectStore for RecordingObjectStore {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.list_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.list(prefix)
     }
 
@@ -1730,6 +1738,7 @@ impl ObjectStore for RecordingObjectStore {
         prefix: Option<&Path>,
         offset: &Path,
     ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.list_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.list_with_offset(prefix, offset)
     }
 

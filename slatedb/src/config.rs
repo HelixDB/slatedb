@@ -1161,6 +1161,12 @@ pub struct DbReaderOptions {
     /// [`crate::DbReaderMode::Checkpoint`] do not poll the manifest or WAL.
     pub manifest_poll_interval: Duration,
 
+    /// How frequently an open reader probes the exact next WAL ID after
+    /// consuming the manifest-known range. Must be nonzero. Runtime WAL
+    /// polling performs bounded range reads and never discovers WALs via LIST.
+    #[serde(default = "default_reader_wal_poll_interval")]
+    pub wal_poll_interval: Duration,
+
     /// For readers using [`crate::DbReaderMode::ManagedCheckpoint`], the client maintains a
     /// checkpoint against the latest database state. The checkpoint's expire time is set to the
     /// current time plus this value. This lifetime must always be greater than
@@ -1207,6 +1213,7 @@ impl Default for DbReaderOptions {
     fn default() -> Self {
         Self {
             manifest_poll_interval: Duration::from_secs(10),
+            wal_poll_interval: default_reader_wal_poll_interval(),
             checkpoint_lifetime: Duration::from_secs(10 * 60),
             max_memtable_bytes: 64 * 1024 * 1024,
             wal_replay: WalReplaySettings::default(),
@@ -1216,6 +1223,10 @@ impl Default for DbReaderOptions {
             object_store_max_retries: None,
         }
     }
+}
+
+fn default_reader_wal_poll_interval() -> Duration {
+    Duration::from_secs(1)
 }
 
 /// The compression algorithm to use for SSTables.
@@ -2220,8 +2231,10 @@ object_store_cache_options:
 
         let mut reader = serde_json::to_value(DbReaderOptions::default()).unwrap();
         reader.as_object_mut().unwrap().remove("wal_replay");
+        reader.as_object_mut().unwrap().remove("wal_poll_interval");
         let decoded: DbReaderOptions = serde_json::from_value(reader).unwrap();
         assert_eq!(decoded.wal_replay, WalReplaySettings::default());
+        assert_eq!(decoded.wal_poll_interval, Duration::from_secs(1));
 
         let partial: WalReplaySettings = serde_json::from_value(serde_json::json!({
             "max_concurrent_objects": 8

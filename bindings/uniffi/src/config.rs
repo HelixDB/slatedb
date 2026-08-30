@@ -188,6 +188,10 @@ impl TryFrom<ReaderMode> for slatedb::DbReaderMode {
 pub struct ReaderOptions {
     /// How often the reader polls for new manifests and WAL data, in milliseconds.
     pub manifest_poll_interval_ms: u64,
+
+    /// How frequently an open reader probes the exact next WAL ID.
+    #[uniffi(default = 1000)]
+    pub wal_poll_interval_ms: u64,
     /// Lifetime of an internally managed checkpoint, in milliseconds.
     pub checkpoint_lifetime_ms: u64,
     /// Maximum size of one in-memory table used while replaying WAL data.
@@ -206,6 +210,7 @@ impl Default for ReaderOptions {
     fn default() -> Self {
         Self {
             manifest_poll_interval_ms: 10_000,
+            wal_poll_interval_ms: 1_000,
             checkpoint_lifetime_ms: 600_000,
             max_memtable_bytes: 64 * 1024 * 1024,
             skip_wal_replay: false,
@@ -218,6 +223,7 @@ impl From<ReaderOptions> for slatedb::config::DbReaderOptions {
     fn from(value: ReaderOptions) -> Self {
         slatedb::config::DbReaderOptions {
             manifest_poll_interval: Duration::from_millis(value.manifest_poll_interval_ms),
+            wal_poll_interval: Duration::from_millis(value.wal_poll_interval_ms),
             checkpoint_lifetime: Duration::from_millis(value.checkpoint_lifetime_ms),
             max_memtable_bytes: value.max_memtable_bytes,
             skip_wal_replay: value.skip_wal_replay,
@@ -572,17 +578,20 @@ mod tests {
         let reader: slatedb::config::DbReaderOptions = ReaderOptions::default().into();
 
         assert_eq!(reader.object_store_max_retries, None);
+        assert_eq!(reader.wal_poll_interval, Duration::from_secs(1));
     }
 
     #[test]
     fn reader_object_store_max_retries_threads_through() {
         let reader: slatedb::config::DbReaderOptions = ReaderOptions {
             object_store_max_retries: Some(5),
+            wal_poll_interval_ms: 250,
             ..ReaderOptions::default()
         }
         .into();
 
         assert_eq!(reader.object_store_max_retries, Some(5));
+        assert_eq!(reader.wal_poll_interval, Duration::from_millis(250));
     }
 }
 

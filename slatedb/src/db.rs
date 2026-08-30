@@ -70,7 +70,7 @@ use crate::tablestore::TableStore;
 use crate::transaction_manager::TransactionManager;
 use crate::types::KeyValue;
 use crate::utils::{format_bytes_si, SafeSender, WatchableOnceCellReader};
-use crate::wal_replay::{WalReplayIterator, WalReplayOptions};
+use crate::wal_replay::{ExactWalReplayIterator, ExactWalReplaySource, WalReplayOptions};
 use crate::{DbCacheManagerOps, DbMetadataOps, DbReadOps, DbWriteOps};
 use slatedb_common::clock::SystemClock;
 use slatedb_common::metrics::MetricsRecorderHelper;
@@ -528,10 +528,11 @@ impl DbInner {
             prefetch: self.settings.wal_replay,
             max_memtable_bytes: self.settings.l0_sst_size_bytes,
             min_seq: None,
+            source: ExactWalReplaySource::WriterOpen,
         };
 
         let db_state = self.state.read().state().core().clone();
-        let mut replay_iter = WalReplayIterator::range(
+        let mut replay_iter = ExactWalReplayIterator::range(
             wal_id_range,
             &db_state,
             replay_options,

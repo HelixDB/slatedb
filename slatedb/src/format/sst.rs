@@ -698,6 +698,11 @@ pub(crate) type LengthOffsetAndVersion = (u64, u64, u16);
 
 pub(crate) type TableInfoAndVersion = (SsTableInfo, u16);
 
+pub(crate) enum StagedSstInfoError {
+    Initial(SlateDBError),
+    Later(SlateDBError),
+}
+
 #[derive(Clone)]
 pub(crate) struct SsTableFormat {
     pub(crate) block_size: usize,
@@ -735,10 +740,21 @@ impl SsTableFormat {
         let header = obj
             .read_range((obj_len - NUM_FOOTER_BYTES_LONG)..obj_len)
             .await?;
-        assert_eq!(header.len(), NUM_FOOTER_BYTES);
+        if header.len() != NUM_FOOTER_BYTES {
+            return Err(SlateDBError::CorruptSst {
+                reason: "invalid SST footer length",
+                path: None,
+            });
+        }
 
         let version = header.slice(8..NUM_FOOTER_BYTES).get_u16();
         let sst_metadata_offset = header.slice(0..8).get_u64();
+        if sst_metadata_offset > obj_len - NUM_FOOTER_BYTES_LONG {
+            return Err(SlateDBError::CorruptSst {
+                reason: "SST metadata offset exceeds footer start",
+                path: None,
+            });
+        }
         Ok((obj_len, sst_metadata_offset, version))
     }
 
@@ -765,6 +781,25 @@ impl SsTableFormat {
             .read_range(sst_metadata_offset..obj_len - NUM_FOOTER_BYTES_LONG)
             .await?;
         SsTableInfo::decode(sst_metadata_bytes, &*self.sst_codec).map(|info| (info, version))
+    }
+
+    pub(crate) async fn read_info_and_version_staged(
+        &self,
+        obj: &impl ReadOnlyBlob,
+    ) -> Result<TableInfoAndVersion, StagedSstInfoError> {
+        let (obj_len, sst_metadata_offset, version) = self
+            .read_length_and_metadata_offset_and_version(obj)
+            .await
+            .map_err(StagedSstInfoError::Initial)?;
+        self.validate_version(version)
+            .map_err(StagedSstInfoError::Later)?;
+        let sst_metadata_bytes = obj
+            .read_range(sst_metadata_offset..obj_len - NUM_FOOTER_BYTES_LONG)
+            .await
+            .map_err(StagedSstInfoError::Later)?;
+        SsTableInfo::decode(sst_metadata_bytes, &*self.sst_codec)
+            .map(|info| (info, version))
+            .map_err(StagedSstInfoError::Later)
     }
 
     pub(crate) async fn read_wal_info_and_version_bounded(

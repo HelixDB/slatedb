@@ -26,8 +26,8 @@ use crate::filter_policy::NamedFilter;
 use crate::flatbuffer_types::SsTableIndexOwned;
 use crate::format::block::Block;
 use crate::format::sst::{
-    EncodedSsTable, EncodedSsTableBlock, SsTableFormat, CHECKSUM_SIZE, METADATA_OFFSET_SIZE,
-    VERSION_SIZE,
+    EncodedSsTable, EncodedSsTableBlock, SsTableFormat, StagedSstInfoError, CHECKSUM_SIZE,
+    METADATA_OFFSET_SIZE, VERSION_SIZE,
 };
 use crate::object_store_tag::ObjectStoreCallTag;
 pub(crate) use crate::object_store_tag::TableStoreKind;
@@ -77,6 +77,11 @@ pub(crate) struct RangedWalSstData {
     pub(crate) info: SsTableInfo,
     pub(crate) index: SsTableIndexOwned,
     pub(crate) retained_decode_bytes: usize,
+}
+
+pub(crate) enum RuntimeWalOpenError {
+    MissingInitialObject(SlateDBError),
+    Replay(SlateDBError),
 }
 
 struct ReadOnlyObject {
@@ -1176,6 +1181,52 @@ impl TableStore {
         let (info, version) =
             read_obj!(self, id, |obj| self.sst_format.read_info_and_version(&obj)).await?;
         Ok(SsTableHandle::new(*id, version, info))
+    }
+
+    pub(crate) async fn open_runtime_wal_sst(
+        &self,
+        wal_id: u64,
+    ) -> Result<SsTableHandle, RuntimeWalOpenError> {
+        fail_point!(Arc::clone(&self.fp_registry), "runtime-wal-replay", |_| {
+            Err(RuntimeWalOpenError::Replay(SlateDBError::from(
+                std::io::Error::other("runtime WAL replay failpoint"),
+            )))
+        });
+        let id = SsTableId::Wal(wal_id);
+        let object_store = self.object_stores.store_for(&id);
+        let path = self.path(&id);
+        let mut tag = ObjectStoreCallTag::new(self.kind, SstType::Wal);
+        let mut validation_retries = 0_usize;
+        loop {
+            let object = ReadOnlyObject {
+                object_store: Arc::clone(&object_store),
+                path: path.clone(),
+                tag,
+            };
+            match self.sst_format.read_info_and_version_staged(&object).await {
+                Ok((info, version)) => return Ok(SsTableHandle::new(id, version, info)),
+                Err(StagedSstInfoError::Initial(error)) if error.has_object_store_not_found() => {
+                    return Err(RuntimeWalOpenError::MissingInitialObject(
+                        error.with_path(&path),
+                    ));
+                }
+                Err(StagedSstInfoError::Initial(error)) | Err(StagedSstInfoError::Later(error)) => {
+                    let error = error.with_path(&path);
+                    let Some(reason) = error.maybe_validation_retry_reason() else {
+                        return Err(RuntimeWalOpenError::Replay(error));
+                    };
+                    if validation_retries >= MAX_VALIDATION_RETRIES {
+                        return Err(RuntimeWalOpenError::Replay(error));
+                    }
+                    validation_retries += 1;
+                    tag.retry = Some(reason);
+                    warn!(
+                        "retrying runtime WAL read after validation failure [wal_id={}, reason={:?}, error={}]",
+                        wal_id, reason, error
+                    );
+                }
+            }
+        }
     }
 
     #[cfg(test)]

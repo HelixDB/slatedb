@@ -9,7 +9,7 @@ use crate::db_iter::DbIteratorGuard;
 use crate::db_state::{collect_touched_segments, SsTableId};
 use crate::db_stats::DbStats;
 use crate::db_status::{ClosedResultWriter, DbStatus, DbStatusManager};
-use crate::dispatcher::{MessageHandler, MessageHandlerExecutor, MessageTickerDef};
+use crate::dispatcher::{MessageHandler, MessageHandlerExecutor, MessageTickerDef, Notifier};
 use crate::error::SlateDBError;
 use crate::manifest::store::{ManifestStore, StoredManifest};
 use crate::manifest::{Manifest, ManifestCore, VersionedManifest};
@@ -21,14 +21,17 @@ use crate::prefix_extractor::PrefixExtractor;
 use crate::reader::{DbStateReader, Reader, ScanContext};
 use crate::tablestore::TableStore;
 use crate::types::KeyValue;
-use crate::utils::IdGenerator;
-use crate::wal_replay::{WalReplayIterator, WalReplayOptions};
+use crate::utils::{panic_string, IdGenerator};
+use crate::wal_replay::{
+    ExactWalReplayIterator, ExactWalReplaySource, ReplayedMemtable, RuntimeWalReplayError,
+    RuntimeWalReplayIterator, RuntimeWalReplayOptions, RuntimeWalReplaySource, WalReplayOptions,
+};
 use crate::{Checkpoint, DbIterator, DbSnapshot};
 use crate::{DbCacheManagerOps, DbMetadataOps, DbReadOps};
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::stream::BoxStream;
-use log::{info, warn};
+use futures::{stream::BoxStream, FutureExt};
+use log::{error, info, warn};
 use object_store::path::Path;
 use object_store::ObjectStore;
 use parking_lot::RwLock;
@@ -36,6 +39,7 @@ use slatedb_common::clock::SystemClock;
 use slatedb_common::DbRand;
 use std::collections::{BTreeSet, HashMap};
 use std::ops::Sub;
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::LazyLock;
 use std::sync::{Arc, Weak};
@@ -44,6 +48,8 @@ use tokio::sync::Notify;
 use uuid::Uuid;
 
 pub(crate) const DB_READER_TASK_NAME: &str = "manifest_poller";
+const MAX_RUNTIME_WALS_PER_TURN: u64 = 64;
+const MAX_RUNTIME_REPLAY_TURN_TIME: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Determines how a [`DbReader`] chooses and refreshes the database state it reads.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -108,9 +114,48 @@ pub(crate) struct DbReaderInner {
     recorder: slatedb_common::metrics::MetricsRecorderHelper,
 }
 
-#[derive(Debug)]
 enum DbReaderMessage {
     PollManifest,
+    PollWalTail,
+    ContinueWalTail,
+    WalTailComplete(Result<RuntimeReplayTurn, SlateDBError>),
+}
+
+impl std::fmt::Debug for DbReaderMessage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::PollManifest => "PollManifest",
+            Self::PollWalTail => "PollWalTail",
+            Self::ContinueWalTail => "ContinueWalTail",
+            Self::WalTailComplete(Ok(_)) => "WalTailComplete(Ok)",
+            Self::WalTailComplete(Err(_)) => "WalTailComplete(Err)",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReaderReplayPath {
+    ExactOpen {
+        include_unmanifested: bool,
+        source: ExactWalReplaySource,
+    },
+    RuntimeManifest,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeMissingPolicy {
+    Error,
+    ExactNextIsCaughtUp(u64),
+}
+
+struct RuntimeReplayTurn {
+    manifest_id: u64,
+    base_last_wal_id: u64,
+    imm_memtable: ReplayMemtables,
+    last_wal_id: u64,
+    last_committed_seq: u64,
+    caught_up: bool,
+    reached_turn_limit: bool,
 }
 
 #[derive(Clone)]
@@ -364,7 +409,7 @@ impl DbReaderInner {
         } else {
             (manifest.id(), manifest.manifest().clone())
         };
-        let replay_new_wals =
+        let include_unmanifested =
             !matches!(mode, DbReaderMode::Checkpoint(_)) && !options.skip_wal_replay;
         let db_stats = DbStats::new(&recorder);
         let initial_state = Arc::new(
@@ -373,7 +418,10 @@ impl DbReaderInner {
                 manifest_id,
                 initial_manifest,
                 ReplayMemtables::default(),
-                replay_new_wals,
+                ReaderReplayPath::ExactOpen {
+                    include_unmanifested,
+                    source: ExactWalReplaySource::ReaderOpen,
+                },
                 Arc::clone(&table_store),
                 &options,
                 segment_extractor.as_ref(),
@@ -639,57 +687,22 @@ impl DbReaderInner {
             .report_manifest_and_memtable_segments(versioned_manifest, touched_segments);
     }
 
-    async fn maybe_replay_new_wals(&self) -> Result<(), SlateDBError> {
-        if self.options.skip_wal_replay {
-            return Ok(());
-        }
-        let current_state = Arc::clone(&self.state.read());
-        let mut imm_memtable = current_state.imm_memtable.clone();
-        let generation = Arc::clone(&current_state.generation);
-        let mut publish =
-            |imm_memtable: &ReplayMemtables, last_wal_id: u64, last_committed_seq: u64| {
-                self.oracle.advance_durable_seq(last_committed_seq);
-                self.db_stats
-                    .reader_replay_memtables
-                    .set(imm_memtable.len() as i64);
-                let mut write_guard = self.state.write();
-                *write_guard = Arc::new(ReaderState {
-                    generation: Arc::clone(&generation),
-                    imm_memtable: imm_memtable.clone(),
-                    last_wal_id,
-                    last_remote_persisted_seq: last_committed_seq,
-                });
-                drop(write_guard);
-                self.status_manager
-                    .report_memtable_segments(collect_touched_segments(self.state.read().as_ref()));
-            };
-
-        Self::replay_wal_into(
-            Arc::clone(&self.table_store),
-            &self.options,
-            current_state.core(),
-            &mut imm_memtable,
-            Some((
-                current_state.last_wal_id,
-                current_state.last_remote_persisted_seq,
-            )),
-            true,
-            self.segment_extractor.as_ref(),
-            Some(&mut publish),
-            Some(&self.db_stats),
-        )
-        .await?;
-        Ok(())
-    }
-
     async fn rebuild_checkpoint_state(
         &self,
         new_checkpoint: Checkpoint,
     ) -> Result<ReaderState, SlateDBError> {
         let manifest_id = new_checkpoint.manifest_id;
         let manifest = self.manifest_store.read_manifest(manifest_id).await?;
-        self.rebuild_state(Some(new_checkpoint), manifest_id, manifest)
-            .await
+        self.rebuild_state(
+            Some(new_checkpoint),
+            manifest_id,
+            manifest,
+            ReaderReplayPath::ExactOpen {
+                include_unmanifested: !self.options.skip_wal_replay,
+                source: ExactWalReplaySource::CheckpointRecovery,
+            },
+        )
+        .await
     }
 
     async fn rebuild_state(
@@ -697,6 +710,7 @@ impl DbReaderInner {
         checkpoint: Option<Checkpoint>,
         manifest_id: u64,
         manifest: Manifest,
+        replay_path: ReaderReplayPath,
     ) -> Result<ReaderState, SlateDBError> {
         let prior = self.state.read().clone();
         let replay_cursor = Some((
@@ -737,7 +751,7 @@ impl DbReaderInner {
             manifest_id,
             manifest,
             imm_memtable,
-            !self.options.skip_wal_replay,
+            replay_path,
             Arc::clone(&self.table_store),
             &self.options,
             self.segment_extractor.as_ref(),
@@ -752,25 +766,45 @@ impl DbReaderInner {
         manifest_id: u64,
         manifest: Manifest,
         mut imm_memtable: ReplayMemtables,
-        replay_new_wals: bool,
+        replay_path: ReaderReplayPath,
         table_store: Arc<TableStore>,
         options: &DbReaderOptions,
         segment_extractor: Option<&Arc<dyn PrefixExtractor>>,
         replay_cursor: Option<(u64, u64)>,
         db_stats: &DbStats,
     ) -> Result<ReaderState, SlateDBError> {
-        let (last_wal_id, last_committed_seq) = Self::replay_wal_into(
-            Arc::clone(&table_store),
-            options,
-            &manifest.core,
-            &mut imm_memtable,
-            replay_cursor,
-            replay_new_wals,
-            segment_extractor,
-            None,
-            Some(db_stats),
-        )
-        .await?;
+        let (last_wal_id, last_committed_seq) = match replay_path {
+            ReaderReplayPath::ExactOpen {
+                include_unmanifested,
+                source,
+            } => {
+                Self::replay_wal_into_exact_with_source(
+                    Arc::clone(&table_store),
+                    options,
+                    &manifest.core,
+                    &mut imm_memtable,
+                    replay_cursor,
+                    include_unmanifested,
+                    source,
+                    segment_extractor,
+                    None,
+                    Some(db_stats),
+                )
+                .await?
+            }
+            ReaderReplayPath::RuntimeManifest => {
+                Self::replay_manifest_range_into(
+                    Arc::clone(&table_store),
+                    options,
+                    &manifest.core,
+                    &mut imm_memtable,
+                    replay_cursor,
+                    segment_extractor,
+                    Some(db_stats),
+                )
+                .await?
+            }
+        };
 
         db_stats
             .reader_replay_memtables
@@ -795,11 +829,16 @@ impl DbReaderInner {
     ) -> Result<(), SlateDBError> {
         let manifest_id = latest_manifest.id;
         if manifest_id <= self.state.read().generation.manifest_id {
-            return self.maybe_replay_new_wals().await;
+            return Ok(());
         }
 
         let new_state = self
-            .rebuild_state(None, manifest_id, latest_manifest.manifest)
+            .rebuild_state(
+                None,
+                manifest_id,
+                latest_manifest.manifest,
+                ReaderReplayPath::RuntimeManifest,
+            )
             .await?;
         self.install_state(new_state);
         info!("refreshed reader to latest manifest [manifest_id={manifest_id}]");
@@ -866,7 +905,8 @@ impl DbReaderInner {
         self: &Arc<Self>,
         task_executor: &MessageHandlerExecutor,
     ) -> Result<(), SlateDBError> {
-        let poller = ManifestPoller::new(Arc::clone(self));
+        let (tail_tx, tail_rx) = async_channel::unbounded();
+        let poller = ManifestPoller::new(Arc::clone(self), tail_tx, tail_rx);
         let (_tx, rx) = async_channel::unbounded();
         let result = task_executor.add_handler(
             DB_READER_TASK_NAME.to_string(),
@@ -878,13 +918,41 @@ impl DbReaderInner {
         result
     }
 
-    async fn replay_wal_into(
+    #[cfg(test)]
+    async fn replay_wal_into_exact(
         table_store: Arc<TableStore>,
         reader_options: &DbReaderOptions,
         core: &ManifestCore,
         into_tables: &mut ReplayMemtables,
         replay_cursor: Option<(u64, u64)>,
         replay_new_wals: bool,
+        segment_extractor: Option<&Arc<dyn PrefixExtractor>>,
+        publish: Option<ReplayPublisher<'_>>,
+        db_stats: Option<&DbStats>,
+    ) -> Result<(u64, u64), SlateDBError> {
+        Self::replay_wal_into_exact_with_source(
+            table_store,
+            reader_options,
+            core,
+            into_tables,
+            replay_cursor,
+            replay_new_wals,
+            ExactWalReplaySource::ReaderOpen,
+            segment_extractor,
+            publish,
+            db_stats,
+        )
+        .await
+    }
+
+    async fn replay_wal_into_exact_with_source(
+        table_store: Arc<TableStore>,
+        reader_options: &DbReaderOptions,
+        core: &ManifestCore,
+        into_tables: &mut ReplayMemtables,
+        replay_cursor: Option<(u64, u64)>,
+        replay_new_wals: bool,
+        source: ExactWalReplaySource,
         segment_extractor: Option<&Arc<dyn PrefixExtractor>>,
         mut publish: Option<ReplayPublisher<'_>>,
         db_stats: Option<&DbStats>,
@@ -911,9 +979,10 @@ impl DbReaderInner {
             max_memtable_bytes: reader_options.max_memtable_bytes as usize,
             // Skip entries that we already have in `imm_memtable` (that might be above last_l0_seq).
             min_seq: Some(last_committed_seq),
+            source,
         };
 
-        let mut replay_iter = WalReplayIterator::range(
+        let mut replay_iter = ExactWalReplayIterator::range(
             (replay_after_wal_id + 1)..wal_id_end,
             core,
             replay_options,
@@ -924,7 +993,6 @@ impl DbReaderInner {
         while let Some(replayed_table) = match replay_iter.next().await {
             Ok(Some(replayed_table)) => Some(replayed_table),
             Ok(None) => None,
-            Err(err) if has_not_found_object_store_error(&err) => None,
             Err(err) => return Err(err),
         } {
             assert!(replayed_table.last_wal_id > replay_after_wal_id);
@@ -964,6 +1032,226 @@ impl DbReaderInner {
         }
 
         Ok((replay_after_wal_id, last_committed_seq))
+    }
+
+    async fn replay_manifest_range_into(
+        table_store: Arc<TableStore>,
+        reader_options: &DbReaderOptions,
+        core: &ManifestCore,
+        into_tables: &mut ReplayMemtables,
+        replay_cursor: Option<(u64, u64)>,
+        segment_extractor: Option<&Arc<dyn PrefixExtractor>>,
+        db_stats: Option<&DbStats>,
+    ) -> Result<(u64, u64), SlateDBError> {
+        let mut replay_cursor =
+            replay_cursor.unwrap_or((core.replay_after_wal_id, core.last_l0_seq));
+        let start = replay_cursor.0.saturating_add(1);
+        Self::replay_runtime_range_into(
+            table_store,
+            reader_options,
+            core,
+            into_tables,
+            &mut replay_cursor,
+            start..core.next_wal_sst_id,
+            RuntimeMissingPolicy::Error,
+            segment_extractor,
+            db_stats,
+            None,
+        )
+        .await?;
+        Ok(replay_cursor)
+    }
+
+    async fn replay_runtime_range_into(
+        table_store: Arc<TableStore>,
+        reader_options: &DbReaderOptions,
+        core: &ManifestCore,
+        into_tables: &mut ReplayMemtables,
+        replay_cursor: &mut (u64, u64),
+        wal_range: std::ops::Range<u64>,
+        missing_policy: RuntimeMissingPolicy,
+        segment_extractor: Option<&Arc<dyn PrefixExtractor>>,
+        db_stats: Option<&DbStats>,
+        max_wals_per_batch: Option<std::num::NonZeroUsize>,
+    ) -> Result<bool, SlateDBError> {
+        let mut replay = RuntimeWalReplayIterator::range(
+            wal_range,
+            core,
+            RuntimeWalReplayOptions {
+                max_memtable_bytes: reader_options.max_memtable_bytes as usize,
+                min_seq: Some(replay_cursor.1),
+                max_wals_per_batch,
+                source: max_wals_per_batch.map_or(RuntimeWalReplaySource::Manifest, |_| {
+                    RuntimeWalReplaySource::Tail
+                }),
+                ..RuntimeWalReplayOptions::default()
+            },
+            table_store,
+        )?;
+
+        loop {
+            let replayed_table = match replay.next().await {
+                Ok(Some(table)) => table,
+                Ok(None) => break,
+                Err(RuntimeWalReplayError::MissingInitialObject { wal_id, source }) => {
+                    if missing_policy == RuntimeMissingPolicy::ExactNextIsCaughtUp(wal_id) {
+                        return Ok(true);
+                    }
+                    return Err(source);
+                }
+                Err(RuntimeWalReplayError::Replay(source)) => return Err(source),
+            };
+            Self::apply_runtime_replayed_table(
+                replayed_table,
+                into_tables,
+                replay_cursor,
+                segment_extractor,
+                db_stats,
+            )?;
+        }
+
+        Ok(false)
+    }
+
+    fn apply_runtime_replayed_table(
+        replayed_table: ReplayedMemtable,
+        into_tables: &mut ReplayMemtables,
+        replay_cursor: &mut (u64, u64),
+        segment_extractor: Option<&Arc<dyn PrefixExtractor>>,
+        db_stats: Option<&DbStats>,
+    ) -> Result<u64, SlateDBError> {
+        assert!(replayed_table.last_wal_id > replay_cursor.0);
+        let replayed_ssts = replayed_table.last_wal_id - replay_cursor.0;
+        replay_cursor.0 = replayed_table.last_wal_id;
+        if let Some(db_stats) = db_stats {
+            let metadata = replayed_table.table.metadata();
+            db_stats.reader_wal_replay_ssts.increment(replayed_ssts);
+            db_stats
+                .reader_wal_replay_bytes
+                .increment(metadata.entries_size_in_bytes as u64);
+            db_stats.reader_wal_replay_batches.increment(1);
+        }
+        if !replayed_table.table.is_empty() && replayed_table.last_seq > replay_cursor.1 {
+            let first_seq = replayed_table
+                .table
+                .table()
+                .first_seq()
+                .expect("expected first_seq on non-empty table");
+            assert!(first_seq > replay_cursor.1);
+            replay_cursor.1 = replayed_table.last_seq;
+            if let Some(extractor) = segment_extractor {
+                Self::record_replayed_touched_segments(extractor.as_ref(), &replayed_table.table)?;
+            }
+            into_tables.prepend(Arc::new(ImmutableMemtable::new(
+                replayed_table.table,
+                replayed_table.last_wal_id,
+            )));
+        }
+        Ok(replayed_ssts)
+    }
+
+    async fn replay_runtime_turn(
+        inner: Arc<Self>,
+        base: Arc<ReaderState>,
+    ) -> Result<RuntimeReplayTurn, SlateDBError> {
+        let manifest_id = base.generation.manifest_id;
+        let base_last_wal_id = base.last_wal_id;
+        let core = base.core();
+        let known_end = core.next_wal_sst_id;
+        let deadline = inner.system_clock.now() + MAX_RUNTIME_REPLAY_TURN_TIME;
+        let mut imm_memtable = base.imm_memtable.clone();
+        let mut cursor = (base.last_wal_id, base.last_remote_persisted_seq);
+        let mut completed_wals = 0_u64;
+        let mut caught_up = false;
+
+        'turn: while completed_wals < MAX_RUNTIME_WALS_PER_TURN
+            && inner.system_clock.now() < deadline
+        {
+            let next_wal_id = cursor
+                .0
+                .checked_add(1)
+                .ok_or(SlateDBError::InvalidDBState)?;
+            let remaining = MAX_RUNTIME_WALS_PER_TURN - completed_wals;
+            let (range_end, missing_policy) = if next_wal_id < known_end {
+                (
+                    next_wal_id
+                        .checked_add(remaining)
+                        .ok_or(SlateDBError::InvalidDBState)?
+                        .min(known_end),
+                    RuntimeMissingPolicy::Error,
+                )
+            } else {
+                (
+                    next_wal_id
+                        .checked_add(1)
+                        .ok_or(SlateDBError::InvalidDBState)?,
+                    RuntimeMissingPolicy::ExactNextIsCaughtUp(next_wal_id),
+                )
+            };
+            let mut replay = RuntimeWalReplayIterator::range(
+                next_wal_id..range_end,
+                core,
+                RuntimeWalReplayOptions {
+                    max_memtable_bytes: inner.options.max_memtable_bytes as usize,
+                    min_seq: Some(cursor.1),
+                    max_wals_per_batch: std::num::NonZeroUsize::new(1),
+                    source: RuntimeWalReplaySource::Tail,
+                    ..RuntimeWalReplayOptions::default()
+                },
+                Arc::clone(&inner.table_store),
+            )?;
+
+            loop {
+                let remaining = deadline
+                    .signed_duration_since(inner.system_clock.now())
+                    .to_std()
+                    .unwrap_or(std::time::Duration::ZERO);
+                let replayed = tokio::select! {
+                    biased;
+                    _ = inner.system_clock.sleep(remaining) => break 'turn,
+                    result = replay.next() => result,
+                };
+                // A result completing at the exact deadline is deliberately
+                // discarded even if the runtime happened to poll it first.
+                if inner.system_clock.now() >= deadline {
+                    break 'turn;
+                }
+                let replayed_table = match replayed {
+                    Ok(Some(table)) => table,
+                    Ok(None) => break,
+                    Err(RuntimeWalReplayError::MissingInitialObject { wal_id, source }) => {
+                        if missing_policy == RuntimeMissingPolicy::ExactNextIsCaughtUp(wal_id) {
+                            caught_up = true;
+                            break 'turn;
+                        }
+                        return Err(source);
+                    }
+                    Err(RuntimeWalReplayError::Replay(source)) => return Err(source),
+                };
+                completed_wals = completed_wals.saturating_add(Self::apply_runtime_replayed_table(
+                    replayed_table,
+                    &mut imm_memtable,
+                    &mut cursor,
+                    inner.segment_extractor.as_ref(),
+                    Some(&inner.db_stats),
+                )?);
+                if completed_wals >= MAX_RUNTIME_WALS_PER_TURN {
+                    break 'turn;
+                }
+            }
+        }
+
+        Ok(RuntimeReplayTurn {
+            manifest_id,
+            base_last_wal_id,
+            imm_memtable,
+            last_wal_id: cursor.0,
+            last_committed_seq: cursor.1,
+            caught_up,
+            reached_turn_limit: !caught_up
+                && (completed_wals >= MAX_RUNTIME_WALS_PER_TURN
+                    || inner.system_clock.now() >= deadline),
+        })
     }
 
     /// Re-derive each replayed entry's segment prefix (RFC-0024) and record the
@@ -1015,10 +1303,19 @@ impl DbReaderInner {
 struct ManifestPoller {
     inner: Arc<DbReaderInner>,
     generations: HashMap<Uuid, Weak<ReaderGeneration>>,
+    tail_tx: async_channel::Sender<DbReaderMessage>,
+    tail_rx: Option<async_channel::Receiver<DbReaderMessage>>,
+    tail_in_flight: bool,
+    continuation_queued: bool,
+    tail_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ManifestPoller {
-    fn new(inner: Arc<DbReaderInner>) -> Self {
+    fn new(
+        inner: Arc<DbReaderInner>,
+        tail_tx: async_channel::Sender<DbReaderMessage>,
+        tail_rx: async_channel::Receiver<DbReaderMessage>,
+    ) -> Self {
         let mut generations = HashMap::new();
         if inner.mode == DbReaderMode::ManagedCheckpoint {
             let generation = Arc::clone(&inner.state.read().generation);
@@ -1028,9 +1325,95 @@ impl ManifestPoller {
                 .id;
             generations.insert(checkpoint_id, Arc::downgrade(&generation));
         }
-        let poller = Self { inner, generations };
+        let poller = Self {
+            inner,
+            generations,
+            tail_rx: Some(tail_rx),
+            tail_tx,
+            tail_in_flight: false,
+            continuation_queued: false,
+            tail_task: None,
+        };
         poller.report_active_checkpoints();
         poller
+    }
+
+    fn runtime_tailing_enabled(&self) -> bool {
+        !self.inner.options.skip_wal_replay
+            && !matches!(self.inner.mode, DbReaderMode::Checkpoint(_))
+    }
+
+    fn start_runtime_tail(&mut self) {
+        if self.tail_in_flight || !self.runtime_tailing_enabled() {
+            return;
+        }
+        self.tail_in_flight = true;
+        self.continuation_queued = false;
+        let inner = Arc::clone(&self.inner);
+        let base = Arc::clone(&inner.state.read());
+        let sender = self.tail_tx.clone();
+        self.tail_task = Some(tokio::spawn(async move {
+            let replay = AssertUnwindSafe(DbReaderInner::replay_runtime_turn(inner, base))
+                .catch_unwind()
+                .await;
+            let result = match replay {
+                Ok(result) => result,
+                Err(panic) => {
+                    let task_name = "reader_runtime_wal_replay".to_string();
+                    error!(
+                        "runtime WAL replay task panicked [task_name={}, panic={}]",
+                        task_name,
+                        panic_string(&panic),
+                    );
+                    Err(SlateDBError::BackgroundTaskPanic(task_name))
+                }
+            };
+            let _ = sender.send(DbReaderMessage::WalTailComplete(result)).await;
+        }));
+    }
+
+    fn schedule_tail_continuation(&mut self) {
+        if self.continuation_queued || !self.runtime_tailing_enabled() {
+            return;
+        }
+        self.continuation_queued = true;
+        let _ = self.tail_tx.try_send(DbReaderMessage::ContinueWalTail);
+    }
+
+    fn apply_runtime_tail(&mut self, turn: RuntimeReplayTurn) {
+        self.tail_in_flight = false;
+        self.tail_task.take();
+        let current = Arc::clone(&self.inner.state.read());
+        if current.generation.manifest_id != turn.manifest_id
+            || current.last_wal_id != turn.base_last_wal_id
+        {
+            self.schedule_tail_continuation();
+            return;
+        }
+
+        let generation = Arc::clone(&current.generation);
+        self.inner
+            .oracle
+            .advance_durable_seq(turn.last_committed_seq);
+        self.inner
+            .db_stats
+            .reader_replay_memtables
+            .set(turn.imm_memtable.len() as i64);
+        let new_state = Arc::new(ReaderState {
+            generation,
+            imm_memtable: turn.imm_memtable,
+            last_wal_id: turn.last_wal_id,
+            last_remote_persisted_seq: turn.last_committed_seq,
+        });
+        let touched_segments = collect_touched_segments(new_state.as_ref());
+        *self.inner.state.write() = new_state;
+        self.inner
+            .status_manager
+            .report_memtable_segments(touched_segments);
+
+        if turn.reached_turn_limit || !turn.caught_up {
+            self.schedule_tail_continuation();
+        }
     }
 
     fn report_active_checkpoints(&self) {
@@ -1148,8 +1531,25 @@ impl ManifestPoller {
     }
 }
 
+struct TailReplayNotifier {
+    receiver: async_channel::Receiver<DbReaderMessage>,
+}
+
+#[async_trait]
+impl Notifier<DbReaderMessage> for TailReplayNotifier {
+    async fn notify(&mut self) -> DbReaderMessage {
+        match self.receiver.recv().await {
+            Ok(message) => message,
+            Err(_) => std::future::pending().await,
+        }
+    }
+}
+
 impl Drop for ManifestPoller {
     fn drop(&mut self) {
+        if let Some(task) = self.tail_task.take() {
+            task.abort();
+        }
         // The gauge tracks only GC checkpoints actively managed by this
         // poller. Reset it even if startup, cleanup, or the poller task fails.
         self.inner.db_stats.reader_active_checkpoints.set(0);
@@ -1159,14 +1559,39 @@ impl Drop for ManifestPoller {
 #[async_trait]
 impl MessageHandler<DbReaderMessage> for ManifestPoller {
     fn tickers(&mut self) -> Vec<MessageTickerDef<DbReaderMessage>> {
-        vec![MessageTickerDef::new(
+        let mut tickers = vec![MessageTickerDef::new(
             self.inner.options.manifest_poll_interval,
             Box::new(|| DbReaderMessage::PollManifest),
-        )]
+        )];
+        if self.runtime_tailing_enabled() {
+            tickers.push(MessageTickerDef::new(
+                self.inner.options.wal_poll_interval,
+                Box::new(|| DbReaderMessage::PollWalTail),
+            ));
+        }
+        tickers
+    }
+
+    fn notifiers(&mut self) -> Vec<Box<dyn Notifier<DbReaderMessage>>> {
+        self.tail_rx.take().map_or_else(Vec::new, |receiver| {
+            vec![Box::new(TailReplayNotifier { receiver }) as Box<dyn Notifier<DbReaderMessage>>]
+        })
     }
 
     async fn handle(&mut self, message: DbReaderMessage) -> Result<(), SlateDBError> {
-        assert!(matches!(message, DbReaderMessage::PollManifest));
+        match message {
+            DbReaderMessage::PollWalTail | DbReaderMessage::ContinueWalTail => {
+                self.continuation_queued = false;
+                self.start_runtime_tail();
+                return Ok(());
+            }
+            DbReaderMessage::WalTailComplete(result) => {
+                let turn = result?;
+                self.apply_runtime_tail(turn);
+                return Ok(());
+            }
+            DbReaderMessage::PollManifest => {}
+        }
         match self.inner.mode {
             DbReaderMode::ManagedCheckpoint => {
                 let mut manifest = StoredManifest::load(
@@ -1184,8 +1609,7 @@ impl MessageHandler<DbReaderMessage> for ManifestPoller {
                     let checkpoint = self.inner.create_checkpoint(&mut manifest).await?;
                     self.inner.reestablish_checkpoint(checkpoint).await?;
                     self.register_current_generation();
-                } else {
-                    self.inner.maybe_replay_new_wals().await?;
+                    self.schedule_tail_continuation();
                 }
 
                 self.refresh_live_checkpoints(&mut manifest).await?;
@@ -1198,6 +1622,7 @@ impl MessageHandler<DbReaderMessage> for ManifestPoller {
                     warn!("failed to refresh reader to latest manifest [error={error:?}]");
                 } else {
                     self.inner.db_stats.reader_manifest_polls.increment(1);
+                    self.schedule_tail_continuation();
                 }
                 Ok(())
             }
@@ -1249,6 +1674,11 @@ impl MessageHandler<DbReaderMessage> for ManifestPoller {
 impl DbReader {
     fn validate_options(mode: DbReaderMode, options: &DbReaderOptions) -> Result<(), SlateDBError> {
         options.wal_replay.validate()?;
+        if options.wal_poll_interval.is_zero() {
+            return Err(SlateDBError::InvalidWalPollInterval(
+                options.wal_poll_interval,
+            ));
+        }
         if mode != DbReaderMode::ManagedCheckpoint {
             return Ok(());
         }
@@ -1940,27 +2370,12 @@ impl DbCacheManagerOps for DbReader {
     }
 }
 
-/// Checks if the error or any of its sources is an `object_store::Error::NotFound` error.
-fn has_not_found_object_store_error(err: &(dyn std::error::Error + 'static)) -> bool {
-    let mut current = Some(err);
-    while let Some(current_err) = current {
-        if current_err
-            .downcast_ref::<object_store::Error>()
-            .is_some_and(|err| matches!(err, object_store::Error::NotFound { .. }))
-            || current_err
-                .downcast_ref::<Arc<object_store::Error>>()
-                .is_some_and(|err| matches!(err.as_ref(), object_store::Error::NotFound { .. }))
-        {
-            return true;
-        }
-        current = current_err.source();
-    }
-    false
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{DbReaderMessage, ManifestPoller, ReaderGeneration, ReaderState, ReplayMemtables};
+    use super::{
+        DbReaderMessage, ManifestPoller, ReaderGeneration, ReaderState, ReplayMemtables,
+        RuntimeMissingPolicy, MAX_RUNTIME_REPLAY_TURN_TIME,
+    };
     use crate::block_cache_policy::BlockCachePolicy;
     use crate::clock::MonotonicClock;
     use crate::config::{
@@ -1975,7 +2390,7 @@ mod tests {
     use crate::db_status::DbStatusManager;
     use crate::dispatcher::MessageHandler;
     use crate::format::sst::SsTableFormat;
-    use crate::iter::IterationOrder;
+    use crate::iter::{IterationOrder, RowEntryIterator};
     use crate::manifest::store::{ManifestStore, StoredManifest};
     use crate::manifest::{Manifest, ManifestCore, VersionedManifest};
     use crate::mem_table::{ImmutableMemtable, WritableKVTable};
@@ -2459,7 +2874,8 @@ mod tests {
             .contains("snapshots are unsupported in FollowLatest mode"));
         assert!(recording_store.write_kinds().is_empty());
 
-        let mut poller = ManifestPoller::new(Arc::clone(&reader.inner));
+        let (tail_tx, tail_rx) = async_channel::unbounded();
+        let mut poller = ManifestPoller::new(Arc::clone(&reader.inner), tail_tx, tail_rx);
         poller.handle(DbReaderMessage::PollManifest).await.unwrap();
 
         assert!(reader.manifest().id() >= latest_manifest.id);
@@ -2529,7 +2945,8 @@ mod tests {
             saved_manifests.push((location, bytes));
         }
 
-        let mut poller = ManifestPoller::new(Arc::clone(&reader.inner));
+        let (tail_tx, tail_rx) = async_channel::unbounded();
+        let mut poller = ManifestPoller::new(Arc::clone(&reader.inner), tail_tx, tail_rx);
         poller.handle(DbReaderMessage::PollManifest).await.unwrap();
 
         assert_eq!(reader.manifest().id(), manifest_id);
@@ -2572,6 +2989,7 @@ mod tests {
         let db = test_provider.new_db(db_options).await.unwrap();
         let reader_options = DbReaderOptions {
             manifest_poll_interval: Duration::from_millis(10),
+            wal_poll_interval: Duration::from_millis(10),
             ..DbReaderOptions::default()
         };
         let reader = test_provider
@@ -2614,6 +3032,7 @@ mod tests {
         let _db = test_provider.new_db(Settings::default()).await;
         let reader_options = DbReaderOptions {
             manifest_poll_interval: Duration::from_millis(500),
+            wal_poll_interval: Duration::from_millis(10),
             checkpoint_lifetime: Duration::from_millis(1000),
             ..DbReaderOptions::default()
         };
@@ -2842,6 +3261,7 @@ mod tests {
 
         let reader_options = DbReaderOptions {
             manifest_poll_interval: Duration::from_millis(500),
+            wal_poll_interval: Duration::from_millis(10),
             checkpoint_lifetime: Duration::from_millis(1000),
             ..DbReaderOptions::default()
         };
@@ -2855,7 +3275,7 @@ mod tests {
         db.put(key, value).await.unwrap();
         db.flush().await.unwrap();
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(
             reader.get(key).await.unwrap(),
             Some(Bytes::from_static(value))
@@ -3476,7 +3896,7 @@ mod tests {
         let mut core = ManifestCore::new();
         core.next_wal_sst_id = 5;
 
-        let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
+        let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into_exact(
             Arc::clone(&table_store),
             &DbReaderOptions::default(),
             &core,
@@ -3554,7 +3974,7 @@ mod tests {
             publications.push((wal_id, seq, tables.len()));
         };
 
-        let result = DbReaderInner::replay_wal_into(
+        let result = DbReaderInner::replay_wal_into_exact(
             Arc::clone(&table_store),
             &options,
             &core,
@@ -3572,24 +3992,207 @@ mod tests {
         assert_eq!(vec![(1, 1, 1), (2, 2, 2), (3, 3, 3)], publications);
     }
 
-    #[test]
-    fn has_not_found_object_store_error_should_walk_nested_error_sources() {
-        let err = crate::Error::from(SlateDBError::from(object_store::Error::NotFound {
-            path: "missing-wal".to_string(),
-            source: Box::new(std::io::Error::other("missing")),
-        }));
+    #[tokio::test]
+    async fn runtime_known_missing_wal_is_error_and_exact_next_probe_reports_caught_up() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_db_reader_runtime_missing_contract");
+        let table_store = TestProvider::new(path, object_store).table_store();
+        let options = DbReaderOptions::default();
+        let mut core = ManifestCore::new();
+        core.next_wal_sst_id = 2;
+        let mut known_cursor = (0, 0);
 
-        assert!(super::has_not_found_object_store_error(&err));
+        let known_missing = DbReaderInner::replay_runtime_range_into(
+            Arc::clone(&table_store),
+            &options,
+            &core,
+            &mut ReplayMemtables::default(),
+            &mut known_cursor,
+            1..2,
+            RuntimeMissingPolicy::Error,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(known_missing.unwrap_err().has_object_store_not_found());
+
+        let mut tail_cursor = (0, 0);
+        let caught_up = DbReaderInner::replay_runtime_range_into(
+            table_store,
+            &options,
+            &core,
+            &mut ReplayMemtables::default(),
+            &mut tail_cursor,
+            1..2,
+            RuntimeMissingPolicy::ExactNextIsCaughtUp(1),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(caught_up);
+        assert_eq!(tail_cursor, (0, 0));
     }
 
-    #[test]
-    fn has_not_found_object_store_error_should_ignore_non_not_found_errors() {
-        let err = SlateDBError::from(object_store::Error::NotImplemented {
-            operation: "test".to_string(),
-            implementer: "test".to_string(),
-        });
+    #[tokio::test]
+    async fn runtime_tail_yields_after_sixty_four_wals_and_continues_without_listing() {
+        let recording = Arc::new(test_utils::RecordingObjectStore::new(Arc::new(
+            InMemory::new(),
+        )));
+        let object_store: Arc<dyn ObjectStore> = recording.clone();
+        let path = Path::from("/tmp/test_db_reader_runtime_turn_limit");
+        let provider = TestProvider::new(path, object_store);
+        let db = provider
+            .new_db(Settings {
+                flush_interval: None,
+                compactor_options: None,
+                garbage_collector_options: None,
+                ..Settings::default()
+            })
+            .await
+            .unwrap();
+        let checkpoint = db
+            .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
+            .await
+            .unwrap();
+        db.close().await.unwrap();
+        let reader = provider
+            .new_db_reader(DbReaderOptions::default(), Some(checkpoint.id), None)
+            .await
+            .unwrap();
+        let table_store = provider.table_store();
+        let initial_wal_id = reader.inner.state.read().last_wal_id;
+        for wal_id in initial_wal_id + 1..=initial_wal_id + 65 {
+            write_wal_sst(
+                Arc::clone(&table_store),
+                wal_id,
+                vec![RowEntry::new_value(
+                    format!("key-{wal_id:03}").as_bytes(),
+                    b"value",
+                    wal_id,
+                )],
+            )
+            .await
+            .unwrap();
+        }
+        recording.clear();
 
-        assert!(!super::has_not_found_object_store_error(&err));
+        let first_base = Arc::clone(&reader.inner.state.read());
+        let first = DbReaderInner::replay_runtime_turn(Arc::clone(&reader.inner), first_base)
+            .await
+            .unwrap();
+        assert_eq!(first.last_wal_id, initial_wal_id + 64);
+        assert!(first.reached_turn_limit);
+        assert!(!first.caught_up);
+
+        let second_base = Arc::new(ReaderState {
+            generation: Arc::clone(&reader.inner.state.read().generation),
+            imm_memtable: first.imm_memtable,
+            last_wal_id: first.last_wal_id,
+            last_remote_persisted_seq: first.last_committed_seq,
+        });
+        let second = DbReaderInner::replay_runtime_turn(Arc::clone(&reader.inner), second_base)
+            .await
+            .unwrap();
+        assert_eq!(second.last_wal_id, initial_wal_id + 65);
+        assert!(second.caught_up);
+        assert!(!second.reached_turn_limit);
+        assert_eq!(recording.list_calls(), 0);
+
+        reader.close().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn runtime_tail_deadline_wins_without_publishing_a_partial_wal() {
+        let inner_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let gated = Arc::new(test_utils::GatedObjectStore::new(inner_store));
+        let object_store: Arc<dyn ObjectStore> = gated.clone();
+        let path = Path::from("/tmp/test_db_reader_runtime_deadline");
+        let provider = TestProvider::new(path, object_store);
+        let db = provider
+            .new_db(Settings {
+                flush_interval: None,
+                compactor_options: None,
+                garbage_collector_options: None,
+                ..Settings::default()
+            })
+            .await
+            .unwrap();
+        let reader = provider
+            .new_db_reader(
+                DbReaderOptions {
+                    // Keep the test-owned replay turn isolated from the background poller.
+                    skip_wal_replay: true,
+                    ..DbReaderOptions::default()
+                },
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let base = Arc::clone(&reader.inner.state.read());
+        let base_memtable_count = base.imm_memtable.len();
+        db.put_with_options(
+            b"deadline-key",
+            b"deadline-value",
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..WriteOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::Wal,
+        })
+        .await
+        .unwrap();
+
+        let prior_head_arrivals = gated.head_gate.arrivals();
+        gated.head_gate.close();
+        let blocked = tokio::spawn(DbReaderInner::replay_runtime_turn(
+            Arc::clone(&reader.inner),
+            Arc::clone(&base),
+        ));
+        gated
+            .head_gate
+            .wait_for_arrivals(prior_head_arrivals + 1)
+            .await;
+        tokio::time::advance(MAX_RUNTIME_REPLAY_TURN_TIME).await;
+        // Make the object read ready at the exact deadline. The deadline branch
+        // is biased and must still win.
+        gated.head_gate.release();
+        let expired = blocked.await.unwrap().unwrap();
+        assert_eq!(expired.last_wal_id, base.last_wal_id);
+        assert_eq!(expired.last_committed_seq, base.last_remote_persisted_seq);
+        assert_eq!(expired.imm_memtable.len(), base_memtable_count);
+        assert!(expired.reached_turn_limit);
+        assert!(!expired.caught_up);
+        assert_eq!(reader.inner.state.read().last_wal_id, base.last_wal_id);
+
+        let completed = DbReaderInner::replay_runtime_turn(Arc::clone(&reader.inner), base)
+            .await
+            .unwrap();
+        assert!(completed.last_wal_id > expired.last_wal_id);
+        assert!(completed.caught_up);
+        let mut rows = completed
+            .imm_memtable
+            .front()
+            .expect("completed WAL must be present")
+            .table()
+            .iter();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.key, Bytes::from_static(b"deadline-key"));
+        assert_eq!(
+            row.value,
+            crate::types::ValueDeletable::Value(Bytes::from_static(b"deadline-value"))
+        );
+
+        reader.close().await.unwrap();
+        db.close().await.unwrap();
     }
 
     #[test]
@@ -3610,8 +4213,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn reader_validation_rejects_zero_wal_poll_interval_in_every_mode() {
+        for mode in [
+            DbReaderMode::Checkpoint(Uuid::nil()),
+            DbReaderMode::ManagedCheckpoint,
+            DbReaderMode::FollowLatest,
+        ] {
+            let options = DbReaderOptions {
+                wal_poll_interval: Duration::ZERO,
+                ..DbReaderOptions::default()
+            };
+            assert!(matches!(
+                DbReader::validate_options(mode, &options),
+                Err(SlateDBError::InvalidWalPollInterval(interval)) if interval.is_zero()
+            ));
+        }
+    }
+
     #[tokio::test]
-    async fn replay_wal_into_should_treat_missing_wal_sst_as_end_of_iteration() {
+    async fn exact_replay_should_fail_closed_on_a_missing_wal() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let path = Path::from("/tmp/test_db_reader_missing_wal");
         let test_provider = TestProvider::new(path, Arc::clone(&object_store));
@@ -3629,7 +4250,7 @@ mod tests {
         let mut core = ManifestCore::new();
         core.next_wal_sst_id = 3;
 
-        let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
+        let error = DbReaderInner::replay_wal_into_exact(
             Arc::clone(&table_store),
             &DbReaderOptions::default(),
             &core,
@@ -3641,15 +4262,14 @@ mod tests {
             None,
         )
         .await
-        .unwrap();
+        .unwrap_err();
 
-        assert_eq!(last_wal_id, 0);
-        assert_eq!(last_committed_seq, 0);
+        assert!(error.has_object_store_not_found());
         assert!(into_tables.is_empty());
     }
 
     #[tokio::test]
-    async fn replay_wal_into_should_keep_previously_replayed_tables_before_missing_wal_sst() {
+    async fn exact_replay_should_surface_a_later_missing_wal() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let path = Path::from("/tmp/test_db_reader_missing_wal_after_replay");
         let test_provider = TestProvider::new(path, Arc::clone(&object_store));
@@ -3684,7 +4304,7 @@ mod tests {
             ..DbReaderOptions::default()
         };
 
-        let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
+        let error = DbReaderInner::replay_wal_into_exact(
             Arc::clone(&table_store),
             &reader_options,
             &core,
@@ -3696,10 +4316,9 @@ mod tests {
             None,
         )
         .await
-        .unwrap();
+        .unwrap_err();
 
-        assert_eq!(last_wal_id, 2);
-        assert_eq!(last_committed_seq, 3);
+        assert!(error.has_object_store_not_found());
         assert_eq!(into_tables.len(), 1);
 
         let replayed = into_tables.front().unwrap();
@@ -3723,7 +4342,7 @@ mod tests {
         let mut into_tables = ReplayMemtables::default();
         let core = ManifestCore::new();
 
-        let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
+        let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into_exact(
             Arc::clone(&table_store),
             &DbReaderOptions::default(),
             &core,
@@ -3757,7 +4376,7 @@ mod tests {
         let mut into_tables = ReplayMemtables::default();
         let core = ManifestCore::new();
 
-        let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
+        let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into_exact(
             Arc::clone(&table_store),
             &DbReaderOptions::default(),
             &core,
@@ -3806,7 +4425,7 @@ mod tests {
         core.last_l0_seq = 8;
         core.next_wal_sst_id = 5;
 
-        let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
+        let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into_exact(
             Arc::clone(&table_store),
             &DbReaderOptions::default(),
             &core,
@@ -3824,7 +4443,7 @@ mod tests {
         assert_eq!(last_committed_seq, 10);
 
         let head_after_first_replay = Arc::clone(into_tables.head.as_ref().unwrap());
-        let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
+        let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into_exact(
             Arc::clone(&table_store),
             &DbReaderOptions::default(),
             &core,
@@ -3859,6 +4478,7 @@ mod tests {
 
         let reader_options = DbReaderOptions {
             manifest_poll_interval: Duration::from_millis(500),
+            wal_poll_interval: Duration::from_millis(10),
             ..DbReaderOptions::default()
         };
         let metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
@@ -3885,13 +4505,16 @@ mod tests {
 
         fail_parallel::cfg(
             Arc::clone(&test_provider.fp_registry),
-            "probe-wal-ssts",
+            "runtime-wal-replay",
             "return",
         )
         .unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
         let result = reader.get(b"key").await.unwrap_err();
-        assert_eq!(result.to_string(), "Unavailable error: io error (oops)");
+        assert_eq!(
+            result.to_string(),
+            "Unavailable error: io error (runtime WAL replay failpoint)"
+        );
         assert_eq!(
             Some(0),
             lookup_metric(
@@ -3940,6 +4563,12 @@ mod tests {
             .new_db_reader(reader_options.clone(), None, None)
             .await
             .unwrap();
+        let (tail_tx, tail_rx) = async_channel::unbounded();
+        let mut skipped_poller = ManifestPoller::new(Arc::clone(&reader.inner), tail_tx, tail_rx);
+        assert!(!skipped_poller.runtime_tailing_enabled());
+        assert_eq!(skipped_poller.tickers().len(), 1);
+        skipped_poller.start_runtime_tail();
+        assert!(!skipped_poller.tail_in_flight);
 
         // Should see the L0 flushed data
         assert_eq!(
@@ -4766,6 +5395,12 @@ mod tests {
             .build()
             .await
             .unwrap();
+        let (tail_tx, tail_rx) = async_channel::unbounded();
+        let mut pinned_poller = ManifestPoller::new(Arc::clone(&reader.inner), tail_tx, tail_rx);
+        assert!(!pinned_poller.runtime_tailing_enabled());
+        assert_eq!(pinned_poller.tickers().len(), 1);
+        pinned_poller.start_runtime_tail();
+        assert!(!pinned_poller.tail_in_flight);
 
         assert_eq!(
             Some(0),
