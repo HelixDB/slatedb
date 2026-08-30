@@ -1,11 +1,22 @@
+//! WAL replay has two deliberately separate discovery and I/O paths.
+//!
+//! Exact recovery (writer/reader open and reader checkpoint recovery) fixes a
+//! finite range with LIST, then uses concurrent full-object GETs with bounded
+//! oversized-object fallback. Runtime reader replay never LISTs: it restores
+//! the bounded range-read iterator and probes only explicit WAL IDs. Keeping
+//! these types separate prevents recurring reader refresh from accidentally
+//! inheriting exact-open discovery cost.
+
 use crate::block_iterator::DataBlockIterator;
 use crate::config::WalReplaySettings;
 use crate::error::SlateDBError;
-use crate::iter::{IterationOrder, RowEntryIterator};
-use crate::manifest::ManifestCore;
+use crate::iter::{EmptyIterator, IterationOrder, RowEntryIterator};
+use crate::manifest::{ManifestCore, SsTableView};
 use crate::mem_table::WritableKVTable;
+use crate::sst_iter::{SstIterator, SstIteratorOptions};
 use crate::tablestore::{
-    DecodedWalSst, DecodedWalSstData, RangedWalSst, RangedWalSstData, TableStore,
+    DecodedWalSst, DecodedWalSstData, RangedWalSst, RangedWalSstData, RuntimeWalOpenError,
+    TableStore,
 };
 use crate::types::RowEntry;
 use crate::utils::panic_string;
@@ -13,10 +24,11 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use log::{error, info};
 use std::collections::VecDeque;
+use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tokio::task::JoinHandle;
+use tokio::task::{self, JoinHandle};
 
 pub(crate) struct WalReplayOptions {
     /// Limits concurrent full-object WAL prefetch.
@@ -30,6 +42,68 @@ pub(crate) struct WalReplayOptions {
     /// The minimum seq number to replay. If unset, will replay all
     /// entries after `last_l0_seq` in the manifest.
     pub(crate) min_seq: Option<u64>,
+
+    pub(crate) source: ExactWalReplaySource,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExactWalReplaySource {
+    /// A writable database is recovering before it can serve writes.
+    WriterOpen,
+    /// A reader is recovering its initial exact view.
+    ReaderOpen,
+    /// A running reader lost or advanced beyond its checkpoint and must recover exactly.
+    CheckpointRecovery,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeWalReplaySource {
+    /// Replay of the exact range declared by a newly applied manifest.
+    Manifest,
+    /// Recurring exact-next WAL tail while the reader remains open.
+    Tail,
+}
+
+pub(crate) struct RuntimeWalReplayOptions {
+    /// The target maximum number of bytes in each returned table. Runtime
+    /// replay splits only between complete WAL SSTs.
+    pub(crate) max_memtable_bytes: usize,
+
+    /// Options passed to the range-read SST iterators.
+    pub(crate) sst_iter_options: SstIteratorOptions,
+
+    /// The minimum sequence number to replay.
+    pub(crate) min_seq: Option<u64>,
+
+    /// Optional fairness boundary used by live tailing. Exact recovery and
+    /// manifest-range replay leave this unset to retain historical memtable
+    /// boundaries.
+    pub(crate) max_wals_per_batch: Option<NonZeroUsize>,
+
+    pub(crate) source: RuntimeWalReplaySource,
+}
+
+impl Default for RuntimeWalReplayOptions {
+    fn default() -> Self {
+        Self {
+            max_memtable_bytes: 64 * 1024 * 1024,
+            // Preserve the pre-full-object reader replay behavior: one fetch
+            // task eagerly reads up to 256 blocks through bounded range GETs.
+            sst_iter_options: SstIteratorOptions {
+                max_fetch_tasks: 1,
+                blocks_to_fetch: 256,
+                cache_blocks: true,
+                cache_metadata: false,
+                eager_spawn: true,
+                order: IterationOrder::Ascending,
+                prefix: None,
+                filter_context: None,
+            },
+            min_seq: None,
+            max_wals_per_batch: None,
+            source: RuntimeWalReplaySource::Manifest,
+        }
+    }
 }
 
 impl Default for WalReplayOptions {
@@ -38,6 +112,7 @@ impl Default for WalReplayOptions {
             prefetch: WalReplaySettings::default(),
             max_memtable_bytes: 64 * 1024 * 1024,
             min_seq: None,
+            source: ExactWalReplaySource::WriterOpen,
         }
     }
 }
@@ -53,6 +128,23 @@ struct WalIdAndIter {
     wal_id: u64,
     iter: Box<dyn RowEntryIterator + 'static>,
     _permit: Option<OwnedSemaphorePermit>,
+}
+
+struct RuntimeWalIdAndIter {
+    wal_id: u64,
+    iter: Box<dyn RowEntryIterator + 'static>,
+}
+
+#[derive(Debug)]
+pub(crate) enum RuntimeWalReplayError {
+    MissingInitialObject { wal_id: u64, source: SlateDBError },
+    Replay(SlateDBError),
+}
+
+impl From<SlateDBError> for RuntimeWalReplayError {
+    fn from(error: SlateDBError) -> Self {
+        Self::Replay(error)
+    }
 }
 
 struct WalObjectPlan {
@@ -369,6 +461,198 @@ impl<T> IteratorHolder<T> {
     }
 }
 
+/// Replays a finite WAL range through the established bounded SST range-read
+/// iterator. This path deliberately performs no object-store LIST and retains
+/// only a small ordered prefetch window.
+pub(crate) struct RuntimeWalReplayIterator {
+    options: RuntimeWalReplayOptions,
+    wal_id_range: Range<u64>,
+    table_store: Arc<TableStore>,
+    current_iter: IteratorHolder<RuntimeWalIdAndIter>,
+    next_iters: VecDeque<JoinHandle<Result<Option<RuntimeWalIdAndIter>, RuntimeWalReplayError>>>,
+    last_tick: i64,
+    last_seq: u64,
+    min_seq: u64,
+    next_wal_id: u64,
+}
+
+const RUNTIME_WAL_PREFETCH: usize = 4;
+
+impl RuntimeWalReplayIterator {
+    pub(crate) fn range(
+        wal_id_range: Range<u64>,
+        db_state: &ManifestCore,
+        options: RuntimeWalReplayOptions,
+        table_store: Arc<TableStore>,
+    ) -> Result<Self, SlateDBError> {
+        let min_seq = options.min_seq.unwrap_or(db_state.last_l0_seq);
+        let last_seq = db_state.last_l0_seq;
+        let last_tick = db_state.last_l0_clock_tick;
+        let next_wal_id = wal_id_range.start;
+        let mut replay = Self {
+            options,
+            wal_id_range,
+            table_store,
+            current_iter: IteratorHolder::new(),
+            next_iters: VecDeque::new(),
+            last_tick,
+            last_seq,
+            min_seq,
+            next_wal_id,
+        };
+        while replay.maybe_load_next_iter() {}
+        info!(
+            "SlateDB runtime WAL replay initialized [source={:?}, replay_start_wal_id={}, replay_end_wal_id={}, prefetch={}]",
+            replay.options.source,
+            replay.wal_id_range.start,
+            replay.wal_id_range.end,
+            RUNTIME_WAL_PREFETCH,
+        );
+        Ok(replay)
+    }
+
+    fn maybe_load_next_iter(&mut self) -> bool {
+        if !self.wal_id_range.contains(&self.next_wal_id)
+            || self.next_iters.len() >= RUNTIME_WAL_PREFETCH
+        {
+            return false;
+        }
+
+        let wal_id = self.next_wal_id;
+        self.next_wal_id += 1;
+        let table_store = Arc::clone(&self.table_store);
+        let sst_iter_options = self.options.sst_iter_options.clone();
+        self.next_iters.push_back(task::spawn(async move {
+            let sst = match table_store.open_runtime_wal_sst(wal_id).await {
+                Ok(sst) => sst,
+                Err(RuntimeWalOpenError::Replay(SlateDBError::EmptySSTable)) => {
+                    return Ok(Some(RuntimeWalIdAndIter {
+                        wal_id,
+                        iter: Box::new(EmptyIterator::new()),
+                    }));
+                }
+                Err(RuntimeWalOpenError::MissingInitialObject(error)) => {
+                    return Err(RuntimeWalReplayError::MissingInitialObject {
+                        wal_id,
+                        source: error,
+                    });
+                }
+                Err(RuntimeWalOpenError::Replay(error)) => {
+                    return Err(RuntimeWalReplayError::Replay(error));
+                }
+            };
+            let iter = SstIterator::new_owned_initialized(
+                ..,
+                SsTableView::identity(sst),
+                Arc::clone(&table_store),
+                sst_iter_options,
+            )
+            .await
+            .map_err(RuntimeWalReplayError::Replay)?;
+            Ok(iter.map(|iter| RuntimeWalIdAndIter {
+                wal_id,
+                iter: Box::new(iter) as Box<dyn RowEntryIterator + 'static>,
+            }))
+        }));
+        true
+    }
+
+    async fn advance_current_iter(&mut self) -> Result<(), RuntimeWalReplayError> {
+        let next_iter = if let Some(join_handle) = self.next_iters.pop_front() {
+            match join_handle.await {
+                Ok(result) => result?,
+                Err(join_error) => {
+                    let task_name = format!("runtime_wal_replay[{:?}]", self.wal_id_range);
+                    if let Ok(panic_error) = join_error.try_into_panic() {
+                        error!(
+                            "runtime WAL replay task panicked [task_name={}, panic={}]",
+                            task_name,
+                            panic_string(&panic_error),
+                        );
+                        return Err(RuntimeWalReplayError::Replay(
+                            SlateDBError::BackgroundTaskPanic(task_name),
+                        ));
+                    }
+                    return Err(RuntimeWalReplayError::Replay(
+                        SlateDBError::BackgroundTaskCancelled(task_name),
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        self.current_iter.advance(next_iter);
+        Ok(())
+    }
+
+    pub(crate) async fn next(&mut self) -> Result<Option<ReplayedMemtable>, RuntimeWalReplayError> {
+        if self.current_iter.is_finished() {
+            return Ok(None);
+        }
+        if !self.current_iter.initialized {
+            self.advance_current_iter().await?;
+        }
+
+        let table = WritableKVTable::new();
+        let mut last_wal_id = 0;
+        let mut replayed_wals = 0_usize;
+        while !self.current_iter.is_finished() {
+            if let Some(wal) = &mut self.current_iter.current_iter {
+                while let Some(row) = wal
+                    .iter
+                    .next()
+                    .await
+                    .map_err(RuntimeWalReplayError::Replay)?
+                {
+                    if row.seq <= self.min_seq {
+                        continue;
+                    }
+                    if let Some(timestamp) = row.create_ts {
+                        self.last_tick = self.last_tick.max(timestamp);
+                    }
+                    self.last_seq = self.last_seq.max(row.seq);
+                    table.put(row);
+                }
+
+                last_wal_id = wal.wal_id;
+                replayed_wals = replayed_wals.saturating_add(1);
+                let metadata = table.metadata();
+                let estimated_bytes = self.table_store.estimate_encoded_size_compacted(
+                    metadata.entry_num,
+                    metadata.entries_size_in_bytes,
+                );
+                if (!table.is_empty() && estimated_bytes >= self.options.max_memtable_bytes)
+                    || self
+                        .options
+                        .max_wals_per_batch
+                        .is_some_and(|limit| replayed_wals >= limit.get())
+                {
+                    self.current_iter.reset();
+                    break;
+                }
+            }
+
+            self.maybe_load_next_iter();
+            self.advance_current_iter().await?;
+        }
+
+        Ok((last_wal_id > 0).then_some(ReplayedMemtable {
+            table,
+            last_tick: self.last_tick,
+            last_seq: self.last_seq,
+            last_wal_id,
+        }))
+    }
+}
+
+impl Drop for RuntimeWalReplayIterator {
+    fn drop(&mut self) {
+        for pending in &self.next_iters {
+            pending.abort();
+        }
+    }
+}
+
 /// Replays one exact, contiguous WAL-ID range.
 ///
 /// Safety invariants:
@@ -377,7 +661,7 @@ impl<T> IteratorHolder<T> {
 /// - encoded-byte permits remain owned until the corresponding WAL is consumed;
 /// - an error permanently fails the iterator and aborts every outstanding fetch;
 /// - the replay cursor is lazy, so memory does not grow with a sparse ID span.
-pub(crate) struct WalReplayIterator {
+pub(crate) struct ExactWalReplayIterator {
     options: WalReplayOptions,
     wal_id_range: Range<u64>,
     table_store: Arc<TableStore>,
@@ -401,7 +685,7 @@ pub(crate) struct WalReplayIterator {
     failed: Option<SlateDBError>,
 }
 
-impl WalReplayIterator {
+impl ExactWalReplayIterator {
     pub(crate) async fn range(
         wal_id_range: Range<u64>,
         db_state: &ManifestCore,
@@ -438,7 +722,7 @@ impl WalReplayIterator {
         let byte_semaphore = Arc::new(Semaphore::new(encoded_byte_limit));
         let next_wal_id = wal_id_range.start;
 
-        let mut replay_iter = WalReplayIterator {
+        let mut replay_iter = ExactWalReplayIterator {
             options,
             wal_id_range,
             table_store: Arc::clone(&table_store),
@@ -464,7 +748,8 @@ impl WalReplayIterator {
 
         replay_iter.fill_prefetch();
         info!(
-            "SlateDB WAL replay initialized [replay_start_wal_id={}, replay_end_wal_id={}, replay_wal_count={}, listed_wal_count={}, missing_size_count={}, max_concurrent_objects={}, max_inflight_bytes={}]",
+            "SlateDB exact WAL replay initialized [source={:?}, replay_start_wal_id={}, replay_end_wal_id={}, replay_wal_count={}, listed_wal_count={}, missing_size_count={}, max_concurrent_objects={}, max_inflight_bytes={}]",
+            replay_iter.options.source,
             replay_iter.wal_id_range.start,
             replay_iter.wal_id_range.end,
             replay_iter
@@ -799,7 +1084,8 @@ impl WalReplayIterator {
         }
         self.completion_logged = true;
         info!(
-            "SlateDB WAL replay completed [replay_start_wal_id={}, replay_end_wal_id={}, fetched_objects={}, fetched_bytes={}, ranged_objects={}, decoded_objects={}, peak_concurrent_objects={}, peak_reserved_bytes={}]",
+            "SlateDB exact WAL replay completed [source={:?}, replay_start_wal_id={}, replay_end_wal_id={}, fetched_objects={}, fetched_bytes={}, ranged_objects={}, decoded_objects={}, peak_concurrent_objects={}, peak_reserved_bytes={}]",
+            self.options.source,
             self.wal_id_range.start,
             self.wal_id_range.end,
             self.fetched_objects,
@@ -821,7 +1107,7 @@ impl WalReplayIterator {
     }
 }
 
-impl Drop for WalReplayIterator {
+impl Drop for ExactWalReplayIterator {
     fn drop(&mut self) {
         for pending in &self.pending_fetches {
             pending.handle.abort();
@@ -831,7 +1117,10 @@ impl Drop for WalReplayIterator {
 
 #[cfg(test)]
 mod tests {
-    use super::{WalReplayIterator, WalReplayOptions};
+    use super::{
+        ExactWalReplayIterator, RuntimeWalReplayError, RuntimeWalReplayIterator,
+        RuntimeWalReplayOptions, WalReplayOptions,
+    };
     use crate::block_cache_policy::BlockCachePolicy;
     use crate::bytes_range::BytesRange;
     use crate::config::WalReplaySettings;
@@ -843,7 +1132,7 @@ mod tests {
     use crate::object_stores::ObjectStores;
     use crate::proptest_util::{rng, sample};
     use crate::tablestore::{DecodedWalSst, TableStore, TableStoreKind};
-    use crate::test_utils::{GatedObjectStore, RecordingObjectStore};
+    use crate::test_utils::{FlakyObjectStore, GatedObjectStore, RecordingObjectStore};
     use crate::types::{RowEntry, ValueDeletable};
     use crate::{error::SlateDBError, test_utils};
     use async_trait::async_trait;
@@ -1057,7 +1346,7 @@ mod tests {
         }
     }
 
-    impl WalReplayIterator {
+    impl ExactWalReplayIterator {
         async fn all_wal_ids(
             db_state: &ManifestCore,
             options: WalReplayOptions,
@@ -1073,10 +1362,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_replay_uses_range_reads_without_listing() {
+        let recording = Arc::new(RecordingObjectStore::new(Arc::new(InMemory::new())));
+        let object_store: Arc<dyn ObjectStore> = recording.clone();
+        let table_store = test_table_store_with_object_store(object_store);
+        write_empty_wal(1, Arc::clone(&table_store)).await.unwrap();
+
+        let mut runtime = RuntimeWalReplayIterator::range(
+            1..2,
+            &ManifestCore::new(),
+            RuntimeWalReplayOptions::default(),
+            Arc::clone(&table_store),
+        )
+        .unwrap();
+        assert!(runtime.next().await.unwrap().is_some());
+        assert!(runtime.next().await.unwrap().is_none());
+        assert_eq!(recording.list_calls(), 0);
+        assert!(!recording.get_range_sizes().is_empty());
+
+        let mut exact = ExactWalReplayIterator::range(
+            1..2,
+            &ManifestCore::new(),
+            WalReplayOptions::default(),
+            table_store,
+        )
+        .await
+        .unwrap();
+        assert!(exact.next().await.unwrap().is_some());
+        assert!(recording.list_calls() > 0);
+    }
+
+    #[tokio::test]
+    async fn runtime_replay_treats_metadata_not_found_as_corruption_not_caught_up() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let gated = Arc::new(GatedObjectStore::new(inner));
+        let object_store: Arc<dyn ObjectStore> = gated.clone();
+        let table_store = test_table_store_with_object_store(object_store);
+        let mut rng = rng::new_test_rng(None);
+        let entries = sample::table(&mut rng, 1, 16);
+        let mut entries = entries.iter();
+        write_wal(1, 1, &mut entries, 1, Arc::clone(&table_store))
+            .await
+            .unwrap();
+
+        // The initial HEAD and footer read establish that the exact object
+        // exists. A later metadata 404 must remain a replay error.
+        let prior_range_arrivals = gated.get_opts_gate.arrivals();
+        gated.get_opts_gate.close();
+        gated.get_opts_gate.admit(1);
+        let mut runtime = RuntimeWalReplayIterator::range(
+            1..2,
+            &ManifestCore::new(),
+            RuntimeWalReplayOptions::default(),
+            table_store,
+        )
+        .unwrap();
+        let replay = tokio::spawn(async move { runtime.next().await });
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            gated
+                .get_opts_gate
+                .wait_for_arrivals(prior_range_arrivals + 2),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "only {} range reads arrived",
+                gated.get_opts_gate.arrivals()
+            )
+        });
+        gated
+            .get_opts_gate
+            .set_error(|| object_store::Error::NotFound {
+                path: "injected-metadata-404".to_string(),
+                source: Box::new(std::io::Error::other("injected metadata 404")),
+            });
+        gated.get_opts_gate.release();
+
+        let replay = tokio::time::timeout(Duration::from_secs(2), replay)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "runtime replay remained blocked after {} range reads",
+                    gated.get_opts_gate.arrivals()
+                )
+            })
+            .unwrap();
+        let error = match replay {
+            Ok(_) => panic!("metadata 404 unexpectedly replayed"),
+            Err(error) => error,
+        };
+        let RuntimeWalReplayError::Replay(error) = error else {
+            panic!("metadata 404 was incorrectly classified as caught up");
+        };
+        assert!(error.has_object_store_not_found());
+    }
+
+    #[tokio::test]
+    async fn runtime_replay_returns_corruption_for_a_truncated_footer_without_panicking() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let flaky = Arc::new(FlakyObjectStore::new(inner, 0).with_truncate_get_range_bytes(1, 2));
+        let object_store: Arc<dyn ObjectStore> = flaky;
+        let table_store = test_table_store_with_object_store(object_store);
+        let entries = BTreeMap::from([(Bytes::from_static(b"key"), Bytes::from_static(b"value"))]);
+        let mut entries = entries.iter();
+        write_wal(1, 1, &mut entries, 1, Arc::clone(&table_store))
+            .await
+            .unwrap();
+        let mut runtime = RuntimeWalReplayIterator::range(
+            1..2,
+            &ManifestCore::new(),
+            RuntimeWalReplayOptions::default(),
+            table_store,
+        )
+        .unwrap();
+
+        let replay = std::panic::AssertUnwindSafe(runtime.next())
+            .catch_unwind()
+            .await;
+        let result = replay.expect("malformed object-store bytes must never panic");
+        let error = match result {
+            Ok(_) => panic!("truncated footer unexpectedly replayed"),
+            Err(error) => error,
+        };
+        let RuntimeWalReplayError::Replay(SlateDBError::CorruptSst { .. }) = error else {
+            panic!("truncated footer did not return typed corruption");
+        };
+    }
+
+    #[tokio::test]
     async fn should_replay_empty_wal() {
         let table_store = test_table_store();
         write_empty_wal(1, Arc::clone(&table_store)).await.unwrap();
-        let mut replay_iter = WalReplayIterator::all_wal_ids(
+        let mut replay_iter = ExactWalReplayIterator::all_wal_ids(
             &ManifestCore::new(),
             WalReplayOptions::default(),
             Arc::clone(&table_store),
@@ -1099,7 +1517,7 @@ mod tests {
     async fn should_replay_zero_byte_wal_fence() {
         let table_store = test_table_store();
         table_store.write_wal_fence(1).await.unwrap();
-        let mut replay_iter = WalReplayIterator::all_wal_ids(
+        let mut replay_iter = ExactWalReplayIterator::all_wal_ids(
             &ManifestCore::new(),
             WalReplayOptions::default(),
             Arc::clone(&table_store),
@@ -1132,7 +1550,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut replay_iter = WalReplayIterator::all_wal_ids(
+        let mut replay_iter = ExactWalReplayIterator::all_wal_ids(
             &ManifestCore::new(),
             WalReplayOptions::default(),
             Arc::clone(&table_store),
@@ -1169,7 +1587,7 @@ mod tests {
         table_store.write_wal_fence(2).await.unwrap();
         table_store.write_wal_fence(4).await.unwrap();
 
-        let mut replay_iter = WalReplayIterator::range(
+        let mut replay_iter = ExactWalReplayIterator::range(
             1..5,
             &ManifestCore::new(),
             WalReplayOptions::default(),
@@ -1209,7 +1627,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut replay_iter = WalReplayIterator::range(
+        let mut replay_iter = ExactWalReplayIterator::range(
             1..2,
             &ManifestCore::new(),
             WalReplayOptions::default(),
@@ -1306,7 +1724,7 @@ mod tests {
                 .filter(|row| row.seq > 8)
                 .cloned()
                 .collect::<Vec<_>>();
-            let mut replay = WalReplayIterator::range(
+            let mut replay = ExactWalReplayIterator::range(
                 1..2,
                 &ManifestCore::new(),
                 WalReplayOptions {
@@ -1325,6 +1743,25 @@ mod tests {
             }
             assert_eq!(replayed_rows, expected_filtered, "filtered fixture {name}");
             assert!(replay.next().await.unwrap().is_none());
+
+            let mut runtime_replay = RuntimeWalReplayIterator::range(
+                1..2,
+                &ManifestCore::new(),
+                RuntimeWalReplayOptions {
+                    min_seq: Some(8),
+                    ..RuntimeWalReplayOptions::default()
+                },
+                Arc::clone(&table_store),
+            )
+            .unwrap();
+            let runtime_table = runtime_replay.next().await.unwrap().unwrap();
+            let mut runtime_rows = Vec::new();
+            let mut runtime_iter = runtime_table.table.table().iter();
+            while let Some(row) = runtime_iter.next().await.unwrap() {
+                runtime_rows.push(row);
+            }
+            assert_eq!(runtime_rows, expected_filtered, "runtime fixture {name}");
+            assert!(runtime_replay.next().await.unwrap().is_none());
         }
     }
 
@@ -1374,6 +1811,21 @@ mod tests {
             .unwrap();
             let full_error = full_iterator.next().await.unwrap_err();
 
+            let mut runtime_replay = RuntimeWalReplayIterator::range(
+                1..2,
+                &ManifestCore::new(),
+                RuntimeWalReplayOptions::default(),
+                Arc::clone(&table_store),
+            )
+            .unwrap();
+            let runtime_error = match runtime_replay.next().await {
+                Ok(_) => panic!("corrupted historical fixture {name} passed runtime replay"),
+                Err(error) => error,
+            };
+            let RuntimeWalReplayError::Replay(runtime_error) = runtime_error else {
+                panic!("corrupted historical fixture {name} looked missing");
+            };
+
             assert_eq!(
                 full_error.maybe_validation_retry_reason(),
                 range_error.maybe_validation_retry_reason(),
@@ -1383,6 +1835,11 @@ mod tests {
                 full_error.maybe_validation_retry_reason(),
                 Some(crate::error::RetryReason::CrcMismatch),
                 "fixture {name}"
+            );
+            assert_eq!(
+                runtime_error.maybe_validation_retry_reason(),
+                full_error.maybe_validation_retry_reason(),
+                "runtime fixture {name}"
             );
         }
     }
@@ -1404,7 +1861,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut replay_iter = WalReplayIterator::range(
+        let mut replay_iter = ExactWalReplayIterator::range(
             1..2,
             &ManifestCore::new(),
             WalReplayOptions::default(),
@@ -1423,7 +1880,7 @@ mod tests {
     async fn should_finish_empty_replay_range_without_object_io() {
         let recording = Arc::new(RecordingObjectStore::new(Arc::new(InMemory::new())));
         let table_store = test_table_store_with_object_store(recording.clone());
-        let mut replay_iter = WalReplayIterator::range(
+        let mut replay_iter = ExactWalReplayIterator::range(
             7..7,
             &ManifestCore::new(),
             WalReplayOptions::default(),
@@ -1446,7 +1903,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut replay_iter = WalReplayIterator::all_wal_ids(
+        let mut replay_iter = ExactWalReplayIterator::all_wal_ids(
             &ManifestCore::new(),
             WalReplayOptions::default(),
             Arc::clone(&table_store),
@@ -1493,7 +1950,7 @@ mod tests {
         }
         recording.clear();
 
-        let mut replay_iter = WalReplayIterator::range(
+        let mut replay_iter = ExactWalReplayIterator::range(
             1..4,
             &ManifestCore::new(),
             WalReplayOptions::default(),
@@ -1537,7 +1994,7 @@ mod tests {
         main.clear();
         wal.clear();
 
-        let mut replay_iter = WalReplayIterator::range(
+        let mut replay_iter = ExactWalReplayIterator::range(
             1..2,
             &ManifestCore::new(),
             WalReplayOptions::default(),
@@ -1589,7 +2046,7 @@ mod tests {
             .unwrap();
         recording.clear();
 
-        let mut replay_iter = WalReplayIterator::range(
+        let mut replay_iter = ExactWalReplayIterator::range(
             1..2,
             &ManifestCore::new(),
             WalReplayOptions::default(),
@@ -1720,7 +2177,7 @@ mod tests {
                 .unwrap();
         }
 
-        let mut replay_iter = WalReplayIterator::range(
+        let mut replay_iter = ExactWalReplayIterator::range(
             1..4,
             &ManifestCore::new(),
             WalReplayOptions::default(),
@@ -1754,7 +2211,7 @@ mod tests {
                 .unwrap();
         }
 
-        let mut replay_iter = WalReplayIterator::range(
+        let mut replay_iter = ExactWalReplayIterator::range(
             1..4,
             &ManifestCore::new(),
             WalReplayOptions::default(),
@@ -1781,7 +2238,7 @@ mod tests {
 
         let replay_iter = tokio::time::timeout(
             Duration::from_secs(1),
-            WalReplayIterator::range(
+            ExactWalReplayIterator::range(
                 1..u64::MAX,
                 &ManifestCore::new(),
                 WalReplayOptions {
@@ -1820,7 +2277,7 @@ mod tests {
             .unwrap();
         gated.get_opts_gate.close();
 
-        let mut replay_iter = WalReplayIterator::range(
+        let mut replay_iter = ExactWalReplayIterator::range(
             1..2,
             &ManifestCore::new(),
             WalReplayOptions::default(),
@@ -1865,7 +2322,7 @@ mod tests {
         }
         gated.get_opts_gate.close();
 
-        let mut replay_iter = WalReplayIterator::range(
+        let mut replay_iter = ExactWalReplayIterator::range(
             1..5,
             &ManifestCore::new(),
             WalReplayOptions {
@@ -1927,7 +2384,7 @@ mod tests {
             recording.clear();
 
             let total_budget = 256 * 1024;
-            let mut replay = WalReplayIterator::range(
+            let mut replay = ExactWalReplayIterator::range(
                 1..2,
                 &ManifestCore::new(),
                 WalReplayOptions {
@@ -1983,7 +2440,7 @@ mod tests {
             .unwrap();
         recording.clear();
 
-        let mut replay = WalReplayIterator::range(
+        let mut replay = ExactWalReplayIterator::range(
             1..2,
             &ManifestCore::new(),
             WalReplayOptions {
@@ -2064,7 +2521,7 @@ mod tests {
             .unwrap();
         recording.clear();
 
-        let mut replay = WalReplayIterator::range(
+        let mut replay = ExactWalReplayIterator::range(
             1..2,
             &ManifestCore::new(),
             WalReplayOptions {
@@ -2131,7 +2588,7 @@ mod tests {
             .unwrap();
         recording.clear();
 
-        let mut replay = WalReplayIterator::range(
+        let mut replay = ExactWalReplayIterator::range(
             1..2,
             &ManifestCore::new(),
             WalReplayOptions {
@@ -2212,7 +2669,7 @@ mod tests {
                     .unwrap();
                 recording.clear();
 
-                let mut replay = WalReplayIterator::range(
+                let mut replay = ExactWalReplayIterator::range(
                     1..2,
                     &ManifestCore::new(),
                     WalReplayOptions {
@@ -2423,7 +2880,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut replay = WalReplayIterator::range(
+        let mut replay = ExactWalReplayIterator::range(
             1..2,
             &ManifestCore::new(),
             WalReplayOptions {
@@ -2468,7 +2925,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut replay = WalReplayIterator::range(
+        let mut replay = ExactWalReplayIterator::range(
             1..2,
             &ManifestCore::new(),
             WalReplayOptions::default(),
@@ -2522,7 +2979,7 @@ mod tests {
         inner.put(&path, Bytes::from(bytes).into()).await.unwrap();
         recording.clear();
 
-        let mut replay = WalReplayIterator::range(
+        let mut replay = ExactWalReplayIterator::range(
             1..2,
             &ManifestCore::new(),
             WalReplayOptions::default(),
@@ -2731,7 +3188,7 @@ mod tests {
                 .unwrap();
         }
 
-        let mut replay_iter = WalReplayIterator::range(
+        let mut replay_iter = ExactWalReplayIterator::range(
             1..3,
             &ManifestCore::new(),
             WalReplayOptions {
@@ -2786,7 +3243,7 @@ mod tests {
             .await
             .unwrap();
 
-        let replay_iter = WalReplayIterator::range(
+        let replay_iter = ExactWalReplayIterator::range(
             1..2,
             &ManifestCore::new(),
             WalReplayOptions::default(),
@@ -2855,7 +3312,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut replay_iter = WalReplayIterator::range(
+        let mut replay_iter = ExactWalReplayIterator::range(
             1..3,
             &ManifestCore::new(),
             WalReplayOptions {
@@ -2907,7 +3364,7 @@ mod tests {
                 .unwrap();
         }
 
-        let mut replay_iter = WalReplayIterator::range(
+        let mut replay_iter = ExactWalReplayIterator::range(
             1..3,
             &ManifestCore::new(),
             WalReplayOptions {
@@ -2956,7 +3413,7 @@ mod tests {
             .unwrap();
         gated.get_opts_gate.close();
 
-        let mut replay_iter = WalReplayIterator::range(
+        let mut replay_iter = ExactWalReplayIterator::range(
             1..2,
             &ManifestCore::new(),
             WalReplayOptions::default(),
@@ -3019,7 +3476,7 @@ mod tests {
         assert!(encoded_budget < largest_object * 2);
         gated.get_opts_gate.close();
 
-        let mut replay_iter = WalReplayIterator::range(
+        let mut replay_iter = ExactWalReplayIterator::range(
             1..3,
             &ManifestCore::new(),
             WalReplayOptions {
@@ -3058,7 +3515,7 @@ mod tests {
             .unwrap();
 
         let max_memtable_bytes = 1024;
-        let mut replay_iter = WalReplayIterator::all_wal_ids(
+        let mut replay_iter = ExactWalReplayIterator::all_wal_ids(
             &ManifestCore::new(),
             WalReplayOptions {
                 max_memtable_bytes,
@@ -3128,7 +3585,7 @@ mod tests {
                 .unwrap();
         }
 
-        let mut replay_iter = WalReplayIterator::all_wal_ids(
+        let mut replay_iter = ExactWalReplayIterator::all_wal_ids(
             &ManifestCore::new(),
             WalReplayOptions {
                 max_memtable_bytes,
@@ -3196,7 +3653,7 @@ mod tests {
 
         // Replay the single WAL SST into in-memory tables. If the replay code
         // can split a single commit sequence, it will do so here.
-        let mut replay_iter = WalReplayIterator::all_wal_ids(
+        let mut replay_iter = ExactWalReplayIterator::all_wal_ids(
             &ManifestCore::new(),
             WalReplayOptions {
                 max_memtable_bytes,
@@ -3254,7 +3711,7 @@ mod tests {
             .unwrap();
 
         // Replay the single WAL SST into in-memory tables.
-        let mut replay_iter = WalReplayIterator::all_wal_ids(
+        let mut replay_iter = ExactWalReplayIterator::all_wal_ids(
             &ManifestCore::new(),
             WalReplayOptions {
                 max_memtable_bytes,
@@ -3316,7 +3773,7 @@ mod tests {
         db_state.replay_after_wal_id = replay_after_wal_id;
         db_state.next_wal_sst_id = replay_after_wal_id + 1;
 
-        let mut replay_iter = WalReplayIterator::all_wal_ids(
+        let mut replay_iter = ExactWalReplayIterator::all_wal_ids(
             &db_state,
             WalReplayOptions::default(),
             Arc::clone(&table_store),
@@ -3355,7 +3812,7 @@ mod tests {
         db_state.last_l0_seq = min_seq;
         db_state.last_l0_clock_tick = 0;
 
-        let mut replay_iter = WalReplayIterator::all_wal_ids(
+        let mut replay_iter = ExactWalReplayIterator::all_wal_ids(
             &db_state,
             WalReplayOptions::default(),
             Arc::clone(&table_store),
@@ -3387,6 +3844,9 @@ mod tests {
             .filter(|line| !line.is_empty() && !line.starts_with('#'))
             .filter_map(|line| {
                 let (name, encoded) = line.split_once(' ')?;
+                // Each recognized suffix has a different compile-time value;
+                // this cannot be reduced to one `matches!` expression.
+                #[allow(clippy::match_like_matches_macro)]
                 let feature_enabled = match name.rsplit_once('-').map(|(_, suffix)| suffix) {
                     Some("snappy") => cfg!(feature = "snappy"),
                     Some("zlib") => cfg!(feature = "zlib"),

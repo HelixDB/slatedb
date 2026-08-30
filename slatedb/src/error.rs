@@ -269,6 +269,9 @@ pub(crate) enum SlateDBError {
     #[error("invalid manifest poll interval. interval=`{0:?}`")]
     InvalidManifestPollInterval(Duration),
 
+    #[error("invalid WAL poll interval. interval=`{0:?}`")]
+    InvalidWalPollInterval(Duration),
+
     #[error("checkpoint lifetime must be at least double the manifest poll interval. lifetime=`{lifetime:?}`, interval=`{interval:?}`")]
     CheckpointLifetimeTooShort {
         lifetime: Duration,
@@ -738,7 +741,8 @@ impl From<SlateDBError> for Error {
             SlateDBError::UnknownConfigurationFormat(_) => Error::invalid(msg),
             SlateDBError::InvalidConfiguration(_) => Error::invalid(msg),
             SlateDBError::InvalidCheckpointLifetime(_) => Error::invalid(msg),
-            SlateDBError::InvalidManifestPollInterval(_) => Error::invalid(msg),
+            SlateDBError::InvalidManifestPollInterval(_)
+            | SlateDBError::InvalidWalPollInterval(_) => Error::invalid(msg),
             SlateDBError::CheckpointLifetimeTooShort { .. } => Error::invalid(msg),
             SlateDBError::DbReaderSnapshotUnsupportedInFollowLatest => Error::invalid(msg),
             SlateDBError::SeekKeyOutOfRange { .. } => Error::invalid(msg),
