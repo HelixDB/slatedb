@@ -160,6 +160,12 @@ struct TransactionManagerInner {
     ///   committed_seq` and follow the same GC rule.
     /// - If there are no active transactions, this deque can be fully drained.
     recent_committed_txns: VecDeque<TransactionState>,
+    /// Exact discriminator payload retained by active and recent transactions.
+    ///
+    /// These counters make quota admission and metric publication independent
+    /// of the number of concurrently retained transaction states.
+    retained_conflict_metadata_bytes: usize,
+    retained_conflict_metadata_tokens: usize,
     /// The oracle for tracking the last committed sequence number.
     oracle: Arc<DbOracle>,
 }
@@ -201,6 +207,8 @@ impl TransactionManager {
             inner: Arc::new(RwLock::new(TransactionManagerInner {
                 active_txns: HashMap::new(),
                 recent_committed_txns: VecDeque::new(),
+                retained_conflict_metadata_bytes: 0,
+                retained_conflict_metadata_tokens: 0,
                 oracle,
             })),
             db_rand,
@@ -214,13 +222,12 @@ impl TransactionManager {
         let Some(metrics) = &self.conflict_metadata_metrics else {
             return;
         };
-        let (bytes, tokens) = inner.conflict_metadata_usage();
         metrics
             .retained_bytes
-            .set(i64::try_from(bytes).unwrap_or(i64::MAX));
+            .set(i64::try_from(inner.retained_conflict_metadata_bytes).unwrap_or(i64::MAX));
         metrics
             .retained_tokens
-            .set(i64::try_from(tokens).unwrap_or(i64::MAX));
+            .set(i64::try_from(inner.retained_conflict_metadata_tokens).unwrap_or(i64::MAX));
     }
 
     /// Register a read-write transaction state.
@@ -271,7 +278,14 @@ impl TransactionManager {
     /// Here's a chance to recycle the recent committed txns.
     pub(crate) fn drop_txn(&self, txn_id: &Uuid) {
         let mut inner = self.inner.write();
-        inner.active_txns.remove(txn_id);
+        if let Some(txn_state) = inner.active_txns.remove(txn_id) {
+            let (bytes, tokens) = txn_state.conflict_metadata_usage();
+            inner.retained_conflict_metadata_bytes =
+                inner.retained_conflict_metadata_bytes.saturating_sub(bytes);
+            inner.retained_conflict_metadata_tokens = inner
+                .retained_conflict_metadata_tokens
+                .saturating_sub(tokens);
+        }
         inner.recycle_recent_committed_txns();
         self.update_conflict_metadata_metrics(&inner);
     }
@@ -289,7 +303,8 @@ impl TransactionManager {
         };
         let mut proposed = txn_state.clone();
         proposed.track_writes(writes.iter().map(|(key, kind)| (key.clone(), kind.clone())));
-        let (proposed_bytes, _) = proposed.conflict_metadata_usage();
+        let (current_bytes, current_tokens) = txn_state.conflict_metadata_usage();
+        let (proposed_bytes, proposed_tokens) = proposed.conflict_metadata_usage();
         if proposed_bytes > self.max_transaction_conflict_metadata_bytes {
             if let Some(metrics) = &self.conflict_metadata_metrics {
                 metrics.quota_rejections.increment(1);
@@ -300,9 +315,8 @@ impl TransactionManager {
             });
         }
 
-        let (retained_bytes, _) = inner.conflict_metadata_usage();
-        let (current_bytes, _) = txn_state.conflict_metadata_usage();
-        let requested_bytes = retained_bytes
+        let requested_bytes = inner
+            .retained_conflict_metadata_bytes
             .saturating_sub(current_bytes)
             .saturating_add(proposed_bytes);
         if requested_bytes > self.max_retained_conflict_metadata_bytes {
@@ -315,6 +329,11 @@ impl TransactionManager {
             });
         }
 
+        inner.retained_conflict_metadata_bytes = requested_bytes;
+        inner.retained_conflict_metadata_tokens = inner
+            .retained_conflict_metadata_tokens
+            .saturating_sub(current_tokens)
+            .saturating_add(proposed_tokens);
         inner.active_txns.insert(*txn_id, proposed);
         self.update_conflict_metadata_metrics(&inner);
         Ok(())
@@ -444,6 +463,7 @@ impl TransactionManager {
 }
 
 impl TransactionManagerInner {
+    #[cfg(test)]
     fn conflict_metadata_usage(&self) -> (usize, usize) {
         self.active_txns
             .values()
@@ -464,6 +484,8 @@ impl TransactionManagerInner {
             // No active write transactions remain, so there is nobody left that can
             // conflict with this committed state or any older committed state.
             self.recent_committed_txns.clear();
+            self.retained_conflict_metadata_bytes = 0;
+            self.retained_conflict_metadata_tokens = 0;
         }
     }
 
@@ -483,9 +505,17 @@ impl TransactionManagerInner {
             // A transaction can be garbage collected when all active transactions
             // have started_seq strictly greater than the transaction's committed_seq.
             // This means we keep transactions where committed_seq >= min_seq.
+            let mut released_bytes = 0_usize;
+            let mut released_tokens = 0_usize;
             self.recent_committed_txns.retain(|txn| {
                 if let Some(committed_seq) = txn.committed_seq {
-                    committed_seq >= min_seq
+                    let retained = committed_seq >= min_seq;
+                    if !retained {
+                        let (bytes, tokens) = txn.conflict_metadata_usage();
+                        released_bytes = released_bytes.saturating_add(bytes);
+                        released_tokens = released_tokens.saturating_add(tokens);
+                    }
+                    retained
                 } else {
                     // If committed_seq is not set, this shouldn't happen in practice.
                     warn!(
@@ -494,9 +524,17 @@ impl TransactionManagerInner {
                     true
                 }
             });
+            self.retained_conflict_metadata_bytes = self
+                .retained_conflict_metadata_bytes
+                .saturating_sub(released_bytes);
+            self.retained_conflict_metadata_tokens = self
+                .retained_conflict_metadata_tokens
+                .saturating_sub(released_tokens);
         } else {
             // No active transactions, can drain the entire deque
             self.recent_committed_txns.clear();
+            self.retained_conflict_metadata_bytes = 0;
+            self.retained_conflict_metadata_tokens = 0;
         }
     }
 
@@ -645,6 +683,55 @@ mod tests {
         let status_reporter = DbStatusManager::new(0);
         let oracle = Arc::new(DbOracle::new(0, 0, 0, Arc::new(status_reporter)));
         TransactionManager::new(oracle, db_rand)
+    }
+
+    fn assert_cached_conflict_metadata_is_exact(txn_manager: &TransactionManager) {
+        let inner = txn_manager.inner.read();
+        assert_eq!(
+            (
+                inner.retained_conflict_metadata_bytes,
+                inner.retained_conflict_metadata_tokens,
+            ),
+            inner.conflict_metadata_usage()
+        );
+    }
+
+    #[test]
+    fn conflict_metadata_accounting_stays_exact_across_commit_drop_and_recycle() {
+        let txn_manager = create_transaction_manager();
+        let guard = txn_manager.new_txn_with_id(0, Uuid::new_v4());
+        let committed = txn_manager.new_txn_with_id(0, Uuid::new_v4());
+        let committed_writes = [(
+            Bytes::from_static(b"committed"),
+            TransactionWriteKind::DisjointMerge(DisjointMergeDiscriminators::from_tokens([1, 2])),
+        )]
+        .into_iter()
+        .collect();
+
+        txn_manager
+            .track_writes(&committed, &committed_writes)
+            .unwrap();
+        assert_cached_conflict_metadata_is_exact(&txn_manager);
+        txn_manager.track_recent_committed_txn(&committed, 1);
+        assert_cached_conflict_metadata_is_exact(&txn_manager);
+
+        let dropped = txn_manager.new_txn_with_id(1, Uuid::new_v4());
+        let dropped_writes = [(
+            Bytes::from_static(b"dropped"),
+            TransactionWriteKind::DisjointMerge(DisjointMergeDiscriminators::from_tokens([3])),
+        )]
+        .into_iter()
+        .collect();
+        txn_manager.track_writes(&dropped, &dropped_writes).unwrap();
+        assert_cached_conflict_metadata_is_exact(&txn_manager);
+        txn_manager.drop_txn(&dropped);
+        assert_cached_conflict_metadata_is_exact(&txn_manager);
+
+        txn_manager.drop_txn(&guard);
+        assert_cached_conflict_metadata_is_exact(&txn_manager);
+        let inner = txn_manager.inner.read();
+        assert_eq!(inner.retained_conflict_metadata_bytes, 0);
+        assert_eq!(inner.retained_conflict_metadata_tokens, 0);
     }
 
     #[test]
