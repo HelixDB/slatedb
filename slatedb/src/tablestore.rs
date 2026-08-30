@@ -4040,11 +4040,20 @@ mod tests {
         use crate::error::{RetryReason, SlateDBError};
         use crate::format::sst::SsTableFormat;
         use crate::object_stores::ObjectStores;
+        use crate::replay_task_scope::ReplayTaskScope;
         use crate::tablestore::TableStore;
         use crate::test_utils::{build_test_sst, RecordingObjectStore};
         use object_store::memory::InMemory;
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::{Arc, Mutex};
+
+        struct RetryCancellationProbe(Arc<AtomicBool>);
+
+        impl Drop for RetryCancellationProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
 
         fn format() -> SsTableFormat {
             SsTableFormat {
@@ -4224,6 +4233,48 @@ mod tests {
                     },
                 ],
                 "a WAL read should be reissued once with the retry reason"
+            );
+        }
+
+        #[tokio::test]
+        async fn validation_retry_is_cancelled_when_its_owner_is_aborted() {
+            let scope = ReplayTaskScope::new();
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let retry_started = Arc::new(tokio::sync::Notify::new());
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let task_attempts = Arc::clone(&attempts);
+            let task_retry_started = Arc::clone(&retry_started);
+            let task_cancelled = Arc::clone(&cancelled);
+            let task = scope.spawn(async move {
+                read_with_validation_retry(
+                    ObjectStoreCallTag::new(TableStoreKind::Reader, SstType::Wal),
+                    move |_| {
+                        let attempt = task_attempts.fetch_add(1, Ordering::SeqCst);
+                        let retry_started = Arc::clone(&task_retry_started);
+                        let cancelled = Arc::clone(&task_cancelled);
+                        async move {
+                            if attempt == 0 {
+                                return Err(SlateDBError::ChecksumMismatch { path: None });
+                            }
+                            let _probe = RetryCancellationProbe(cancelled);
+                            retry_started.notify_one();
+                            std::future::pending::<Result<(), SlateDBError>>().await
+                        }
+                    },
+                )
+                .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(1), retry_started.notified())
+                .await
+                .expect("validation retry did not start");
+
+            task.abort();
+            let _ = task.await;
+            scope.shutdown().await;
+            assert_eq!(attempts.load(Ordering::SeqCst), 2);
+            assert!(
+                cancelled.load(Ordering::Acquire),
+                "validation retry future outlived its owner"
             );
         }
 

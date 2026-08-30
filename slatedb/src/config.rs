@@ -1199,10 +1199,10 @@ impl Default for WalReplaySettings {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct DbReaderOptions {
-    /// How frequently to poll for new manifest files and WAL data. Refreshing the manifest
-    /// file allows readers to detect newly compacted data. The reader will also look for
-    /// new writes to the WAL at this poll interval. Readers using
-    /// [`crate::DbReaderMode::Checkpoint`] do not poll the manifest or WAL.
+    /// How frequently to poll for new manifest files. Refreshing the manifest
+    /// allows readers to detect newly compacted data. Runtime WAL polling uses
+    /// [`Self::wal_poll_interval`] independently. Readers using
+    /// [`crate::DbReaderMode::Checkpoint`] do not poll either source.
     pub manifest_poll_interval: Duration,
 
     /// How frequently an open reader probes the exact next WAL ID after

@@ -13,6 +13,7 @@ use crate::error::SlateDBError;
 use crate::iter::{EmptyIterator, IterationOrder, RowEntryIterator};
 use crate::manifest::{ManifestCore, SsTableView};
 use crate::mem_table::WritableKVTable;
+use crate::replay_task_scope::ReplayTaskScope;
 use crate::sst_iter::{SstIterator, SstIteratorOptions};
 use crate::tablestore::{
     DecodedWalSst, DecodedWalSstData, RangedWalSst, RangedWalSstData, RuntimeWalOpenError,
@@ -44,6 +45,10 @@ pub(crate) struct WalReplayOptions {
     pub(crate) min_seq: Option<u64>,
 
     pub(crate) source: ExactWalReplaySource,
+
+    /// Tracks spawned fetches for a live reader. Writer opening leaves this
+    /// unset because its open future already owns the entire replay lifetime.
+    pub(crate) task_scope: Option<ReplayTaskScope>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -81,6 +86,9 @@ pub(crate) struct RuntimeWalReplayOptions {
     pub(crate) max_wals_per_batch: Option<NonZeroUsize>,
 
     pub(crate) source: RuntimeWalReplaySource,
+
+    /// Exact owner for WAL-open and nested block-fetch tasks.
+    pub(crate) task_scope: Option<ReplayTaskScope>,
 }
 
 impl Default for RuntimeWalReplayOptions {
@@ -102,6 +110,7 @@ impl Default for RuntimeWalReplayOptions {
             min_seq: None,
             max_wals_per_batch: None,
             source: RuntimeWalReplaySource::Manifest,
+            task_scope: None,
         }
     }
 }
@@ -113,6 +122,7 @@ impl Default for WalReplayOptions {
             max_memtable_bytes: 64 * 1024 * 1024,
             min_seq: None,
             source: ExactWalReplaySource::WriterOpen,
+            task_scope: None,
         }
     }
 }
@@ -522,7 +532,9 @@ impl RuntimeWalReplayIterator {
         self.next_wal_id += 1;
         let table_store = Arc::clone(&self.table_store);
         let sst_iter_options = self.options.sst_iter_options.clone();
-        self.next_iters.push_back(task::spawn(async move {
+        let task_scope = self.options.task_scope.clone();
+        let nested_scope = task_scope.clone();
+        let task = async move {
             let sst = match table_store.open_runtime_wal_sst(wal_id).await {
                 Ok(sst) => sst,
                 Err(RuntimeWalOpenError::Replay(SlateDBError::EmptySSTable)) => {
@@ -541,19 +553,36 @@ impl RuntimeWalReplayIterator {
                     return Err(RuntimeWalReplayError::Replay(error));
                 }
             };
-            let iter = SstIterator::new_owned_initialized(
-                ..,
-                SsTableView::identity(sst),
-                Arc::clone(&table_store),
-                sst_iter_options,
-            )
-            .await
+            let iter = if let Some(scope) = nested_scope {
+                SstIterator::new_owned_initialized_scoped(
+                    ..,
+                    SsTableView::identity(sst),
+                    Arc::clone(&table_store),
+                    sst_iter_options,
+                    scope,
+                )
+                .await
+            } else {
+                SstIterator::new_owned_initialized(
+                    ..,
+                    SsTableView::identity(sst),
+                    Arc::clone(&table_store),
+                    sst_iter_options,
+                )
+                .await
+            }
             .map_err(RuntimeWalReplayError::Replay)?;
             Ok(iter.map(|iter| RuntimeWalIdAndIter {
                 wal_id,
                 iter: Box::new(iter) as Box<dyn RowEntryIterator + 'static>,
             }))
-        }));
+        };
+        let handle = if let Some(scope) = task_scope.as_ref() {
+            scope.spawn(task)
+        } else {
+            task::spawn(task)
+        };
+        self.next_iters.push_back(handle);
         true
     }
 
@@ -769,6 +798,18 @@ impl ExactWalReplayIterator {
         Ok(replay_iter)
     }
 
+    fn spawn_fetch<F, T>(&self, task: F) -> JoinHandle<T>
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        if let Some(scope) = self.options.task_scope.as_ref() {
+            scope.spawn(task)
+        } else {
+            tokio::spawn(task)
+        }
+    }
+
     fn fill_prefetch(&mut self) {
         while self.pending_fetches.len() < self.options.prefetch.max_concurrent_objects {
             if self.next_wal_id >= self.wal_id_range.end {
@@ -802,15 +843,14 @@ impl ExactWalReplayIterator {
                     .expect("an oversized planned WAL must have a listed size");
                 self.listed_sizes.pop_front();
                 self.next_wal_id += 1;
-                self.pending_fetches.push_back(PendingWal {
-                    wal_id,
-                    handle: tokio::spawn(async move {
-                        Ok(FetchedWal::Ranged {
-                            wal_id,
-                            expected_size,
-                        })
-                    }),
+                let handle = self.spawn_fetch(async move {
+                    Ok(FetchedWal::Ranged {
+                        wal_id,
+                        expected_size,
+                    })
                 });
+                self.pending_fetches
+                    .push_back(PendingWal { wal_id, handle });
                 self.peak_concurrent_objects =
                     self.peak_concurrent_objects.max(self.pending_fetches.len());
                 continue;
@@ -826,7 +866,7 @@ impl ExactWalReplayIterator {
             }
             self.next_wal_id += 1;
             let table_store = Arc::clone(&self.table_store);
-            let handle = tokio::spawn(async move {
+            let handle = self.spawn_fetch(async move {
                 match table_store
                     .read_wal_sst_bytes(plan.wal_id, plan.expected_size, byte_limit)
                     .await
