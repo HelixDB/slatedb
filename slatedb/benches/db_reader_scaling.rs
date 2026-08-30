@@ -1,3 +1,11 @@
+// Benchmarks intentionally use wall-clock timing, unique object-store namespaces, and stdout
+// result records. Those operations are forbidden in library code but are the benchmark contract.
+#![allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    clippy::disallowed_types
+)]
+
 //! End-to-end scaling benchmarks for reader-backed snapshots and incremental WAL replay.
 //!
 //! This target deliberately uses fixed repetitions instead of Criterion's adaptive
