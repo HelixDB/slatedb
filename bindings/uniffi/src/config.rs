@@ -534,6 +534,7 @@ impl From<GarbageCollectorOptions> for slatedb::config::GarbageCollectorOptions 
 #[cfg(test)]
 mod tests {
     use super::{GarbageCollectorOptions, ReaderOptions};
+    use std::time::Duration;
 
     #[test]
     fn boundary_files_are_enabled_by_default() {
