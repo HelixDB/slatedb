@@ -152,6 +152,7 @@ fn writer_settings() -> Settings {
 fn quiet_reader_options(max_memtable_bytes: u64) -> DbReaderOptions {
     DbReaderOptions {
         manifest_poll_interval: Duration::from_secs(60 * 60),
+        wal_poll_interval: Duration::from_secs(60 * 60),
         checkpoint_lifetime: Duration::from_secs(3 * 60 * 60),
         max_memtable_bytes,
         ..DbReaderOptions::default()
@@ -164,6 +165,7 @@ fn polling_reader_options(
 ) -> DbReaderOptions {
     DbReaderOptions {
         manifest_poll_interval: POLL_INTERVAL,
+        wal_poll_interval: POLL_INTERVAL,
         checkpoint_lifetime,
         max_memtable_bytes,
         ..DbReaderOptions::default()
