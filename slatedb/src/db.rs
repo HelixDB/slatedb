@@ -174,7 +174,13 @@ impl DbInner {
             merge_operator.clone(),
         );
 
-        let txn_manager = Arc::new(TransactionManager::new(oracle.clone(), rand.clone()));
+        let txn_manager = Arc::new(TransactionManager::new_with_limits(
+            oracle.clone(),
+            rand.clone(),
+            settings.max_transaction_conflict_metadata_bytes,
+            settings.max_retained_conflict_metadata_bytes,
+            &db_stats,
+        ));
         let snapshot_manager = Arc::new(SnapshotManager::new(oracle.clone(), rand.clone()));
         let wal_observer = DbWalObserver::new(
             wal_observer,
@@ -7333,6 +7339,10 @@ mod tests {
             garbage_collector_options: None,
             metric_level: MetricLevel::default(),
             default_ttl: ttl,
+            max_transaction_conflict_metadata_bytes:
+                crate::config::DEFAULT_MAX_TRANSACTION_CONFLICT_METADATA_BYTES,
+            max_retained_conflict_metadata_bytes:
+                crate::config::DEFAULT_MAX_RETAINED_CONFLICT_METADATA_BYTES,
             object_store_max_retries: None,
             block_format: None,
         }

@@ -509,6 +509,44 @@ pub trait DbTransactionOps: DbReadOps {
         self.merge(key, operand)
     }
 
+    /// Buffers a merge operand that is compatible only with concurrent merges
+    /// whose logical discriminator sets are disjoint.
+    ///
+    /// See [`DbTransaction::merge_disjoint`](crate::DbTransaction::merge_disjoint)
+    /// for the caller contract. The default implementation conservatively
+    /// delegates to [`Self::merge`].
+    fn merge_disjoint<K, V, D, I>(
+        &self,
+        key: K,
+        _discriminators: I,
+        operand: V,
+    ) -> Result<(), crate::Error>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+        D: AsRef<[u8]>,
+        I: IntoIterator<Item = D>,
+    {
+        self.merge(key, operand)
+    }
+
+    /// Fixed-width equivalent of [`Self::merge_disjoint`].
+    ///
+    /// The default remains exclusive for third-party implementations.
+    fn merge_disjoint_tokens<K, V, I>(
+        &self,
+        key: K,
+        _tokens: I,
+        operand: V,
+    ) -> Result<(), crate::Error>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+        I: IntoIterator<Item = u128>,
+    {
+        self.merge(key, operand)
+    }
+
     /// Merge a key-value pair into the transaction with custom `MergeOptions`.
     ///
     /// ## Errors

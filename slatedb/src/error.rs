@@ -71,6 +71,9 @@ pub(crate) enum SlateDBError {
     #[allow(unused)]
     InvalidDeletion,
 
+    #[error("disjoint merge batch contains duplicate key {key:?}")]
+    DuplicateDisjointMergeKey { key: Bytes },
+
     #[error("invalid sst error")]
     InvalidFlatbuffer(#[from] flatbuffers::InvalidFlatbuffer),
 
@@ -297,6 +300,11 @@ pub(crate) enum SlateDBError {
     #[error("transaction conflict")]
     TransactionConflict,
 
+    #[error(
+        "transaction conflict metadata limit exceeded: requested={requested} bytes, limit={limit} bytes"
+    )]
+    ConflictMetadataLimitExceeded { requested: usize, limit: usize },
+
     #[error("iterator not initialized")]
     IteratorNotInitialized,
 
@@ -506,6 +514,9 @@ pub enum ErrorKind {
 pub enum ErrorCode {
     /// A reader cannot open because no database manifest exists.
     DatabaseMissing,
+
+    /// Transaction conflict metadata exceeded its configured hard limit.
+    ConflictMetadataLimitExceeded,
 }
 
 impl From<ErrorKind> for CloseReason {
@@ -728,9 +739,13 @@ impl From<SlateDBError> for Error {
             SlateDBError::EmptySegmentPrefix { .. } => Error::invalid(msg),
             SlateDBError::InvalidClockTick { .. } => Error::invalid(msg),
             SlateDBError::InvalidDeletion => Error::invalid(msg),
+            SlateDBError::DuplicateDisjointMergeKey { .. } => Error::invalid(msg),
             SlateDBError::MergeOperatorError(err) => Error::invalid(msg).with_source(Box::new(err)),
             SlateDBError::MergeOperatorMissing => Error::invalid(msg),
             SlateDBError::IncompatibleMergeTtls { .. } => Error::invalid(msg),
+            SlateDBError::ConflictMetadataLimitExceeded { .. } => {
+                Error::invalid(msg).with_code(ErrorCode::ConflictMetadataLimitExceeded)
+            }
             SlateDBError::IteratorNotInitialized => Error::invalid(msg),
             SlateDBError::InvalidSequenceOrder { .. } => Error::invalid(msg),
             SlateDBError::InvalidEnvironmentVariable { .. } => Error::invalid(msg),

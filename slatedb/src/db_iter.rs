@@ -259,15 +259,18 @@ impl DbIterator {
         };
 
         if let Some(merge_operator) = merge_operator {
-            iter = Box::new(MergeOperatorIterator::new(
-                merge_operator,
-                iter,
-                true,
-                // Its important not to set a snapshot seq num barrier for this merge iterator
-                // The entries in the write batch iterator have seq num u64::MAX and any merges
-                // there need to be merged with the entries from the other iterators.
-                None,
-            ));
+            iter = Box::new(
+                MergeOperatorIterator::new(
+                    merge_operator,
+                    iter,
+                    true,
+                    // Its important not to set a snapshot seq num barrier for this merge iterator
+                    // The entries in the write batch iterator have seq num u64::MAX and any merges
+                    // there need to be merged with the entries from the other iterators.
+                    None,
+                )
+                .with_resolved_missing_base(),
+            );
         } else {
             // When no merge operator is configured, wrap with iterator that errors on merge operands
             iter = Box::new(MergeOperatorRequiredIterator::new(iter));
