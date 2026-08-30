@@ -1,3 +1,7 @@
+// Benchmarks intentionally use unique object-store namespaces and stdout result records. Those
+// operations are forbidden in library code but are the benchmark contract.
+#![allow(clippy::disallowed_macros, clippy::disallowed_methods)]
+
 //! Heap-memory scaling benchmarks for DbReader snapshots and incremental WAL replay.
 //!
 //! This is separate from `db_reader_scaling` because its global allocator performs
