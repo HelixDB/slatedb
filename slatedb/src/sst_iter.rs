@@ -18,6 +18,7 @@ use crate::filter_policy::{FilterContext, FilterQuery, NamedFilter};
 use crate::flatbuffer_types::SsTableIndexOwned;
 use crate::format::block::Block;
 use crate::prefix_extractor::PrefixTarget;
+use crate::replay_task_scope::ReplayTaskScope;
 use crate::{
     iter::{IterationOrder, RowEntryIterator},
     partitioned_keyspace,
@@ -29,6 +30,14 @@ use crate::{
 enum FetchTask {
     InFlight(JoinHandle<Result<VecDeque<Arc<Block>>, SlateDBError>>),
     Finished(VecDeque<Arc<Block>>),
+}
+
+impl Drop for FetchTask {
+    fn drop(&mut self) {
+        if let Self::InFlight(handle) = self {
+            handle.abort();
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -279,6 +288,7 @@ pub(crate) struct InternalSstIterator<'a> {
     fetch_tasks: VecDeque<FetchTask>,
     table_store: Arc<TableStore>,
     options: SstIteratorOptions,
+    replay_tasks: Option<ReplayTaskScope>,
     /// Buffer for descending iteration to maintain correct sequence order within keys.
     descending_buffer: Option<VecDeque<RowEntry>>,
     /// Pending entry that was read ahead but belongs to the next key group.
@@ -291,6 +301,15 @@ impl<'a> InternalSstIterator<'a> {
         view: SstView<'a>,
         table_store: Arc<TableStore>,
         options: SstIteratorOptions,
+    ) -> Result<Self, SlateDBError> {
+        Self::new_scoped(view, table_store, options, None)
+    }
+
+    fn new_scoped(
+        view: SstView<'a>,
+        table_store: Arc<TableStore>,
+        options: SstIteratorOptions,
+        replay_tasks: Option<ReplayTaskScope>,
     ) -> Result<Self, SlateDBError> {
         assert!(options.max_fetch_tasks > 0);
         assert!(options.blocks_to_fetch > 0);
@@ -309,6 +328,7 @@ impl<'a> InternalSstIterator<'a> {
             fetch_tasks: VecDeque::new(),
             table_store,
             options,
+            replay_tasks,
             descending_buffer,
             pending_entry: None,
         })
@@ -333,6 +353,20 @@ impl<'a> InternalSstIterator<'a> {
         };
         let view = SstView::Owned(Box::new(table), view_range);
         Self::new(view, table_store, options).map(Some)
+    }
+
+    fn new_owned_scoped<T: RangeBounds<Bytes>>(
+        range: T,
+        table: SsTableView,
+        table_store: Arc<TableStore>,
+        options: SstIteratorOptions,
+        replay_tasks: ReplayTaskScope,
+    ) -> Result<Option<Self>, SlateDBError> {
+        let Some(view_range) = table.calculate_view_range(BytesRange::from(range)) else {
+            return Ok(None);
+        };
+        let view = SstView::Owned(Box::new(table), view_range);
+        Self::new_scoped(view, table_store, options, Some(replay_tasks)).map(Some)
     }
 
     fn new_borrowed<T: RangeBounds<Bytes>>(
@@ -391,17 +425,22 @@ impl<'a> InternalSstIterator<'a> {
                     let blocks_end = self.next_block_idx_to_fetch + blocks_to_fetch;
                     let index = index.clone();
                     let cache_blocks = self.options.cache_blocks;
-                    self.fetch_tasks
-                        .push_back(FetchTask::InFlight(tokio::spawn(async move {
-                            table_store
-                                .read_blocks_using_index(
-                                    &table,
-                                    index,
-                                    blocks_start..blocks_end,
-                                    cache_blocks,
-                                )
-                                .await
-                        })));
+                    let task = async move {
+                        table_store
+                            .read_blocks_using_index(
+                                &table,
+                                index,
+                                blocks_start..blocks_end,
+                                cache_blocks,
+                            )
+                            .await
+                    };
+                    let task = if let Some(scope) = self.replay_tasks.as_ref() {
+                        scope.spawn(task)
+                    } else {
+                        tokio::spawn(task)
+                    };
+                    self.fetch_tasks.push_back(FetchTask::InFlight(task));
                     self.next_block_idx_to_fetch = blocks_end;
                 }
             }
@@ -420,17 +459,22 @@ impl<'a> InternalSstIterator<'a> {
                     let blocks_start = blocks_end - blocks_to_fetch;
                     let index = index.clone();
                     let cache_blocks = self.options.cache_blocks;
-                    self.fetch_tasks
-                        .push_back(FetchTask::InFlight(tokio::spawn(async move {
-                            table_store
-                                .read_blocks_using_index(
-                                    &table,
-                                    index,
-                                    blocks_start..blocks_end,
-                                    cache_blocks,
-                                )
-                                .await
-                        })));
+                    let task = async move {
+                        table_store
+                            .read_blocks_using_index(
+                                &table,
+                                index,
+                                blocks_start..blocks_end,
+                                cache_blocks,
+                            )
+                            .await
+                    };
+                    let task = if let Some(scope) = self.replay_tasks.as_ref() {
+                        scope.spawn(task)
+                    } else {
+                        tokio::spawn(task)
+                    };
+                    self.fetch_tasks.push_back(FetchTask::InFlight(task));
                     self.next_block_idx_to_fetch = blocks_start;
                 }
             }
@@ -916,6 +960,40 @@ impl<'a> SstIterator<'a> {
         Self::new_owned_initialized_with_stats(range, table, table_store, options, None).await
     }
 
+    pub(crate) async fn new_owned_initialized_scoped<T: RangeBounds<Bytes>>(
+        range: T,
+        table: SsTableView,
+        table_store: Arc<TableStore>,
+        options: SstIteratorOptions,
+        replay_tasks: ReplayTaskScope,
+    ) -> Result<Option<Self>, SlateDBError> {
+        let internal = InternalSstIterator::new_owned_scoped(
+            range,
+            table,
+            table_store,
+            options,
+            replay_tasks,
+        )?;
+        match internal {
+            Some(inner) => {
+                let mut iterator = Self::from_internal(inner, None);
+                match &mut iterator.delegate {
+                    SstIteratorDelegate::Filter(filter_iter) => {
+                        filter_iter.init().await?;
+                        if filter_iter.is_filtered_out() {
+                            return Ok(None);
+                        }
+                    }
+                    SstIteratorDelegate::Direct(inner_iter) => {
+                        inner_iter.init().await?;
+                    }
+                }
+                Ok(Some(iterator))
+            }
+            None => Ok(None),
+        }
+    }
+
     pub(crate) async fn new_owned_initialized_with_stats<T: RangeBounds<Bytes>>(
         range: T,
         table: SsTableView,
@@ -1104,7 +1182,40 @@ mod tests {
     use slatedb_common::metrics::{
         lookup_metric_with_labels, DefaultMetricsRecorder, MetricLevel, MetricsRecorderHelper,
     };
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    struct FetchCancellationProbe(Arc<AtomicBool>);
+
+    impl Drop for FetchCancellationProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_an_in_flight_fetch_aborts_and_joins_its_scoped_task() {
+        let scope = ReplayTaskScope::new();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let probe = Arc::clone(&cancelled);
+        let handle = scope.spawn(async move {
+            let _probe = FetchCancellationProbe(probe);
+            std::future::pending::<Result<VecDeque<Arc<Block>>, SlateDBError>>().await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(scope.active_tasks(), 1);
+
+        drop(FetchTask::InFlight(handle));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !cancelled.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped block fetch remained detached");
+        scope.shutdown().await;
+        assert_eq!(scope.active_tasks(), 0);
+    }
 
     #[tokio::test]
     async fn test_one_block_sst_iter() {

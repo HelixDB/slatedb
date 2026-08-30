@@ -529,6 +529,7 @@ impl DbInner {
             max_memtable_bytes: self.settings.l0_sst_size_bytes,
             min_seq: None,
             source: ExactWalReplaySource::WriterOpen,
+            task_scope: None,
         };
 
         let db_state = self.state.read().state().core().clone();

@@ -1113,6 +1113,9 @@ pub(crate) struct GatedObjectStore {
     pub(crate) put_multipart_opts_gate: Gate,
     pub(crate) copy_gate: Gate,
     pub(crate) rename_gate: Gate,
+    /// Gates each path emitted by LIST operations. Per-item gating also lets
+    /// tests observe cancellation while a list stream is being consumed.
+    pub(crate) list_gate: Arc<Gate>,
     /// Gates each path emitted by `delete_stream`. Per-item gating preserves
     /// the pre-0.13 single-call `delete` semantics now that callers go through
     /// `ObjectStoreExt::delete`, which fans out into `delete_stream`.
@@ -1129,6 +1132,7 @@ impl GatedObjectStore {
             put_multipart_opts_gate: Gate::default(),
             copy_gate: Gate::default(),
             rename_gate: Gate::default(),
+            list_gate: Arc::new(Gate::default()),
             delete_stream_gate: Arc::new(Gate::default()),
         }
     }
@@ -1193,7 +1197,17 @@ impl ObjectStore for GatedObjectStore {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-        self.inner.list(prefix)
+        let gate = Arc::clone(&self.list_gate);
+        self.inner
+            .list(prefix)
+            .then(move |result| {
+                let gate = Arc::clone(&gate);
+                async move {
+                    gate.wait().await?;
+                    result
+                }
+            })
+            .boxed()
     }
 
     fn list_with_offset(
@@ -1201,7 +1215,17 @@ impl ObjectStore for GatedObjectStore {
         prefix: Option<&Path>,
         offset: &Path,
     ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-        self.inner.list_with_offset(prefix, offset)
+        let gate = Arc::clone(&self.list_gate);
+        self.inner
+            .list_with_offset(prefix, offset)
+            .then(move |result| {
+                let gate = Arc::clone(&gate);
+                async move {
+                    gate.wait().await?;
+                    result
+                }
+            })
+            .boxed()
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {

@@ -160,6 +160,7 @@ mod peeking_iterator;
 #[cfg(test)]
 mod proptest_util;
 mod reader;
+mod replay_task_scope;
 mod retention_iterator;
 mod retrying_object_store;
 mod segment_iterator;

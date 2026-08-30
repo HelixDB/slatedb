@@ -19,6 +19,7 @@ use crate::oracle::DbReaderOracle;
 use crate::paths::PathResolver;
 use crate::prefix_extractor::PrefixExtractor;
 use crate::reader::{DbStateReader, Reader, ScanContext};
+use crate::replay_task_scope::ReplayTaskScope;
 use crate::tablestore::TableStore;
 use crate::types::KeyValue;
 use crate::utils::{panic_string, IdGenerator};
@@ -107,6 +108,8 @@ pub(crate) struct DbReaderInner {
     status_manager: DbStatusManager,
     segment_extractor: Option<Arc<dyn PrefixExtractor>>,
     rand: Arc<DbRand>,
+    /// Root ownership scope for every replay task in this reader tenure.
+    replay_tasks: ReplayTaskScope,
     /// Kept alive so the underlying `MetricsRecorder` is not dropped while
     /// metric handles in `DbStats` (and other stats structs) are still in use.
     /// See: https://github.com/slatedb/slatedb/issues/1469
@@ -119,6 +122,7 @@ enum DbReaderMessage {
     PollWalTail,
     ContinueWalTail,
     WalTailComplete(Result<RuntimeReplayTurn, SlateDBError>),
+    ManifestRefreshComplete(Result<Option<ManifestRefreshCandidate>, SlateDBError>),
 }
 
 impl std::fmt::Debug for DbReaderMessage {
@@ -129,6 +133,9 @@ impl std::fmt::Debug for DbReaderMessage {
             Self::ContinueWalTail => "ContinueWalTail",
             Self::WalTailComplete(Ok(_)) => "WalTailComplete(Ok)",
             Self::WalTailComplete(Err(_)) => "WalTailComplete(Err)",
+            Self::ManifestRefreshComplete(Ok(Some(_))) => "ManifestRefreshComplete(Ok(Some))",
+            Self::ManifestRefreshComplete(Ok(None)) => "ManifestRefreshComplete(Ok(None))",
+            Self::ManifestRefreshComplete(Err(_)) => "ManifestRefreshComplete(Err)",
         })
     }
 }
@@ -156,6 +163,12 @@ struct RuntimeReplayTurn {
     last_committed_seq: u64,
     caught_up: bool,
     reached_turn_limit: bool,
+}
+
+struct ManifestRefreshCandidate {
+    base_manifest_id: u64,
+    base_last_wal_id: u64,
+    state: ReaderState,
 }
 
 #[derive(Clone)]
@@ -412,6 +425,7 @@ impl DbReaderInner {
         let include_unmanifested =
             !matches!(mode, DbReaderMode::Checkpoint(_)) && !options.skip_wal_replay;
         let db_stats = DbStats::new(&recorder);
+        let replay_tasks = ReplayTaskScope::new();
         let initial_state = Arc::new(
             Self::build_reader_state(
                 checkpoint,
@@ -427,6 +441,8 @@ impl DbReaderInner {
                 segment_extractor.as_ref(),
                 None,
                 &db_stats,
+                Some(replay_tasks.clone()),
+                &system_clock,
             )
             .await?,
         );
@@ -473,6 +489,7 @@ impl DbReaderInner {
             status_manager,
             segment_extractor,
             rand,
+            replay_tasks,
             recorder,
         };
         Ok(inner)
@@ -713,6 +730,26 @@ impl DbReaderInner {
         replay_path: ReaderReplayPath,
     ) -> Result<ReaderState, SlateDBError> {
         let prior = self.state.read().clone();
+        self.rebuild_state_from(
+            prior,
+            checkpoint,
+            manifest_id,
+            manifest,
+            replay_path,
+            self.replay_tasks.clone(),
+        )
+        .await
+    }
+
+    async fn rebuild_state_from(
+        &self,
+        prior: Arc<ReaderState>,
+        checkpoint: Option<Checkpoint>,
+        manifest_id: u64,
+        manifest: Manifest,
+        replay_path: ReaderReplayPath,
+        replay_tasks: ReplayTaskScope,
+    ) -> Result<ReaderState, SlateDBError> {
         let replay_cursor = Some((
             prior.last_wal_id.max(manifest.core.replay_after_wal_id),
             prior
@@ -757,8 +794,39 @@ impl DbReaderInner {
             self.segment_extractor.as_ref(),
             replay_cursor,
             &self.db_stats,
+            Some(replay_tasks),
+            &self.system_clock,
         )
         .await
+    }
+
+    async fn build_latest_manifest_candidate(
+        &self,
+        base: Arc<ReaderState>,
+        replay_tasks: ReplayTaskScope,
+    ) -> Result<Option<ManifestRefreshCandidate>, SlateDBError> {
+        let latest_manifest = self.manifest_store.read_latest_manifest().await?;
+        if latest_manifest.id <= base.generation.manifest_id {
+            return Ok(None);
+        }
+
+        let base_manifest_id = base.generation.manifest_id;
+        let base_last_wal_id = base.last_wal_id;
+        let state = self
+            .rebuild_state_from(
+                base,
+                None,
+                latest_manifest.id,
+                latest_manifest.manifest,
+                ReaderReplayPath::RuntimeManifest,
+                replay_tasks,
+            )
+            .await?;
+        Ok(Some(ManifestRefreshCandidate {
+            base_manifest_id,
+            base_last_wal_id,
+            state,
+        }))
     }
 
     async fn build_reader_state(
@@ -772,6 +840,8 @@ impl DbReaderInner {
         segment_extractor: Option<&Arc<dyn PrefixExtractor>>,
         replay_cursor: Option<(u64, u64)>,
         db_stats: &DbStats,
+        replay_tasks: Option<ReplayTaskScope>,
+        system_clock: &Arc<dyn SystemClock>,
     ) -> Result<ReaderState, SlateDBError> {
         let (last_wal_id, last_committed_seq) = match replay_path {
             ReaderReplayPath::ExactOpen {
@@ -789,6 +859,7 @@ impl DbReaderInner {
                     segment_extractor,
                     None,
                     Some(db_stats),
+                    replay_tasks.clone(),
                 )
                 .await?
             }
@@ -801,6 +872,8 @@ impl DbReaderInner {
                     replay_cursor,
                     segment_extractor,
                     Some(db_stats),
+                    replay_tasks,
+                    system_clock,
                 )
                 .await?
             }
@@ -818,11 +891,7 @@ impl DbReaderInner {
         })
     }
 
-    async fn refresh_latest_manifest(&self) -> Result<(), SlateDBError> {
-        let latest_manifest = self.manifest_store.read_latest_manifest().await?;
-        self.apply_latest_manifest(latest_manifest).await
-    }
-
+    #[cfg(test)]
     async fn apply_latest_manifest(
         &self,
         latest_manifest: VersionedManifest,
@@ -941,6 +1010,7 @@ impl DbReaderInner {
             segment_extractor,
             publish,
             db_stats,
+            None,
         )
         .await
     }
@@ -956,6 +1026,7 @@ impl DbReaderInner {
         segment_extractor: Option<&Arc<dyn PrefixExtractor>>,
         mut publish: Option<ReplayPublisher<'_>>,
         db_stats: Option<&DbStats>,
+        replay_tasks: Option<ReplayTaskScope>,
     ) -> Result<(u64, u64), SlateDBError> {
         let (mut replay_after_wal_id, mut last_committed_seq) =
             replay_cursor.unwrap_or_else(|| {
@@ -968,7 +1039,21 @@ impl DbReaderInner {
                     (core.replay_after_wal_id, core.last_l0_seq)
                 }
             });
+        let replay_list_counter = db_stats.map(|stats| match source {
+            ExactWalReplaySource::ReaderOpen => {
+                Arc::clone(&stats.reader_wal_replay_list_reader_open)
+            }
+            ExactWalReplaySource::CheckpointRecovery => {
+                Arc::clone(&stats.reader_wal_replay_list_checkpoint_recovery)
+            }
+            ExactWalReplaySource::WriterOpen => {
+                unreachable!("writer replay does not use DbReader metrics")
+            }
+        });
         let wal_id_end = if replay_new_wals {
+            if let Some(counter) = replay_list_counter.as_ref() {
+                counter.increment(1);
+            }
             table_store.last_seen_wal_id(replay_after_wal_id).await? + 1
         } else {
             core.next_wal_sst_id
@@ -980,8 +1065,12 @@ impl DbReaderInner {
             // Skip entries that we already have in `imm_memtable` (that might be above last_l0_seq).
             min_seq: Some(last_committed_seq),
             source,
+            task_scope: replay_tasks,
         };
 
+        if let Some(counter) = replay_list_counter {
+            counter.increment(1);
+        }
         let mut replay_iter = ExactWalReplayIterator::range(
             (replay_after_wal_id + 1)..wal_id_end,
             core,
@@ -1042,26 +1131,73 @@ impl DbReaderInner {
         replay_cursor: Option<(u64, u64)>,
         segment_extractor: Option<&Arc<dyn PrefixExtractor>>,
         db_stats: Option<&DbStats>,
+        replay_tasks: Option<ReplayTaskScope>,
+        system_clock: &Arc<dyn SystemClock>,
     ) -> Result<(u64, u64), SlateDBError> {
         let mut replay_cursor =
             replay_cursor.unwrap_or((core.replay_after_wal_id, core.last_l0_seq));
-        let start = replay_cursor.0.saturating_add(1);
-        Self::replay_runtime_range_into(
-            table_store,
-            reader_options,
-            core,
-            into_tables,
-            &mut replay_cursor,
-            start..core.next_wal_sst_id,
-            RuntimeMissingPolicy::Error,
-            segment_extractor,
-            db_stats,
-            None,
-        )
-        .await?;
+        while replay_cursor.0.saturating_add(1) < core.next_wal_sst_id {
+            let start = replay_cursor.0.saturating_add(1);
+            let deadline = system_clock.now() + MAX_RUNTIME_REPLAY_TURN_TIME;
+            let completed_before = replay_cursor.0;
+            let mut replay = RuntimeWalReplayIterator::range(
+                start..core.next_wal_sst_id,
+                core,
+                RuntimeWalReplayOptions {
+                    max_memtable_bytes: reader_options.max_memtable_bytes as usize,
+                    min_seq: Some(replay_cursor.1),
+                    max_wals_per_batch: std::num::NonZeroUsize::new(
+                        usize::try_from(MAX_RUNTIME_WALS_PER_TURN)
+                            .expect("runtime WAL turn limit must fit usize"),
+                    ),
+                    source: RuntimeWalReplaySource::Manifest,
+                    task_scope: replay_tasks.clone(),
+                    ..RuntimeWalReplayOptions::default()
+                },
+                Arc::clone(&table_store),
+            )?;
+
+            loop {
+                let completed_wals = replay_cursor.0.saturating_sub(completed_before);
+                if completed_wals >= MAX_RUNTIME_WALS_PER_TURN {
+                    break;
+                }
+                let remaining = deadline
+                    .signed_duration_since(system_clock.now())
+                    .to_std()
+                    .unwrap_or(std::time::Duration::ZERO);
+                let replayed = tokio::select! {
+                    biased;
+                    _ = system_clock.sleep(remaining) => break,
+                    result = replay.next() => result,
+                };
+                if system_clock.now() >= deadline {
+                    break;
+                }
+                let replayed_table = match replayed {
+                    Ok(Some(table)) => table,
+                    Ok(None) => break,
+                    Err(RuntimeWalReplayError::MissingInitialObject { source, .. })
+                    | Err(RuntimeWalReplayError::Replay(source)) => return Err(source),
+                };
+                Self::apply_runtime_replayed_table(
+                    replayed_table,
+                    into_tables,
+                    &mut replay_cursor,
+                    segment_extractor,
+                    db_stats,
+                )?;
+            }
+            drop(replay);
+
+            if replay_cursor.0.saturating_add(1) < core.next_wal_sst_id {
+                tokio::task::yield_now().await;
+            }
+        }
         Ok(replay_cursor)
     }
 
+    #[cfg(test)]
     async fn replay_runtime_range_into(
         table_store: Arc<TableStore>,
         reader_options: &DbReaderOptions,
@@ -1073,6 +1209,7 @@ impl DbReaderInner {
         segment_extractor: Option<&Arc<dyn PrefixExtractor>>,
         db_stats: Option<&DbStats>,
         max_wals_per_batch: Option<std::num::NonZeroUsize>,
+        replay_tasks: Option<ReplayTaskScope>,
     ) -> Result<bool, SlateDBError> {
         let mut replay = RuntimeWalReplayIterator::range(
             wal_range,
@@ -1084,6 +1221,7 @@ impl DbReaderInner {
                 source: max_wals_per_batch.map_or(RuntimeWalReplaySource::Manifest, |_| {
                     RuntimeWalReplaySource::Tail
                 }),
+                task_scope: replay_tasks,
                 ..RuntimeWalReplayOptions::default()
             },
             table_store,
@@ -1153,6 +1291,7 @@ impl DbReaderInner {
     async fn replay_runtime_turn(
         inner: Arc<Self>,
         base: Arc<ReaderState>,
+        replay_tasks: ReplayTaskScope,
     ) -> Result<RuntimeReplayTurn, SlateDBError> {
         let manifest_id = base.generation.manifest_id;
         let base_last_wal_id = base.last_wal_id;
@@ -1196,6 +1335,7 @@ impl DbReaderInner {
                     min_seq: Some(cursor.1),
                     max_wals_per_batch: std::num::NonZeroUsize::new(1),
                     source: RuntimeWalReplaySource::Tail,
+                    task_scope: Some(replay_tasks.clone()),
                     ..RuntimeWalReplayOptions::default()
                 },
                 Arc::clone(&inner.table_store),
@@ -1308,6 +1448,10 @@ struct ManifestPoller {
     tail_in_flight: bool,
     continuation_queued: bool,
     tail_task: Option<tokio::task::JoinHandle<()>>,
+    tail_scope: Option<ReplayTaskScope>,
+    manifest_refresh_in_flight: bool,
+    manifest_refresh_task: Option<tokio::task::JoinHandle<()>>,
+    manifest_refresh_scope: Option<ReplayTaskScope>,
 }
 
 impl ManifestPoller {
@@ -1333,6 +1477,10 @@ impl ManifestPoller {
             tail_in_flight: false,
             continuation_queued: false,
             tail_task: None,
+            tail_scope: None,
+            manifest_refresh_in_flight: false,
+            manifest_refresh_task: None,
+            manifest_refresh_scope: None,
         };
         poller.report_active_checkpoints();
         poller
@@ -1344,7 +1492,8 @@ impl ManifestPoller {
     }
 
     fn start_runtime_tail(&mut self) {
-        if self.tail_in_flight || !self.runtime_tailing_enabled() {
+        if self.tail_in_flight || self.manifest_refresh_in_flight || !self.runtime_tailing_enabled()
+        {
             return;
         }
         self.tail_in_flight = true;
@@ -1352,10 +1501,18 @@ impl ManifestPoller {
         let inner = Arc::clone(&self.inner);
         let base = Arc::clone(&inner.state.read());
         let sender = self.tail_tx.clone();
-        self.tail_task = Some(tokio::spawn(async move {
-            let replay = AssertUnwindSafe(DbReaderInner::replay_runtime_turn(inner, base))
-                .catch_unwind()
-                .await;
+        let scope = inner.replay_tasks.child();
+        let replay_scope = scope.clone();
+        self.tail_task = Some(scope.spawn(async move {
+            let replay = tokio::select! {
+                biased;
+                _ = replay_scope.cancelled() => return,
+                replay = AssertUnwindSafe(DbReaderInner::replay_runtime_turn(
+                    inner,
+                    base,
+                    replay_scope.clone(),
+                )).catch_unwind() => replay,
+            };
             let result = match replay {
                 Ok(result) => result,
                 Err(panic) => {
@@ -1370,6 +1527,44 @@ impl ManifestPoller {
             };
             let _ = sender.send(DbReaderMessage::WalTailComplete(result)).await;
         }));
+        self.tail_scope = Some(scope);
+    }
+
+    fn start_manifest_refresh(&mut self) {
+        if self.manifest_refresh_in_flight {
+            return;
+        }
+        self.manifest_refresh_in_flight = true;
+        let inner = Arc::clone(&self.inner);
+        let base = Arc::clone(&inner.state.read());
+        let sender = self.tail_tx.clone();
+        let scope = inner.replay_tasks.child();
+        let replay_scope = scope.clone();
+        self.manifest_refresh_task = Some(scope.spawn(async move {
+            let result = tokio::select! {
+                biased;
+                _ = replay_scope.cancelled() => return,
+                result = AssertUnwindSafe(inner.build_latest_manifest_candidate(
+                    base,
+                    replay_scope.clone(),
+                )).catch_unwind() => match result {
+                    Ok(result) => result,
+                    Err(panic) => {
+                        let task_name = "reader_manifest_wal_replay".to_string();
+                        error!(
+                            "manifest WAL replay task panicked [task_name={}, panic={}]",
+                            task_name,
+                            panic_string(&panic),
+                        );
+                        Err(SlateDBError::BackgroundTaskPanic(task_name))
+                    }
+                },
+            };
+            let _ = sender
+                .send(DbReaderMessage::ManifestRefreshComplete(result))
+                .await;
+        }));
+        self.manifest_refresh_scope = Some(scope);
     }
 
     fn schedule_tail_continuation(&mut self) {
@@ -1380,9 +1575,72 @@ impl ManifestPoller {
         let _ = self.tail_tx.try_send(DbReaderMessage::ContinueWalTail);
     }
 
-    fn apply_runtime_tail(&mut self, turn: RuntimeReplayTurn) {
+    async fn finish_tail_task(&mut self) {
+        if let Some(task) = self.tail_task.take() {
+            let _ = task.await;
+        }
+        if let Some(scope) = self.tail_scope.take() {
+            scope.shutdown().await;
+        }
+    }
+
+    async fn cancel_tail_task(&mut self) {
+        if let Some(scope) = self.tail_scope.as_ref() {
+            scope.cancel();
+        }
+        if let Some(task) = self.tail_task.as_ref() {
+            task.abort();
+        }
+        self.finish_tail_task().await;
         self.tail_in_flight = false;
-        self.tail_task.take();
+    }
+
+    async fn finish_manifest_refresh_task(&mut self) {
+        if let Some(task) = self.manifest_refresh_task.take() {
+            let _ = task.await;
+        }
+        if let Some(scope) = self.manifest_refresh_scope.take() {
+            scope.shutdown().await;
+        }
+    }
+
+    async fn cancel_manifest_refresh_task(&mut self) {
+        if let Some(scope) = self.manifest_refresh_scope.as_ref() {
+            scope.cancel();
+        }
+        if let Some(task) = self.manifest_refresh_task.as_ref() {
+            task.abort();
+        }
+        self.finish_manifest_refresh_task().await;
+        self.manifest_refresh_in_flight = false;
+    }
+
+    async fn apply_manifest_refresh(&mut self, candidate: Option<ManifestRefreshCandidate>) {
+        self.manifest_refresh_in_flight = false;
+        self.finish_manifest_refresh_task().await;
+        let Some(candidate) = candidate else {
+            self.inner.db_stats.reader_manifest_polls.increment(1);
+            self.schedule_tail_continuation();
+            return;
+        };
+        let current = Arc::clone(&self.inner.state.read());
+        if current.generation.manifest_id != candidate.base_manifest_id
+            || current.last_wal_id != candidate.base_last_wal_id
+        {
+            self.start_manifest_refresh();
+            return;
+        }
+
+        let manifest_id = candidate.state.generation.manifest_id;
+        self.inner.install_state(candidate.state);
+        self.inner.db_stats.reader_manifest_polls.increment(1);
+        info!("refreshed reader to latest manifest [manifest_id={manifest_id}]");
+        self.schedule_tail_continuation();
+    }
+
+    async fn apply_runtime_tail(&mut self, turn: RuntimeReplayTurn) {
+        self.tail_in_flight = false;
+        self.finish_tail_task().await;
         let current = Arc::clone(&self.inner.state.read());
         if current.generation.manifest_id != turn.manifest_id
             || current.last_wal_id != turn.base_last_wal_id
@@ -1547,7 +1805,16 @@ impl Notifier<DbReaderMessage> for TailReplayNotifier {
 
 impl Drop for ManifestPoller {
     fn drop(&mut self) {
+        if let Some(scope) = self.tail_scope.take() {
+            scope.cancel();
+        }
         if let Some(task) = self.tail_task.take() {
+            task.abort();
+        }
+        if let Some(scope) = self.manifest_refresh_scope.take() {
+            scope.cancel();
+        }
+        if let Some(task) = self.manifest_refresh_task.take() {
             task.abort();
         }
         // The gauge tracks only GC checkpoints actively managed by this
@@ -1579,6 +1846,15 @@ impl MessageHandler<DbReaderMessage> for ManifestPoller {
     }
 
     async fn handle(&mut self, message: DbReaderMessage) -> Result<(), SlateDBError> {
+        let replay_tasks = self.inner.replay_tasks.clone();
+        tokio::select! {
+            biased;
+            _ = replay_tasks.cancelled() => {
+                self.cancel_tail_task().await;
+                self.cancel_manifest_refresh_task().await;
+                Ok(())
+            }
+            result = async {
         match message {
             DbReaderMessage::PollWalTail | DbReaderMessage::ContinueWalTail => {
                 self.continuation_queued = false;
@@ -1587,7 +1863,20 @@ impl MessageHandler<DbReaderMessage> for ManifestPoller {
             }
             DbReaderMessage::WalTailComplete(result) => {
                 let turn = result?;
-                self.apply_runtime_tail(turn);
+                self.apply_runtime_tail(turn).await;
+                return Ok(());
+            }
+            DbReaderMessage::ManifestRefreshComplete(result) => {
+                match result {
+                    Ok(candidate) => self.apply_manifest_refresh(candidate).await,
+                    Err(error) => {
+                        self.manifest_refresh_in_flight = false;
+                        self.finish_manifest_refresh_task().await;
+                        warn!(
+                            "failed to refresh reader to latest manifest [error={error:?}]"
+                        );
+                    }
+                }
                 return Ok(());
             }
             DbReaderMessage::PollManifest => {}
@@ -1617,17 +1906,14 @@ impl MessageHandler<DbReaderMessage> for ManifestPoller {
                 Ok(())
             }
             DbReaderMode::FollowLatest => {
-                let result = self.inner.refresh_latest_manifest().await;
-                if let Err(error) = result {
-                    warn!("failed to refresh reader to latest manifest [error={error:?}]");
-                } else {
-                    self.inner.db_stats.reader_manifest_polls.increment(1);
-                    self.schedule_tail_continuation();
-                }
+                self.cancel_tail_task().await;
+                self.start_manifest_refresh();
                 Ok(())
             }
             // No polling is needed for a pinned checkpoint, so we just return Ok(()).
             DbReaderMode::Checkpoint(_) => Ok(()),
+        }
+            } => result,
         }
     }
 
@@ -1636,16 +1922,9 @@ impl MessageHandler<DbReaderMessage> for ManifestPoller {
         _messages: BoxStream<'async_trait, DbReaderMessage>,
         _result: Result<(), SlateDBError>,
     ) -> Result<(), SlateDBError> {
-        if self.inner.mode != DbReaderMode::ManagedCheckpoint {
-            return Ok(());
-        }
-        let mut manifest = StoredManifest::load(
-            Arc::clone(&self.inner.manifest_store),
-            self.inner.system_clock.clone(),
-        )
-        .await?;
-        let checkpoint_ids = self.generations.keys().copied().collect::<Vec<_>>();
-        if !checkpoint_ids.is_empty() {
+        self.cancel_tail_task().await;
+        self.cancel_manifest_refresh_task().await;
+        if self.inner.mode == DbReaderMode::ManagedCheckpoint {
             let live_generations = self
                 .generations
                 .values()
@@ -1660,11 +1939,10 @@ impl MessageHandler<DbReaderMessage> for ManifestPoller {
             for generation in live_generations {
                 generation.drain().await;
             }
-            info!(
-                "deleting reader established checkpoints for shutdown [checkpoint_ids={:?}]",
-                checkpoint_ids
-            );
-            manifest.delete_checkpoints(&checkpoint_ids).await?;
+            // Managed checkpoints have a finite lease and can safely expire.
+            // Remote cleanup is intentionally not part of reader close: an
+            // unavailable object store must not prevent retirement proof.
+            self.generations.clear();
         }
         self.inner.db_stats.reader_active_checkpoints.set(0);
         Ok(())
@@ -2253,10 +2531,10 @@ impl DbReader {
         // both reader modes before shutting down any managed task.
         self.inner.status_manager.write_result(Ok(()));
 
-        self.task_executor
-            .shutdown_task(DB_READER_TASK_NAME)
-            .await
-            .map_err(Into::<crate::Error>::into)?;
+        self.inner.replay_tasks.cancel();
+        let shutdown_result = self.task_executor.shutdown_task(DB_READER_TASK_NAME).await;
+        self.inner.replay_tasks.shutdown().await;
+        shutdown_result.map_err(Into::<crate::Error>::into)?;
 
         if let Err(e) = self.inner.table_store.close_cache().await {
             warn!("failed to close block cache [error={:?}]", e);
@@ -2401,6 +2679,7 @@ mod tests {
     use crate::proptest_util::rng::new_test_rng;
     use crate::proptest_util::sample;
     use crate::reader::Reader;
+    use crate::replay_task_scope::ReplayTaskScope;
     use crate::tablestore::{TableStore, TableStoreKind};
     use crate::types::RowEntry;
     use crate::{error::SlateDBError, test_utils, CloseReason, Db};
@@ -2449,6 +2728,24 @@ mod tests {
         })
         .await
         .expect("reader did not install a new manifest generation");
+    }
+
+    async fn finish_manual_manifest_refresh(poller: &mut ManifestPoller) {
+        let receiver = poller
+            .tail_rx
+            .as_ref()
+            .expect("manual poller must retain its completion receiver")
+            .clone();
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+                .await
+                .expect("manifest refresh did not complete")
+                .expect("manifest completion channel closed");
+            poller.handle(message).await.unwrap();
+            if !poller.manifest_refresh_in_flight {
+                break;
+            }
+        }
     }
 
     #[tokio::test]
@@ -2877,6 +3174,7 @@ mod tests {
         let (tail_tx, tail_rx) = async_channel::unbounded();
         let mut poller = ManifestPoller::new(Arc::clone(&reader.inner), tail_tx, tail_rx);
         poller.handle(DbReaderMessage::PollManifest).await.unwrap();
+        finish_manual_manifest_refresh(&mut poller).await;
 
         assert!(reader.manifest().id() >= latest_manifest.id);
         assert_eq!(
@@ -2948,6 +3246,7 @@ mod tests {
         let (tail_tx, tail_rx) = async_channel::unbounded();
         let mut poller = ManifestPoller::new(Arc::clone(&reader.inner), tail_tx, tail_rx);
         poller.handle(DbReaderMessage::PollManifest).await.unwrap();
+        finish_manual_manifest_refresh(&mut poller).await;
 
         assert_eq!(reader.manifest().id(), manifest_id);
         assert_eq!(
@@ -2968,12 +3267,102 @@ mod tests {
         db.close().await.unwrap();
 
         poller.handle(DbReaderMessage::PollManifest).await.unwrap();
+        finish_manual_manifest_refresh(&mut poller).await;
         assert!(reader.manifest().id() > manifest_id);
         assert_eq!(
             reader.get(b"key").await.unwrap(),
             Some(Bytes::from_static(b"updated"))
         );
         reader.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_cancels_a_blocked_manifest_get() {
+        let inner = Arc::new(InMemory::new());
+        let writer_store: Arc<dyn ObjectStore> = inner.clone();
+        let gated = Arc::new(test_utils::GatedObjectStore::new(inner));
+        let object_store: Arc<dyn ObjectStore> = gated.clone();
+        let path = Path::from("/tmp/test_reader_close_blocked_manifest_list");
+        let provider = TestProvider::new(path.clone(), writer_store);
+        let db = provider.new_db(Settings::default()).await.unwrap();
+        db.put(b"key", b"value").await.unwrap();
+        db.flush().await.unwrap();
+
+        let reader = DbReader::open(
+            path,
+            object_store,
+            DbReaderMode::FollowLatest,
+            DbReaderOptions {
+                manifest_poll_interval: Duration::from_secs(60),
+                wal_poll_interval: Duration::from_secs(60),
+                checkpoint_lifetime: Duration::ZERO,
+                ..DbReaderOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        db.put(b"key", b"updated").await.unwrap();
+        db.flush().await.unwrap();
+        let (tx, rx) = async_channel::unbounded();
+        let mut poller = ManifestPoller::new(Arc::clone(&reader.inner), tx, rx);
+        gated.get_opts_gate.close();
+        poller.handle(DbReaderMessage::PollManifest).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            gated.get_opts_gate.wait_for_arrivals(1),
+        )
+        .await
+        .expect("manifest refresh did not reach the blocked GET");
+
+        tokio::time::timeout(Duration::from_secs(1), reader.close())
+            .await
+            .expect("reader close waited for a blocked manifest GET")
+            .unwrap();
+        poller.cancel_manifest_refresh_task().await;
+    }
+
+    #[tokio::test]
+    async fn close_cancels_a_blocked_checkpoint_manifest_list() {
+        let inner = Arc::new(InMemory::new());
+        let writer_store: Arc<dyn ObjectStore> = inner.clone();
+        let gated = Arc::new(test_utils::GatedObjectStore::new(inner));
+        let reader_store: Arc<dyn ObjectStore> = gated.clone();
+        let path = Path::from("/tmp/test_reader_close_blocked_checkpoint_list");
+        let provider = TestProvider::new(path.clone(), writer_store);
+        let db = provider.new_db(Settings::default()).await.unwrap();
+        db.put(b"key", b"value").await.unwrap();
+        db.flush().await.unwrap();
+
+        let reader = DbReader::open(
+            path,
+            reader_store,
+            DbReaderMode::ManagedCheckpoint,
+            DbReaderOptions {
+                manifest_poll_interval: Duration::from_secs(60),
+                wal_poll_interval: Duration::from_secs(60),
+                ..DbReaderOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let (tx, rx) = async_channel::unbounded();
+        let mut poller = ManifestPoller::new(Arc::clone(&reader.inner), tx, rx);
+        gated.list_gate.close();
+        let poll = tokio::spawn(async move { poller.handle(DbReaderMessage::PollManifest).await });
+        tokio::time::timeout(Duration::from_secs(1), gated.list_gate.wait_for_arrivals(1))
+            .await
+            .expect("checkpoint refresh did not reach the blocked LIST");
+
+        tokio::time::timeout(Duration::from_secs(1), reader.close())
+            .await
+            .expect("reader close waited for a blocked manifest LIST")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), poll)
+            .await
+            .expect("cancelled checkpoint poll remained blocked")
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -3070,10 +3459,12 @@ mod tests {
                 > initial_reader_checkpoint.expire_time.unwrap()
         );
 
-        // The checkpoint is removed on shutdown
+        // Shutdown is a bounded local operation. It must not wait for a remote
+        // manifest write merely to delete the checkpoint; its finite lease is
+        // reclaimed by normal checkpoint GC after expiry.
         reader.close().await.unwrap();
         let updated_manifest = manifest_store.read_latest_manifest().await.unwrap();
-        assert_eq!(0, updated_manifest.manifest.core.checkpoints.len());
+        assert_eq!(1, updated_manifest.manifest.core.checkpoints.len());
     }
 
     // Regression test for https://github.com/slatedb/slatedb/issues/1750.
@@ -4013,6 +4404,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert!(known_missing.unwrap_err().has_object_store_not_found());
@@ -4029,11 +4421,55 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
         assert!(caught_up);
         assert_eq!(tail_cursor, (0, 0));
+    }
+
+    #[tokio::test]
+    async fn manifest_replay_yields_at_the_sixty_four_wal_boundary() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_db_reader_manifest_turn_limit");
+        let table_store = TestProvider::new(path, object_store).table_store();
+        for wal_id in 1..=65 {
+            write_wal_sst(
+                Arc::clone(&table_store),
+                wal_id,
+                vec![RowEntry::new_value(
+                    format!("key-{wal_id:03}").as_bytes(),
+                    b"value",
+                    wal_id,
+                )],
+            )
+            .await
+            .unwrap();
+        }
+        let mut core = ManifestCore::new();
+        core.next_wal_sst_id = 66;
+        let mut replayed = ReplayMemtables::default();
+        let clock: Arc<dyn SystemClock> = Arc::new(DefaultSystemClock::new());
+        let scope = ReplayTaskScope::new();
+
+        let cursor = DbReaderInner::replay_manifest_range_into(
+            table_store,
+            &DbReaderOptions::default(),
+            &core,
+            &mut replayed,
+            None,
+            None,
+            None,
+            Some(scope.clone()),
+            &clock,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(cursor, (65, 65));
+        assert_eq!(replayed.len(), 2);
+        scope.shutdown().await;
     }
 
     #[tokio::test]
@@ -4080,9 +4516,13 @@ mod tests {
         recording.clear();
 
         let first_base = Arc::clone(&reader.inner.state.read());
-        let first = DbReaderInner::replay_runtime_turn(Arc::clone(&reader.inner), first_base)
-            .await
-            .unwrap();
+        let first = DbReaderInner::replay_runtime_turn(
+            Arc::clone(&reader.inner),
+            first_base,
+            reader.inner.replay_tasks.child(),
+        )
+        .await
+        .unwrap();
         assert_eq!(first.last_wal_id, initial_wal_id + 64);
         assert!(first.reached_turn_limit);
         assert!(!first.caught_up);
@@ -4093,9 +4533,13 @@ mod tests {
             last_wal_id: first.last_wal_id,
             last_remote_persisted_seq: first.last_committed_seq,
         });
-        let second = DbReaderInner::replay_runtime_turn(Arc::clone(&reader.inner), second_base)
-            .await
-            .unwrap();
+        let second = DbReaderInner::replay_runtime_turn(
+            Arc::clone(&reader.inner),
+            second_base,
+            reader.inner.replay_tasks.child(),
+        )
+        .await
+        .unwrap();
         assert_eq!(second.last_wal_id, initial_wal_id + 65);
         assert!(second.caught_up);
         assert!(!second.reached_turn_limit);
@@ -4156,6 +4600,7 @@ mod tests {
         let blocked = tokio::spawn(DbReaderInner::replay_runtime_turn(
             Arc::clone(&reader.inner),
             Arc::clone(&base),
+            reader.inner.replay_tasks.child(),
         ));
         gated
             .head_gate
@@ -4173,9 +4618,13 @@ mod tests {
         assert!(!expired.caught_up);
         assert_eq!(reader.inner.state.read().last_wal_id, base.last_wal_id);
 
-        let completed = DbReaderInner::replay_runtime_turn(Arc::clone(&reader.inner), base)
-            .await
-            .unwrap();
+        let completed = DbReaderInner::replay_runtime_turn(
+            Arc::clone(&reader.inner),
+            base,
+            reader.inner.replay_tasks.child(),
+        )
+        .await
+        .unwrap();
         assert!(completed.last_wal_id > expired.last_wal_id);
         assert!(completed.caught_up);
         let mut rows = completed
@@ -4971,6 +5420,7 @@ mod tests {
             status_manager: DbStatusManager::new(0),
             segment_extractor: None,
             rand: test_provider.rand.clone(),
+            replay_tasks: ReplayTaskScope::new(),
             recorder,
         };
 
@@ -5063,6 +5513,7 @@ mod tests {
             status_manager: DbStatusManager::new(0),
             segment_extractor: None,
             rand: test_provider.rand.clone(),
+            replay_tasks: ReplayTaskScope::new(),
             recorder,
         }
     }
@@ -5296,7 +5747,9 @@ mod tests {
 
     #[tokio::test]
     async fn should_record_incremental_wal_replay_metrics() {
-        use slatedb_common::metrics::{lookup_metric, DefaultMetricsRecorder};
+        use slatedb_common::metrics::{
+            lookup_metric, lookup_metric_with_labels, DefaultMetricsRecorder,
+        };
 
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let path = Path::from("/tmp/test_db_reader_wal_replay_metrics");
@@ -5351,6 +5804,42 @@ mod tests {
             Some(1),
             lookup_metric(&metrics_recorder, crate::db_stats::READER_REPLAY_MEMTABLES)
         );
+        let list_metric = crate::db_stats::READER_WAL_REPLAY_OBJECT_STORE_CALLS;
+        assert!(lookup_metric_with_labels(
+            &metrics_recorder,
+            list_metric,
+            &[
+                (
+                    crate::db_stats::REPLAY_SOURCE_LABEL,
+                    crate::db_stats::REPLAY_SOURCE_READER_OPEN,
+                ),
+                (
+                    crate::db_stats::REPLAY_OPERATION_LABEL,
+                    crate::db_stats::REPLAY_OPERATION_LIST,
+                ),
+            ],
+        )
+        .is_some_and(|value| value > 0));
+        for source in [
+            crate::db_stats::REPLAY_SOURCE_RUNTIME_MANIFEST,
+            crate::db_stats::REPLAY_SOURCE_RUNTIME_TAIL,
+        ] {
+            assert_eq!(
+                lookup_metric_with_labels(
+                    &metrics_recorder,
+                    list_metric,
+                    &[
+                        (crate::db_stats::REPLAY_SOURCE_LABEL, source),
+                        (
+                            crate::db_stats::REPLAY_OPERATION_LABEL,
+                            crate::db_stats::REPLAY_OPERATION_LIST,
+                        ),
+                    ],
+                ),
+                Some(0),
+                "runtime replay source unexpectedly performed LIST: {source}",
+            );
+        }
         assert_eq!(
             Some(1),
             lookup_metric(
