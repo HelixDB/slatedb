@@ -542,7 +542,12 @@ impl TableStore {
         };
         let mut tag = ObjectStoreCallTag::new(self.kind, SstType::Wal);
         tag.retry = retry;
+        // Some object stores reject a body read for an existing zero-byte object.
+        // A tagged HEAD still proves that the exact fence object exists and has
+        // the size observed by the replay LIST.
+        let is_expected_fence = expected_size == Some(0);
         let opts = GetOptions {
+            head: is_expected_fence,
             extensions: tag.into(),
             ..GetOptions::default()
         };
@@ -573,6 +578,9 @@ impl TableStore {
                 expected_size,
                 result.meta.size,
             ));
+        }
+        if is_expected_fence {
+            return Ok(Bytes::new());
         }
         let response_size_u64 = result.meta.size;
         let bytes = result
