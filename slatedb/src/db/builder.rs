@@ -102,6 +102,7 @@
 //! ```
 //!
 use std::collections::{BTreeSet, HashMap};
+use std::num::NonZeroU64;
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
@@ -194,6 +195,7 @@ pub struct DbBuilder<P: Into<Path>> {
     filter_policies: Vec<Arc<dyn FilterPolicy>>,
     metrics_recorder: Arc<dyn MetricsRecorder>,
     segment_extractor: Option<Arc<dyn crate::prefix_extractor::PrefixExtractor>>,
+    writer_epoch: Option<NonZeroU64>,
 }
 
 impl<P: Into<Path>> DbBuilder<P> {
@@ -223,7 +225,20 @@ impl<P: Into<Path>> DbBuilder<P> {
             filter_policies: default_filter_policies(),
             metrics_recorder: Arc::new(NoopMetricsRecorder::new()),
             segment_extractor: None,
+            writer_epoch: None,
         }
+    }
+
+    /// Requires this writer open to claim exactly `writer_epoch`.
+    ///
+    /// SlateDB rejects the open before publishing its WAL fence when the
+    /// stored writer epoch is greater than or equal to this value. Managed
+    /// control planes can therefore persist a monotonic epoch before opening
+    /// a writer and safely reject delayed stale opens. Builders that do not
+    /// set this value retain the embedded last-open-wins behavior.
+    pub fn with_writer_epoch(mut self, writer_epoch: NonZeroU64) -> Self {
+        self.writer_epoch = Some(writer_epoch);
+        self
     }
 
     /// Set the segment extractor (RFC-0024). When configured, every
@@ -435,6 +450,7 @@ impl<P: Into<Path>> DbBuilder<P> {
         let system_clock = self
             .system_clock
             .unwrap_or_else(|| Arc::new(DefaultSystemClock::new()));
+        let open_started = system_clock.now();
 
         let metrics_recorder = self.metrics_recorder.clone();
         let recorder =
@@ -464,6 +480,7 @@ impl<P: Into<Path>> DbBuilder<P> {
         // under the retry and instrumentation layers, so the same cache
         // instance can be shared with the compactor and GC below while each
         // component keeps its own layers.
+        let stage_started = system_clock.now();
         let cached_object_store = CachedObjectStore::from_config(
             self.main_object_store.clone(),
             &self.settings.object_store_cache_options,
@@ -472,6 +489,17 @@ impl<P: Into<Path>> DbBuilder<P> {
             rand.clone(),
         )
         .await?;
+        info!(
+            "SlateDB writer open stage completed [stage=cache_initialization, elapsed_ms={}, total_elapsed_ms={}]",
+            system_clock
+                .now()
+                .signed_duration_since(stage_started)
+                .num_milliseconds(),
+            system_clock
+                .now()
+                .signed_duration_since(open_started)
+                .num_milliseconds()
+        );
         let maybe_cached_main_object_store: Arc<dyn ObjectStore> = match &cached_object_store {
             Some(cached_store) => cached_store.clone(),
             None => self.main_object_store.clone(),
@@ -519,6 +547,9 @@ impl<P: Into<Path>> DbBuilder<P> {
             block_format,
             ..SsTableFormat::default()
         };
+        self.settings
+            .wal_replay
+            .validate_wal_block_size(sst_format.block_size)?;
 
         // Setup the manifest store and load latest manifest
         let manifest_store = Arc::new(ManifestStore::new(
@@ -529,8 +560,20 @@ impl<P: Into<Path>> DbBuilder<P> {
             &path,
             retrying_main_object_store.clone(),
         ));
+        let stage_started = system_clock.now();
         let latest_manifest =
             StoredManifest::try_load(manifest_store.clone(), system_clock.clone()).await?;
+        info!(
+            "SlateDB writer open stage completed [stage=manifest_load, elapsed_ms={}, total_elapsed_ms={}]",
+            system_clock
+                .now()
+                .signed_duration_since(stage_started)
+                .num_milliseconds(),
+            system_clock
+                .now()
+                .signed_duration_since(open_started)
+                .num_milliseconds()
+        );
 
         if let Some(latest_manifest) = &latest_manifest {
             latest_manifest
@@ -615,11 +658,29 @@ impl<P: Into<Path>> DbBuilder<P> {
             system_clock.clone(),
             task_executor.clone(),
         );
+        let stage_started = system_clock.now();
         let WriterFenceResult {
             manifest,
             replay_range,
             mut wal_writer,
-        } = fencer.fence(stored_manifest).await?;
+        } = fencer.fence(stored_manifest, self.writer_epoch).await?;
+        let replay_start_wal_id = replay_range.start;
+        let replay_end_wal_id = replay_range.end;
+        let replay_wal_count = replay_end_wal_id.saturating_sub(replay_start_wal_id);
+        info!(
+            "SlateDB writer open stage completed [stage=writer_fence, elapsed_ms={}, total_elapsed_ms={}, replay_start_wal_id={}, replay_end_wal_id={}, replay_wal_count={}]",
+            system_clock
+                .now()
+                .signed_duration_since(stage_started)
+                .num_milliseconds(),
+            system_clock
+                .now()
+                .signed_duration_since(open_started)
+                .num_milliseconds(),
+            replay_start_wal_id,
+            replay_end_wal_id,
+            replay_wal_count
+        );
         let (wal_writer, wal_observer) = if DbInner::wal_enabled_in_options(&self.settings) {
             let wal_observer = wal_writer.observer();
             (Some(wal_writer), wal_observer)
@@ -646,6 +707,7 @@ impl<P: Into<Path>> DbBuilder<P> {
         let (write_tx, write_rx) = SafeSender::unbounded_channel(reader);
 
         // Create the database inner state
+        let stage_started = system_clock.now();
         let memtable_flusher = Arc::new(MemtableFlusher::new(status_manager.as_ref()));
         let inner = Arc::new(
             DbInner::new(
@@ -816,18 +878,67 @@ impl<P: Into<Path>> DbBuilder<P> {
 
         // Monitor background tasks
         task_executor.monitor_on(&tokio_handle)?;
+        info!(
+            "SlateDB writer open stage completed [stage=runtime_initialization, elapsed_ms={}, total_elapsed_ms={}]",
+            system_clock
+                .now()
+                .signed_duration_since(stage_started)
+                .num_milliseconds(),
+            system_clock
+                .now()
+                .signed_duration_since(open_started)
+                .num_milliseconds()
+        );
 
         // Replay WAL
+        let stage_started = system_clock.now();
+        info!(
+            "SlateDB WAL replay started [replay_start_wal_id={}, replay_end_wal_id={}, replay_wal_count={}]",
+            replay_start_wal_id, replay_end_wal_id, replay_wal_count
+        );
         inner.replay_wal(replay_range).await?;
+        info!(
+            "SlateDB writer open stage completed [stage=wal_replay, elapsed_ms={}, total_elapsed_ms={}, replay_start_wal_id={}, replay_end_wal_id={}, replay_wal_count={}]",
+            system_clock
+                .now()
+                .signed_duration_since(stage_started)
+                .num_milliseconds(),
+            system_clock
+                .now()
+                .signed_duration_since(open_started)
+                .num_milliseconds(),
+            replay_start_wal_id,
+            replay_end_wal_id,
+            replay_wal_count
+        );
 
         // Preload cache if enabled
+        let stage_started = system_clock.now();
         if let Some(cached_obj_store) = &cached_object_store {
             inner
                 .preload_cache(cached_obj_store, &path_resolver)
                 .await?;
         }
+        info!(
+            "SlateDB writer open stage completed [stage=cache_preload, elapsed_ms={}, total_elapsed_ms={}]",
+            system_clock
+                .now()
+                .signed_duration_since(stage_started)
+                .num_milliseconds(),
+            system_clock
+                .now()
+                .signed_duration_since(open_started)
+                .num_milliseconds()
+        );
 
         // Create and return the Db instance
+        info!(
+            "SlateDB writer open completed [elapsed_ms={}]",
+            system_clock
+                .now()
+                .signed_duration_since(open_started)
+                .num_milliseconds()
+        );
         Ok(Db {
             inner,
             task_executor,
@@ -1853,6 +1964,9 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
             block_transformer: self.block_transformer,
             ..SsTableFormat::default()
         };
+        self.options
+            .wal_replay
+            .validate_wal_block_size(sst_format.block_size)?;
         let path_resolver = PathResolver::new_with_external_ssts(path.clone(), external_ssts);
         let table_store = Arc::new(TableStore::new_with_fp_registry(
             ObjectStores::new(retrying_object_store, retrying_wal_object_store),

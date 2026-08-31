@@ -16,7 +16,7 @@ use flatbuffers::DefaultAllocator;
 use futures::future::try_join_all;
 use log::warn;
 use std::collections::VecDeque;
-#[cfg(feature = "zlib")]
+#[cfg(any(feature = "zlib", feature = "zstd"))]
 use std::io::Read;
 #[cfg(feature = "zlib")]
 use std::io::Write;
@@ -33,6 +33,78 @@ pub(crate) const SST_FORMAT_VERSION_LATEST: u16 = SST_FORMAT_VERSION_V2;
 
 fn is_supported_version(version: u16) -> bool {
     matches!(version, SST_FORMAT_VERSION | SST_FORMAT_VERSION_V2)
+}
+
+fn validate_decoded_size(required_bytes: usize, limit_bytes: usize) -> Result<(), SlateDBError> {
+    if required_bytes > limit_bytes {
+        return Err(SlateDBError::WalReplayMemoryLimitExceeded {
+            kind: "decoded WAL section",
+            required_bytes,
+            limit_bytes,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "zlib", feature = "zstd"))]
+fn measure_bounded_decompressed(
+    reader: &mut impl Read,
+    max_output_bytes: usize,
+) -> Result<usize, SlateDBError> {
+    debug_assert_ne!(max_output_bytes, usize::MAX);
+    let mut decoded_len = 0usize;
+    let mut chunk = [0u8; 8 * 1024];
+    while decoded_len < max_output_bytes {
+        let remaining = max_output_bytes - decoded_len;
+        let chunk_len = remaining.min(chunk.len());
+        let read = reader
+            .read(&mut chunk[..chunk_len])
+            .map_err(|_| SlateDBError::BlockDecompressionError)?;
+        if read == 0 {
+            return Ok(decoded_len);
+        }
+        decoded_len = decoded_len
+            .checked_add(read)
+            .ok_or(SlateDBError::BlockDecompressionError)?;
+    }
+
+    let mut overflow = [0u8; 1];
+    if reader
+        .read(&mut overflow)
+        .map_err(|_| SlateDBError::BlockDecompressionError)?
+        != 0
+    {
+        return Err(SlateDBError::WalReplayMemoryLimitExceeded {
+            kind: "decoded WAL section",
+            required_bytes: max_output_bytes.saturating_add(1),
+            limit_bytes: max_output_bytes,
+        });
+    }
+    Ok(decoded_len)
+}
+
+#[cfg(any(feature = "zlib", feature = "zstd"))]
+fn read_exact_decompressed(
+    reader: &mut impl Read,
+    decoded_len: usize,
+) -> Result<Bytes, SlateDBError> {
+    // The first pass measured the exact output size using only a fixed stack
+    // buffer. Allocate exactly that much for the retained decoded block; this
+    // avoids either reserving the entire replay working budget for a tiny
+    // block or allowing Vec growth to exceed the limit.
+    let mut decompressed = vec![0u8; decoded_len];
+    reader
+        .read_exact(&mut decompressed)
+        .map_err(|_| SlateDBError::BlockDecompressionError)?;
+    let mut overflow = [0u8; 1];
+    if reader
+        .read(&mut overflow)
+        .map_err(|_| SlateDBError::BlockDecompressionError)?
+        != 0
+    {
+        return Err(SlateDBError::BlockDecompressionError);
+    }
+    Ok(Bytes::from(decompressed))
 }
 
 #[allow(private_interfaces)]
@@ -178,6 +250,10 @@ pub(crate) const VERSION_SIZE: usize = SIZEOF_U16;
 ///
 /// #[async_trait]
 /// impl BlockTransformer for XorTransformer {
+///     fn max_decoded_len(&self, encoded_len: usize) -> Option<usize> {
+///         Some(encoded_len)
+///     }
+///
 ///     async fn encode(&self, data: Bytes) -> Result<Bytes, Error> {
 ///         let transformed: Vec<u8> = data.iter().map(|b| b ^ self.key).collect();
 ///         Ok(Bytes::from(transformed))
@@ -190,6 +266,15 @@ pub(crate) const VERSION_SIZE: usize = SIZEOF_U16;
 /// ```
 #[async_trait]
 pub trait BlockTransformer: Send + Sync {
+    /// Returns a strict upper bound for the decoded allocation produced from an
+    /// encoded buffer of `encoded_len` bytes.
+    ///
+    /// Full-object WAL replay checks this bound before calling [`Self::decode`].
+    /// Return `None` when the transform cannot provide a safe bound; WAL replay
+    /// will then fail closed instead of invoking it. Implementations must never
+    /// allocate or return more decoded bytes than this bound.
+    fn max_decoded_len(&self, encoded_len: usize) -> Option<usize>;
+
     /// Encode (transform) block data before storage.
     async fn encode(&self, data: Bytes) -> Result<Bytes, crate::error::Error>;
 
@@ -613,6 +698,11 @@ pub(crate) type LengthOffsetAndVersion = (u64, u64, u16);
 
 pub(crate) type TableInfoAndVersion = (SsTableInfo, u16);
 
+pub(crate) enum StagedSstInfoError {
+    Initial(SlateDBError),
+    Later(SlateDBError),
+}
+
 #[derive(Clone)]
 pub(crate) struct SsTableFormat {
     pub(crate) block_size: usize,
@@ -650,10 +740,21 @@ impl SsTableFormat {
         let header = obj
             .read_range((obj_len - NUM_FOOTER_BYTES_LONG)..obj_len)
             .await?;
-        assert_eq!(header.len(), NUM_FOOTER_BYTES);
+        if header.len() != NUM_FOOTER_BYTES {
+            return Err(SlateDBError::CorruptSst {
+                reason: "invalid SST footer length",
+                path: None,
+            });
+        }
 
         let version = header.slice(8..NUM_FOOTER_BYTES).get_u16();
         let sst_metadata_offset = header.slice(0..8).get_u64();
+        if sst_metadata_offset > obj_len - NUM_FOOTER_BYTES_LONG {
+            return Err(SlateDBError::CorruptSst {
+                reason: "SST metadata offset exceeds footer start",
+                path: None,
+            });
+        }
         Ok((obj_len, sst_metadata_offset, version))
     }
 
@@ -680,6 +781,100 @@ impl SsTableFormat {
             .read_range(sst_metadata_offset..obj_len - NUM_FOOTER_BYTES_LONG)
             .await?;
         SsTableInfo::decode(sst_metadata_bytes, &*self.sst_codec).map(|info| (info, version))
+    }
+
+    pub(crate) async fn read_info_and_version_staged(
+        &self,
+        obj: &impl ReadOnlyBlob,
+    ) -> Result<TableInfoAndVersion, StagedSstInfoError> {
+        let (obj_len, sst_metadata_offset, version) = self
+            .read_length_and_metadata_offset_and_version(obj)
+            .await
+            .map_err(StagedSstInfoError::Initial)?;
+        self.validate_version(version)
+            .map_err(StagedSstInfoError::Later)?;
+        let sst_metadata_bytes = obj
+            .read_range(sst_metadata_offset..obj_len - NUM_FOOTER_BYTES_LONG)
+            .await
+            .map_err(StagedSstInfoError::Later)?;
+        SsTableInfo::decode(sst_metadata_bytes, &*self.sst_codec)
+            .map(|info| (info, version))
+            .map_err(StagedSstInfoError::Later)
+    }
+
+    pub(crate) async fn read_wal_info_and_version_bounded(
+        &self,
+        obj: &impl ReadOnlyBlob,
+        object_len: u64,
+        metadata_offset: u64,
+        version: u16,
+        working_memory_limit: usize,
+    ) -> Result<TableInfoAndVersion, SlateDBError> {
+        self.validate_version(version)?;
+        let metadata_end = object_len
+            .checked_sub(NUM_FOOTER_BYTES_LONG)
+            .ok_or(SlateDBError::EmptySSTable)?;
+        let encoded_len = usize::try_from(metadata_end.checked_sub(metadata_offset).ok_or(
+            SlateDBError::CorruptSst {
+                reason: "WAL metadata range is outside the object",
+                path: None,
+            },
+        )?)
+        .map_err(|_| SlateDBError::WalReplayMemoryLimitExceeded {
+            kind: "encoded and decoded WAL metadata",
+            required_bytes: usize::MAX,
+            limit_bytes: working_memory_limit,
+        })?;
+        // The FlatBuffer decoder copies first/last entries. Their combined
+        // bytes cannot exceed the encoded metadata that contains them.
+        let conservative_bytes =
+            encoded_len
+                .checked_mul(2)
+                .ok_or(SlateDBError::WalReplayMemoryLimitExceeded {
+                    kind: "encoded and decoded WAL metadata",
+                    required_bytes: usize::MAX,
+                    limit_bytes: working_memory_limit,
+                })?;
+        if conservative_bytes > working_memory_limit {
+            return Err(SlateDBError::WalReplayMemoryLimitExceeded {
+                kind: "encoded and decoded WAL metadata",
+                required_bytes: conservative_bytes,
+                limit_bytes: working_memory_limit,
+            });
+        }
+        let metadata = obj.read_range(metadata_offset..metadata_end).await?;
+        if metadata.len() != encoded_len {
+            return Err(SlateDBError::CorruptSst {
+                reason: "WAL metadata range returned an unexpected length",
+                path: None,
+            });
+        }
+        let info = SsTableInfo::decode(metadata, &*self.sst_codec)?;
+        let retained_bytes = info
+            .first_entry
+            .as_ref()
+            .map_or(0, Bytes::len)
+            .checked_add(info.last_entry.as_ref().map_or(0, Bytes::len))
+            .ok_or(SlateDBError::WalReplayMemoryLimitExceeded {
+                kind: "encoded and decoded WAL metadata",
+                required_bytes: usize::MAX,
+                limit_bytes: working_memory_limit,
+            })?;
+        let actual_bytes = encoded_len.checked_add(retained_bytes).ok_or(
+            SlateDBError::WalReplayMemoryLimitExceeded {
+                kind: "encoded and decoded WAL metadata",
+                required_bytes: usize::MAX,
+                limit_bytes: working_memory_limit,
+            },
+        )?;
+        if actual_bytes > working_memory_limit {
+            return Err(SlateDBError::WalReplayMemoryLimitExceeded {
+                kind: "encoded and decoded WAL metadata",
+                required_bytes: actual_bytes,
+                limit_bytes: working_memory_limit,
+            });
+        }
+        Ok((info, version))
     }
 
     pub(crate) async fn read_filters(
@@ -804,6 +999,62 @@ impl SsTableFormat {
         self.decode_index(index_bytes, compression_codec).await
     }
 
+    pub(crate) async fn read_wal_index_bounded(
+        &self,
+        info: &SsTableInfo,
+        obj: &impl ReadOnlyBlob,
+        working_memory_limit: usize,
+    ) -> Result<SsTableIndexOwned, SlateDBError> {
+        let index_end =
+            info.index_offset
+                .checked_add(info.index_len)
+                .ok_or(SlateDBError::CorruptSst {
+                    reason: "WAL index range overflow",
+                    path: None,
+                })?;
+        let index_bytes = obj.read_range(info.index_offset..index_end).await?;
+        self.decode_index_bounded(index_bytes, info.compression_codec, working_memory_limit)
+            .await
+    }
+
+    pub(crate) async fn read_ranged_wal_index_bounded(
+        &self,
+        info: &SsTableInfo,
+        obj: &impl ReadOnlyBlob,
+        working_memory_limit: usize,
+    ) -> Result<SsTableIndexOwned, SlateDBError> {
+        let index_end =
+            info.index_offset
+                .checked_add(info.index_len)
+                .ok_or(SlateDBError::CorruptSst {
+                    reason: "WAL index range overflow",
+                    path: None,
+                })?;
+        let encoded_len = usize::try_from(info.index_len).map_err(|_| {
+            SlateDBError::WalReplayMemoryLimitExceeded {
+                kind: "encoded and decoded WAL index",
+                required_bytes: usize::MAX,
+                limit_bytes: working_memory_limit,
+            }
+        })?;
+        let decode_memory_limit = working_memory_limit.checked_sub(encoded_len).ok_or(
+            SlateDBError::WalReplayMemoryLimitExceeded {
+                kind: "encoded and decoded WAL index",
+                required_bytes: encoded_len,
+                limit_bytes: working_memory_limit,
+            },
+        )?;
+        let index_bytes = obj.read_range(info.index_offset..index_end).await?;
+        if index_bytes.len() != encoded_len {
+            return Err(SlateDBError::CorruptSst {
+                reason: "WAL index range returned an unexpected length",
+                path: None,
+            });
+        }
+        self.decode_index_bounded(index_bytes, info.compression_codec, decode_memory_limit)
+            .await
+    }
+
     #[cfg(test)]
     pub(crate) async fn read_index_raw(
         &self,
@@ -837,6 +1088,50 @@ impl SsTableFormat {
         };
 
         Ok(SsTableIndexOwned::new(decompressed_bytes)?)
+    }
+
+    async fn decode_index_bounded(
+        &self,
+        bytes: Bytes,
+        compression_codec: Option<CompressionCodec>,
+        working_memory_limit: usize,
+    ) -> Result<SsTableIndexOwned, SlateDBError> {
+        let index_bytes = self.validate_checksum(bytes)?;
+        let untransformed_bytes = match &self.block_transformer {
+            Some(transformer) => {
+                let decoded_bound = transformer
+                    .max_decoded_len(index_bytes.len())
+                    .ok_or(SlateDBError::BlockTransformError)?;
+                validate_decoded_size(decoded_bound, working_memory_limit)?;
+                let transformed = transformer
+                    .decode(index_bytes)
+                    .await
+                    .map_err(|_| SlateDBError::BlockTransformError)?;
+                if transformed.len() > decoded_bound {
+                    return Err(SlateDBError::BlockTransformError);
+                }
+                transformed
+            }
+            None => index_bytes,
+        };
+        let transformed_allocation = if self.block_transformer.is_some() {
+            untransformed_bytes.len()
+        } else {
+            0
+        };
+        let remaining = working_memory_limit
+            .checked_sub(transformed_allocation)
+            .ok_or(SlateDBError::WalReplayMemoryLimitExceeded {
+                kind: "transformed WAL index",
+                required_bytes: transformed_allocation,
+                limit_bytes: working_memory_limit,
+            })?;
+        let decompressed = match compression_codec {
+            Some(codec) => Self::decompress_bounded(untransformed_bytes, codec, remaining)?,
+            None => untransformed_bytes,
+        };
+        validate_decoded_size(decompressed.len(), remaining)?;
+        Ok(SsTableIndexOwned::new(decompressed)?)
     }
 
     pub(crate) async fn read_stats(
@@ -881,33 +1176,73 @@ impl SsTableFormat {
         #[allow(unused_variables)] compressed_data: Bytes,
         compression_option: CompressionCodec,
     ) -> Result<Bytes, SlateDBError> {
+        Self::decompress_bounded(compressed_data, compression_option, usize::MAX)
+    }
+
+    fn decompress_bounded(
+        #[allow(unused_variables)] compressed_data: Bytes,
+        compression_option: CompressionCodec,
+        _max_output_bytes: usize,
+    ) -> Result<Bytes, SlateDBError> {
         match compression_option {
             #[cfg(feature = "snappy")]
-            CompressionCodec::Snappy => Ok(Bytes::from(
-                snap::raw::Decoder::new()
-                    .decompress_vec(&compressed_data)
-                    .map_err(|_| SlateDBError::BlockDecompressionError)?,
-            )),
+            CompressionCodec::Snappy => {
+                let decoded_len = snap::raw::decompress_len(&compressed_data)
+                    .map_err(|_| SlateDBError::BlockDecompressionError)?;
+                validate_decoded_size(decoded_len, _max_output_bytes)?;
+                Ok(Bytes::from(
+                    snap::raw::Decoder::new()
+                        .decompress_vec(&compressed_data)
+                        .map_err(|_| SlateDBError::BlockDecompressionError)?,
+                ))
+            }
             #[cfg(feature = "zlib")]
             CompressionCodec::Zlib => {
+                if _max_output_bytes == usize::MAX {
+                    let mut decoder = flate2::read::ZlibDecoder::new(&compressed_data[..]);
+                    let mut decompressed = Vec::new();
+                    decoder
+                        .read_to_end(&mut decompressed)
+                        .map_err(|_| SlateDBError::BlockDecompressionError)?;
+                    return Ok(Bytes::from(decompressed));
+                }
                 let mut decoder = flate2::read::ZlibDecoder::new(&compressed_data[..]);
-                let mut decompressed = Vec::new();
-                decoder
-                    .read_to_end(&mut decompressed)
-                    .map_err(|_| SlateDBError::BlockDecompressionError)?;
-                Ok(Bytes::from(decompressed))
+                let decoded_len = measure_bounded_decompressed(&mut decoder, _max_output_bytes)?;
+                let mut decoder = flate2::read::ZlibDecoder::new(&compressed_data[..]);
+                read_exact_decompressed(&mut decoder, decoded_len)
             }
             #[cfg(feature = "lz4")]
             CompressionCodec::Lz4 => {
+                if compressed_data.len() < size_of::<u32>() {
+                    return Err(SlateDBError::BlockDecompressionError);
+                }
+                let decoded_len = u32::from_le_bytes(
+                    compressed_data[..size_of::<u32>()]
+                        .try_into()
+                        .map_err(|_| SlateDBError::BlockDecompressionError)?,
+                ) as usize;
+                validate_decoded_size(decoded_len, _max_output_bytes)?;
                 let decompressed = lz4_flex::block::decompress_size_prepended(&compressed_data)
                     .map_err(|_| SlateDBError::BlockDecompressionError)?;
                 Ok(Bytes::from(decompressed))
             }
             #[cfg(feature = "zstd")]
             CompressionCodec::Zstd => {
-                let decompressed = zstd::stream::decode_all(&compressed_data[..])
+                if _max_output_bytes == usize::MAX {
+                    let mut decoder = zstd::stream::read::Decoder::new(&compressed_data[..])
+                        .map_err(|_| SlateDBError::BlockDecompressionError)?;
+                    let mut decompressed = Vec::new();
+                    decoder
+                        .read_to_end(&mut decompressed)
+                        .map_err(|_| SlateDBError::BlockDecompressionError)?;
+                    return Ok(Bytes::from(decompressed));
+                }
+                let mut decoder = zstd::stream::read::Decoder::new(&compressed_data[..])
                     .map_err(|_| SlateDBError::BlockDecompressionError)?;
-                Ok(Bytes::from(decompressed))
+                let decoded_len = measure_bounded_decompressed(&mut decoder, _max_output_bytes)?;
+                let mut decoder = zstd::stream::read::Decoder::new(&compressed_data[..])
+                    .map_err(|_| SlateDBError::BlockDecompressionError)?;
+                read_exact_decompressed(&mut decoder, decoded_len)
             }
         }
     }
@@ -987,7 +1322,93 @@ impl SsTableFormat {
             None => untransformed_bytes,
         };
 
-        Ok(Block::decode(decompressed_bytes))
+        Block::decode(decompressed_bytes)
+    }
+
+    pub(crate) async fn decode_wal_block_bounded(
+        &self,
+        bytes: Bytes,
+        compression_codec: Option<CompressionCodec>,
+        working_memory_limit: usize,
+    ) -> Result<Block, SlateDBError> {
+        let block_bytes = self.validate_checksum(bytes)?;
+        let untransformed_bytes = match &self.block_transformer {
+            Some(transformer) => {
+                let decoded_bound = transformer
+                    .max_decoded_len(block_bytes.len())
+                    .ok_or(SlateDBError::BlockTransformError)?;
+                validate_decoded_size(decoded_bound, working_memory_limit)?;
+                let transformed = transformer
+                    .decode(block_bytes)
+                    .await
+                    .map_err(|_| SlateDBError::BlockTransformError)?;
+                if transformed.len() > decoded_bound {
+                    return Err(SlateDBError::BlockTransformError);
+                }
+                transformed
+            }
+            None => block_bytes,
+        };
+        let transformed_allocation = if self.block_transformer.is_some() {
+            untransformed_bytes.len()
+        } else {
+            0
+        };
+        let remaining = working_memory_limit
+            .checked_sub(transformed_allocation)
+            .ok_or(SlateDBError::WalReplayMemoryLimitExceeded {
+                kind: "transformed WAL block",
+                required_bytes: transformed_allocation,
+                limit_bytes: working_memory_limit,
+            })?;
+        let decoded = match compression_codec {
+            Some(codec) => Self::decompress_bounded(untransformed_bytes, codec, remaining)?,
+            None => untransformed_bytes,
+        };
+        Block::decode_with_memory_limit(decoded, remaining)
+    }
+
+    pub(crate) async fn decode_wal_block_from_object(
+        &self,
+        info: &SsTableInfo,
+        index_owned: &SsTableIndexOwned,
+        block_index: usize,
+        object_bytes: &Bytes,
+        working_memory_limit: usize,
+    ) -> Result<Block, SlateDBError> {
+        let index = index_owned.borrow();
+        if block_index >= index.block_meta().len() {
+            return Err(SlateDBError::CorruptSst {
+                reason: "WAL block index is out of range",
+                path: None,
+            });
+        }
+        let start = index.block_meta().get(block_index).offset();
+        let end = if block_index + 1 < index.block_meta().len() {
+            index.block_meta().get(block_index + 1).offset()
+        } else {
+            info.filter_offset
+        };
+        let start = usize::try_from(start).map_err(|_| SlateDBError::CorruptSst {
+            reason: "WAL block start does not fit in memory",
+            path: None,
+        })?;
+        let end = usize::try_from(end).map_err(|_| SlateDBError::CorruptSst {
+            reason: "WAL block end does not fit in memory",
+            path: None,
+        })?;
+        if start >= end || end > object_bytes.len() {
+            return Err(SlateDBError::CorruptSst {
+                reason: "WAL block range is outside the object",
+                path: None,
+            });
+        }
+        self.decode_wal_block_bounded(
+            object_bytes.slice(start..end),
+            info.compression_codec,
+            working_memory_limit,
+        )
+        .await
     }
 
     pub(crate) async fn read_block(
@@ -1019,6 +1440,9 @@ impl SsTableFormat {
 
     /// validate checksum and return the actual data bytes
     pub(crate) fn validate_checksum(&self, bytes: Bytes) -> Result<Bytes, SlateDBError> {
+        if bytes.len() < CHECKSUM_SIZE {
+            return Err(SlateDBError::ChecksumMismatch { path: None });
+        }
         let data_bytes = bytes.slice(..bytes.len() - CHECKSUM_SIZE);
         let mut checksum_bytes = bytes.slice(bytes.len() - CHECKSUM_SIZE..);
         let checksum = crc32fast::hash(&data_bytes);

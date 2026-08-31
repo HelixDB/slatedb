@@ -52,6 +52,15 @@ pub const READER_WAL_REPLAY_BATCHES: &str = db_stat_name!("reader_wal_replay_bat
 pub const READER_REPLAY_MEMTABLES: &str = db_stat_name!("reader_replay_memtables");
 pub const READER_ACTIVE_CHECKPOINTS: &str = db_stat_name!("reader_active_checkpoints");
 pub const READER_MANIFEST_POLLS: &str = db_stat_name!("reader_manifest_polls");
+pub const READER_WAL_REPLAY_OBJECT_STORE_CALLS: &str =
+    db_stat_name!("reader_wal_replay_object_store_calls");
+pub const REPLAY_SOURCE_LABEL: &str = "source";
+pub const REPLAY_OPERATION_LABEL: &str = "operation";
+pub const REPLAY_OPERATION_LIST: &str = "list";
+pub const REPLAY_SOURCE_READER_OPEN: &str = "reader_open";
+pub const REPLAY_SOURCE_CHECKPOINT_RECOVERY: &str = "checkpoint_recovery";
+pub const REPLAY_SOURCE_RUNTIME_MANIFEST: &str = "runtime_manifest";
+pub const REPLAY_SOURCE_RUNTIME_TAIL: &str = "runtime_tail";
 
 /// Label key distinguishing filter metrics for point lookups from those for
 /// prefix scans. Value is one of [`FILTER_KIND_POINT`] or
@@ -96,6 +105,8 @@ pub(crate) struct DbStatsInner {
     pub(crate) reader_replay_memtables: Arc<dyn GaugeFn>,
     pub(crate) reader_active_checkpoints: Arc<dyn GaugeFn>,
     pub(crate) reader_manifest_polls: Arc<dyn CounterFn>,
+    pub(crate) reader_wal_replay_list_reader_open: Arc<dyn CounterFn>,
+    pub(crate) reader_wal_replay_list_checkpoint_recovery: Arc<dyn CounterFn>,
 }
 
 #[derive(Clone)]
@@ -205,7 +216,38 @@ impl DbStats {
                 .counter(READER_MANIFEST_POLLS)
                 .description("Number of successful DbReader manifest polls completed")
                 .register(),
+            reader_wal_replay_list_reader_open: recorder
+                .counter(READER_WAL_REPLAY_OBJECT_STORE_CALLS)
+                .labels(&[
+                    (REPLAY_SOURCE_LABEL, REPLAY_SOURCE_READER_OPEN),
+                    (REPLAY_OPERATION_LABEL, REPLAY_OPERATION_LIST),
+                ])
+                .register(),
+            reader_wal_replay_list_checkpoint_recovery: recorder
+                .counter(READER_WAL_REPLAY_OBJECT_STORE_CALLS)
+                .labels(&[
+                    (REPLAY_SOURCE_LABEL, REPLAY_SOURCE_CHECKPOINT_RECOVERY),
+                    (REPLAY_OPERATION_LABEL, REPLAY_OPERATION_LIST),
+                ])
+                .register(),
         };
+        // Register zero-valued runtime series so live monitoring can prove
+        // runtime replay did not LIST without conflating fencing, GC, or
+        // maintenance operations from the same object store.
+        recorder
+            .counter(READER_WAL_REPLAY_OBJECT_STORE_CALLS)
+            .labels(&[
+                (REPLAY_SOURCE_LABEL, REPLAY_SOURCE_RUNTIME_MANIFEST),
+                (REPLAY_OPERATION_LABEL, REPLAY_OPERATION_LIST),
+            ])
+            .register();
+        recorder
+            .counter(READER_WAL_REPLAY_OBJECT_STORE_CALLS)
+            .labels(&[
+                (REPLAY_SOURCE_LABEL, REPLAY_SOURCE_RUNTIME_TAIL),
+                (REPLAY_OPERATION_LABEL, REPLAY_OPERATION_LIST),
+            ])
+            .register();
         DbStats {
             inner: Arc::new(inner),
         }

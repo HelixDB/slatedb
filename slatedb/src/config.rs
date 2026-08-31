@@ -713,6 +713,10 @@ pub struct Settings {
     /// memtable will be frozen even if it has not reached `l0_sst_size_bytes`.
     pub max_wal_flushes_before_l0_flush: u64,
 
+    /// Controls concurrent full-object WAL prefetch during recovery.
+    #[serde(default)]
+    pub wal_replay: WalReplaySettings,
+
     /// Defines the max total number of SSTs in L0 across the entire key space. Memtables
     /// will not be flushed if the total L0 count (including in-flight uploads) would exceed
     /// this value, until compaction can compact the ssts into compacted.
@@ -828,6 +832,7 @@ impl std::fmt::Debug for Settings {
                 "max_wal_flushes_before_l0_flush",
                 &self.max_wal_flushes_before_l0_flush,
             )
+            .field("wal_replay", &self.wal_replay)
             .field("l0_max_ssts", &self.l0_max_ssts)
             .field("l0_max_ssts_per_key", &self.l0_max_ssts_per_key)
             .field("l0_flush_parallelism", &self.l0_flush_parallelism)
@@ -866,6 +871,7 @@ impl Settings {
     /// Returns an [`crate::Error`] with [`crate::ErrorKind::Invalid`] describing
     /// the first invalid setting or combination encountered.
     pub fn validate(&self) -> Result<(), crate::Error> {
+        self.wal_replay.validate()?;
         if self.l0_flush_parallelism == 0 {
             return Err(SlateDBError::InvalidConfiguration(
                 "l0_flush_parallelism must be at least 1".into(),
@@ -1082,6 +1088,7 @@ impl Default for Settings {
             max_unflushed_bytes: 1_073_741_824,
             l0_sst_size_bytes: 64 * 1024 * 1024,
             max_wal_flushes_before_l0_flush: 4096,
+            wal_replay: WalReplaySettings::default(),
             l0_max_ssts: 8,
             l0_max_ssts_per_key: 8,
             l0_flush_parallelism: 4,
@@ -1101,13 +1108,108 @@ impl Default for Settings {
     }
 }
 
+/// Limits full-object WAL prefetch during writer and reader recovery.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(default)]
+pub struct WalReplaySettings {
+    /// Maximum number of WAL objects fetched concurrently.
+    pub max_concurrent_objects: usize,
+
+    /// Maximum WAL payload memory used by full-object replay.
+    ///
+    /// Replay reserves `min(max_inflight_bytes / 4, 64 MiB)` for metadata, the
+    /// index, and one lazily decoded block. Half of that working partition is
+    /// reserved for metadata/index and half for the current decoded block. It
+    /// uses the remainder for retained normal-sized encoded objects. Oversized
+    /// objects use bounded range replay instead of bypassing the limit. Writers
+    /// reject a WAL before durable acknowledgement when one of its sections
+    /// cannot be recovered within these partitions.
+    pub max_inflight_bytes: usize,
+}
+
+impl WalReplaySettings {
+    const MAX_DECODE_WORKING_BYTES: usize = 64 * 1024 * 1024;
+
+    pub(crate) fn validate(&self) -> Result<(), SlateDBError> {
+        if self.max_concurrent_objects == 0 {
+            return Err(SlateDBError::InvalidConfiguration(
+                "wal_replay.max_concurrent_objects must be at least 1".into(),
+            ));
+        }
+        if self.max_inflight_bytes == 0 {
+            return Err(SlateDBError::InvalidConfiguration(
+                "wal_replay.max_inflight_bytes must be at least 1".into(),
+            ));
+        }
+        if u32::try_from(self.max_inflight_bytes).is_err() {
+            return Err(SlateDBError::InvalidConfiguration(
+                "wal_replay.max_inflight_bytes must fit in a 32-bit semaphore permit count".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn working_memory_limit(&self) -> usize {
+        (self.max_inflight_bytes / 4).min(Self::MAX_DECODE_WORKING_BYTES)
+    }
+
+    pub(crate) fn encoded_byte_limit(&self) -> Result<usize, SlateDBError> {
+        self.max_inflight_bytes
+            .checked_sub(self.working_memory_limit())
+            .ok_or(SlateDBError::InvalidConfiguration(
+                "wal replay memory budget cannot reserve decode working memory".into(),
+            ))
+    }
+
+    pub(crate) fn block_working_memory_limit(&self) -> usize {
+        self.working_memory_limit() / 2
+    }
+
+    pub(crate) fn metadata_working_memory_limit(&self) -> usize {
+        self.working_memory_limit() / 2
+    }
+
+    pub(crate) fn validate_wal_block_size(&self, block_size: usize) -> Result<(), SlateDBError> {
+        // In the worst uncompressed case range replay holds the encoded block,
+        // its decoded bytes, and a materialized `u16` offset vector together.
+        let required_bytes = block_size
+            .checked_mul(3)
+            .and_then(|size| size.checked_add(10))
+            .ok_or(SlateDBError::InvalidConfiguration(
+                "SST block size overflows WAL replay memory accounting".into(),
+            ))?;
+        let limit_bytes = self.block_working_memory_limit();
+        if required_bytes > limit_bytes {
+            return Err(SlateDBError::InvalidConfiguration(format!(
+                "SST block size requires {required_bytes} bytes of WAL replay working memory, limit is {limit_bytes} bytes"
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Default for WalReplaySettings {
+    fn default() -> Self {
+        Self {
+            max_concurrent_objects: 64,
+            max_inflight_bytes: 256 * 1024 * 1024,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct DbReaderOptions {
-    /// How frequently to poll for new manifest files and WAL data. Refreshing the manifest
-    /// file allows readers to detect newly compacted data. The reader will also look for
-    /// new writes to the WAL at this poll interval. Readers using
-    /// [`crate::DbReaderMode::Checkpoint`] do not poll the manifest or WAL.
+    /// How frequently to poll for new manifest files. Refreshing the manifest
+    /// allows readers to detect newly compacted data. Runtime WAL polling uses
+    /// [`Self::wal_poll_interval`] independently. Readers using
+    /// [`crate::DbReaderMode::Checkpoint`] do not poll either source.
     pub manifest_poll_interval: Duration,
+
+    /// How frequently an open reader probes the exact next WAL ID after
+    /// consuming the manifest-known range. Must be nonzero. Runtime WAL
+    /// polling performs bounded range reads and never discovers WALs via LIST.
+    #[serde(default = "default_reader_wal_poll_interval")]
+    pub wal_poll_interval: Duration,
 
     /// For readers using [`crate::DbReaderMode::ManagedCheckpoint`], the client maintains a
     /// checkpoint against the latest database state. The checkpoint's expire time is set to the
@@ -1118,6 +1220,10 @@ pub struct DbReaderOptions {
     /// The max size of a single in-memory table used to buffer WAL entries
     /// Defaults to 64MB
     pub max_memtable_bytes: u64,
+
+    /// Controls concurrent full-object WAL prefetch during recovery.
+    #[serde(default)]
+    pub wal_replay: WalReplaySettings,
 
     /// Options for the local disk cache. If `root_folder` is set, the reader
     /// will wrap its object store in a `CachedObjectStore` backed by the
@@ -1151,14 +1257,20 @@ impl Default for DbReaderOptions {
     fn default() -> Self {
         Self {
             manifest_poll_interval: Duration::from_secs(10),
+            wal_poll_interval: default_reader_wal_poll_interval(),
             checkpoint_lifetime: Duration::from_secs(10 * 60),
             max_memtable_bytes: 64 * 1024 * 1024,
+            wal_replay: WalReplaySettings::default(),
             object_store_cache_options: ObjectStoreCacheOptions::default(),
             skip_wal_replay: false,
             metric_level: None,
             object_store_max_retries: None,
         }
     }
+}
+
+fn default_reader_wal_poll_interval() -> Duration {
+    Duration::from_secs(1)
 }
 
 /// The compression algorithm to use for SSTables.
@@ -2101,6 +2213,82 @@ object_store_cache_options:
     #[test]
     fn test_validate_accepts_default_settings() {
         assert!(Settings::default().validate().is_ok());
+        assert_eq!(
+            Settings::default().wal_replay,
+            WalReplaySettings {
+                max_concurrent_objects: 64,
+                max_inflight_bytes: 256 * 1024 * 1024,
+            }
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_wal_replay_settings() {
+        for wal_replay in [
+            WalReplaySettings {
+                max_concurrent_objects: 0,
+                ..WalReplaySettings::default()
+            },
+            WalReplaySettings {
+                max_inflight_bytes: 0,
+                ..WalReplaySettings::default()
+            },
+        ] {
+            let settings = Settings {
+                wal_replay,
+                ..Settings::default()
+            };
+            assert!(settings.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn wal_replay_rejects_a_block_target_larger_than_its_working_partition() {
+        let settings = WalReplaySettings {
+            max_concurrent_objects: 1,
+            max_inflight_bytes: 64 * 1024,
+        };
+
+        assert!(settings.validate_wal_block_size(4096).is_err());
+        assert!(settings.validate_wal_block_size(1024).is_ok());
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn test_validate_rejects_wal_replay_byte_semaphore_overflow() {
+        let settings = Settings {
+            wal_replay: WalReplaySettings {
+                max_inflight_bytes: u32::MAX as usize + 1,
+                ..WalReplaySettings::default()
+            },
+            ..Settings::default()
+        };
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn test_wal_replay_settings_default_when_omitted() {
+        let mut settings = serde_json::to_value(Settings::default()).unwrap();
+        settings.as_object_mut().unwrap().remove("wal_replay");
+        let decoded: Settings = serde_json::from_value(settings).unwrap();
+        assert_eq!(decoded.wal_replay, WalReplaySettings::default());
+
+        let mut reader = serde_json::to_value(DbReaderOptions::default()).unwrap();
+        reader.as_object_mut().unwrap().remove("wal_replay");
+        reader.as_object_mut().unwrap().remove("wal_poll_interval");
+        let decoded: DbReaderOptions = serde_json::from_value(reader).unwrap();
+        assert_eq!(decoded.wal_replay, WalReplaySettings::default());
+        assert_eq!(decoded.wal_poll_interval, Duration::from_secs(1));
+
+        let partial: WalReplaySettings = serde_json::from_value(serde_json::json!({
+            "max_concurrent_objects": 8
+        }))
+        .unwrap();
+        assert_eq!(partial.max_concurrent_objects, 8);
+        assert_eq!(
+            partial.max_inflight_bytes,
+            WalReplaySettings::default().max_inflight_bytes
+        );
     }
 
     #[test]

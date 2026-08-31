@@ -57,7 +57,6 @@ use crate::db_snapshot::DbSnapshot;
 use crate::db_state::{collect_touched_segments, DbState, SsTableId};
 use crate::db_stats::DbStats;
 use crate::error::SlateDBError;
-use crate::iter::IterationOrder;
 use crate::manifest::{Manifest, VersionedManifest};
 use crate::mem_table::KVTableMetadata;
 use crate::memtable_flusher::{FlushResult, FlushTarget, MemtableFlusher};
@@ -67,12 +66,11 @@ use crate::paths::PathResolver;
 use crate::prefix_extractor::PrefixExtractor;
 use crate::reader::{Reader, ScanContext};
 use crate::snapshot_manager::SnapshotManager;
-use crate::sst_iter::SstIteratorOptions;
 use crate::tablestore::TableStore;
 use crate::transaction_manager::TransactionManager;
 use crate::types::KeyValue;
 use crate::utils::{format_bytes_si, SafeSender, WatchableOnceCellReader};
-use crate::wal_replay::{WalReplayIterator, WalReplayOptions};
+use crate::wal_replay::{ExactWalReplayIterator, ExactWalReplaySource, WalReplayOptions};
 use crate::{DbCacheManagerOps, DbMetadataOps, DbReadOps, DbWriteOps};
 use slatedb_common::clock::SystemClock;
 use slatedb_common::metrics::MetricsRecorderHelper;
@@ -510,6 +508,12 @@ impl DbInner {
     }
 
     async fn replay_wal(&self, wal_id_range: Range<u64>) -> Result<(), SlateDBError> {
+        let replay_started = self.system_clock.now();
+        let replay_range_start = wal_id_range.start;
+        let replay_range_end = wal_id_range.end;
+        let replay_wal_count = replay_range_end.saturating_sub(replay_range_start);
+        let mut replayed_entries = 0_u64;
+        let mut replayed_bytes = 0_u64;
         let mut current_memtable_wal_id = self
             .state
             .read()
@@ -526,26 +530,16 @@ impl DbInner {
             |_| -> Result<(), SlateDBError> { Ok(()) }
         );
 
-        let sst_iter_options = SstIteratorOptions {
-            max_fetch_tasks: 1,
-            blocks_to_fetch: 256,
-            cache_blocks: false,
-            cache_metadata: false,
-            eager_spawn: true,
-            order: IterationOrder::Ascending,
-            prefix: None,
-            filter_context: None,
-        };
-
         let replay_options = WalReplayOptions {
-            sst_batch_size: 4,
+            prefetch: self.settings.wal_replay,
             max_memtable_bytes: self.settings.l0_sst_size_bytes,
-            sst_iter_options,
             min_seq: None,
+            source: ExactWalReplaySource::WriterOpen,
+            task_scope: None,
         };
 
         let db_state = self.state.read().state().core().clone();
-        let mut replay_iter = WalReplayIterator::range(
+        let mut replay_iter = ExactWalReplayIterator::range(
             wal_id_range,
             &db_state,
             replay_options,
@@ -590,6 +584,11 @@ impl DbInner {
                     .table
                     .record_touched_segments(touched_segments);
             }
+            let metadata = replayed_table.table.metadata();
+            replayed_entries = replayed_entries
+                .saturating_add(u64::try_from(metadata.entry_num).unwrap_or(u64::MAX));
+            replayed_bytes = replayed_bytes
+                .saturating_add(u64::try_from(metadata.entries_size_in_bytes).unwrap_or(u64::MAX));
             // Replayed rows come from WAL SSTs in remote storage, so they are already
             // durable. Update `last_remote_persisted_seq` before replaying to avoid a race with
             // the memtable flusher. The flusher calls flush_wals() to guarantee all data in the
@@ -610,6 +609,20 @@ impl DbInner {
         let guard = self.state.read();
         self.status_manager
             .report_memtable_segments(collect_touched_segments(&guard.view()));
+        info!(
+            "SlateDB WAL replay completed [writer_epoch={}, replay_start_wal_id={}, replay_end_wal_id={}, replay_wal_count={}, last_replayed_wal_id={}, replayed_entries={}, replayed_bytes={}, elapsed_ms={}]",
+            writer_epoch,
+            replay_range_start,
+            replay_range_end,
+            replay_wal_count,
+            current_memtable_wal_id,
+            replayed_entries,
+            replayed_bytes,
+            self.system_clock
+                .now()
+                .signed_duration_since(replay_started)
+                .num_milliseconds()
+        );
 
         Ok(())
     }
@@ -2260,7 +2273,7 @@ mod tests {
         REQUEST_COUNT as OBJECT_STORE_REQUEST_COUNT,
         REQUEST_DURATION_SECONDS as OBJECT_STORE_REQUEST_DURATION_SECONDS,
     };
-    use crate::iter::RowEntryIterator;
+    use crate::iter::{IterationOrder, RowEntryIterator};
     use crate::manifest::store::{ManifestStore, StoredManifest};
     use crate::manifest::{ManifestCore, VersionedManifest};
     use crate::merge_operator::{
@@ -6708,12 +6721,12 @@ mod tests {
         )
         .await;
 
-        let head_arrivals_before = gated_store.head_gate.arrivals();
-        gated_store.head_gate.close();
+        let get_arrivals_before = gated_store.get_opts_gate.arrivals();
+        gated_store.get_opts_gate.close();
         fail_parallel::cfg(fp_registry.clone(), "replay-wal-pause", "off").unwrap();
         gated_store
-            .head_gate
-            .wait_for_arrivals(head_arrivals_before + 1)
+            .get_opts_gate
+            .wait_for_arrivals(get_arrivals_before + 1)
             .await;
 
         let db2 = Db::builder(path, base_store.clone())
@@ -6731,7 +6744,7 @@ mod tests {
             .delete_sst(&SsTableId::Wal(1))
             .await
             .unwrap();
-        gated_store.head_gate.release();
+        gated_store.get_opts_gate.release();
 
         let err = match w1_handle.await.unwrap() {
             Ok(_) => panic!("expected W1 open to fail"),
@@ -6787,19 +6800,19 @@ mod tests {
         )
         .await;
 
-        let head_arrivals_before = gated_store.head_gate.arrivals();
-        gated_store.head_gate.close();
+        let get_arrivals_before = gated_store.get_opts_gate.arrivals();
+        gated_store.get_opts_gate.close();
         fail_parallel::cfg(fp_registry.clone(), "replay-wal-pause", "off").unwrap();
         gated_store
-            .head_gate
-            .wait_for_arrivals(head_arrivals_before + 1)
+            .get_opts_gate
+            .wait_for_arrivals(get_arrivals_before + 1)
             .await;
 
         probe_table_store
             .delete_sst(&SsTableId::Wal(1))
             .await
             .unwrap();
-        gated_store.head_gate.release();
+        gated_store.get_opts_gate.release();
 
         let err = match w1_handle.await.unwrap() {
             Ok(_) => panic!("expected W1 open to fail"),
@@ -7333,6 +7346,7 @@ mod tests {
             min_filter_keys,
             l0_sst_size_bytes,
             max_wal_flushes_before_l0_flush: 4096,
+            wal_replay: crate::config::WalReplaySettings::default(),
             compactor_options,
             compression_codec: None,
             object_store_cache_options: ObjectStoreCacheOptions::default(),
@@ -10359,6 +10373,63 @@ mod tests {
             .expect("write after oversized WAL replay should succeed");
 
         recovered.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn acknowledged_wal_larger_than_full_object_limit_recovers_on_reopen() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = "/tmp/acknowledged_oversized_wal_range_replay";
+        let mut settings = test_db_options(0, 1024 * 1024, None);
+        settings.flush_interval = Some(Duration::from_millis(10));
+        settings.wal_replay = crate::config::WalReplaySettings {
+            max_concurrent_objects: 4,
+            max_inflight_bytes: 128 * 1024,
+        };
+        let source = Db::builder(path, object_store.clone())
+            .with_settings(settings.clone())
+            .build()
+            .await
+            .unwrap();
+        let mut batch = WriteBatch::new();
+        for id in 0..64 {
+            batch.put(format!("oversized-{id:03}"), vec![id as u8; 2048]);
+        }
+
+        source
+            .write(batch)
+            .await
+            .expect("the large multi-block WAL was not acknowledged");
+        let last_flushed_wal_id = source
+            .inner
+            .wal_observer
+            .status()
+            .unwrap()
+            .last_flushed_wal_id;
+        assert!(last_flushed_wal_id > 0);
+        let listed = source
+            .inner
+            .table_store
+            .list_wal_ssts_for_replay(1..last_flushed_wal_id + 1)
+            .await
+            .unwrap();
+        assert!(listed.iter().any(|wal| wal.metadata.size > 96 * 1024));
+
+        // Keep the source open to model a crash. The replacement writer must
+        // recover the acknowledged WAL rather than relying on clean shutdown.
+        let recovered = Db::builder(path, object_store)
+            .with_settings(settings)
+            .build()
+            .await
+            .expect("replacement writer could not range-replay the oversized WAL");
+        for id in 0..64 {
+            assert_eq!(
+                recovered.get(format!("oversized-{id:03}")).await.unwrap(),
+                Some(Bytes::from(vec![id as u8; 2048]))
+            );
+        }
+
+        recovered.close().await.unwrap();
+        drop(source);
     }
 
     /// RFC-0024: WAL replay through a conforming extractor preserves the

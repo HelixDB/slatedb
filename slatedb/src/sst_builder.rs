@@ -1321,6 +1321,10 @@ mod tests {
 
     #[async_trait]
     impl BlockTransformer for XorTransformer {
+        fn max_decoded_len(&self, encoded_len: usize) -> Option<usize> {
+            Some(encoded_len)
+        }
+
         async fn encode(&self, data: Bytes) -> Result<Bytes, crate::error::Error> {
             let transformed: Vec<u8> = data.iter().map(|b| b ^ self.key).collect();
             Ok(Bytes::from(transformed))
