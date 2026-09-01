@@ -527,8 +527,14 @@ impl CloseOptions {
 
 /// Configuration for client write operations. `WriteOptions` is supplied for each
 /// write call and controls the behavior of the write.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct WriteOptions {
+    /// Whether the write call waits for the returned handle to become durable before returning.
+    ///
+    /// Defaults to `true` for compatibility with the fork's v0.15 write contract. Callers that
+    /// want v0.16's non-blocking write behavior can set this to `false` and await the returned
+    /// [`crate::WriteHandle`] when durability is required.
+    pub await_durable: bool,
     #[cfg(dst)]
     /// Force the current timestamp for DST operations. See #719 for details.
     pub now: i64,
@@ -537,6 +543,17 @@ pub struct WriteOptions {
     /// The value must be strictly greater than the current maximum sequence number
     /// or the write will fail with an `InvalidSequenceNumber` error.
     pub seqnum: u64,
+}
+
+impl Default for WriteOptions {
+    fn default() -> Self {
+        Self {
+            await_durable: true,
+            #[cfg(dst)]
+            now: 0,
+            seqnum: 0,
+        }
+    }
 }
 
 /// Configuration for client put operations. `PutOptions` is supplied for each

@@ -411,7 +411,7 @@ impl WalIteratorTrait for SlateDbWalIterator {
                                 [wal_id={}, min_seq={}, last_seq={}]",
                                 rows.last_consumed_wal_file_id, min_seq, last_seq,
                             );
-                            error!("{}", &msg);
+                            error!("{}", msg);
                             let error =
                                 Arc::from(Box::<dyn std::error::Error + Send + Sync>::from(msg));
                             return self.terminate(Err(WalError::InternalError(error)));

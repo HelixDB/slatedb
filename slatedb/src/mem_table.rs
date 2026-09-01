@@ -849,11 +849,9 @@ mod tests {
         let sample_table = sample::table(runner.rng(), 500, 10);
 
         let kv_table = WritableKVTable::new();
-        let mut seq = 1;
-        for (key, value) in &sample_table {
+        for (seq, (key, value)) in (1..).zip(&sample_table) {
             let row_entry = RowEntry::new_value(key, value, seq);
             kv_table.put(row_entry);
-            seq += 1;
         }
 
         runner

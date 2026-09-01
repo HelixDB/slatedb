@@ -249,7 +249,7 @@ impl CachedObjectStore {
 
         // Second pass: load the selected files in bounded parallelism and cache them.
         let degree_of_parallelism = 32;
-        let _result = build_concurrent(files_to_load.into_iter(), degree_of_parallelism, |path| {
+        let _result = build_concurrent(files_to_load, degree_of_parallelism, |path| {
             let this = self.clone();
             async move {
                 match this
@@ -390,7 +390,7 @@ impl CachedObjectStore {
 
         // Convert PutPayload to stream and save parts to cache.
         let entry = self.cache_storage.entry(location, self.part_size_bytes);
-        let stream = stream::iter(payload.into_iter()).map(Ok::<Bytes, object_store::Error>);
+        let stream = stream::iter(payload).map(Ok::<Bytes, object_store::Error>);
         // Save parts, ignoring errors (cache failures must not fail the PUT).
         self.save_parts_stream(entry.as_ref(), stream, 0).await.ok();
 

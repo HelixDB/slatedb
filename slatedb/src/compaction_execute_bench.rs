@@ -182,7 +182,7 @@ impl CompactionExecuteBench {
             .now()
             .signed_duration_since(start)
             .num_milliseconds();
-        info!("wrote sst [id={:?}, elapsed_ms={}]", &sst.id, elapsed_ms);
+        info!("wrote sst [id={:?}, elapsed_ms={}]", sst.id, elapsed_ms);
         Ok(())
     }
 

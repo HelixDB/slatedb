@@ -330,16 +330,29 @@ impl TryFrom<ScanOptions> for slatedb::config::ScanOptions {
 }
 
 /// Options that control writes and commits.
-#[derive(Clone, Debug, Default, uniffi::Record)]
+#[derive(Clone, Debug, uniffi::Record)]
 pub struct WriteOptions {
+    /// Whether the call waits for the write to become durable before returning.
+    #[uniffi(default = true)]
+    pub await_durable: bool,
     /// Optional caller-supplied sequence number. Zero uses SlateDB's sequence oracle.
     #[uniffi(default = 0)]
     pub seqnum: u64,
 }
 
+impl Default for WriteOptions {
+    fn default() -> Self {
+        Self {
+            await_durable: true,
+            seqnum: 0,
+        }
+    }
+}
+
 impl From<WriteOptions> for slatedb::config::WriteOptions {
     fn from(value: WriteOptions) -> Self {
         slatedb::config::WriteOptions {
+            await_durable: value.await_durable,
             seqnum: value.seqnum,
         }
     }

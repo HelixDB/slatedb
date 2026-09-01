@@ -232,7 +232,10 @@ async fn write_wal(db: &Db, index: usize, segmentation: Segmentation) {
         &key_for(index, segmentation),
         b"value-value-value-value-value",
         &PutOptions::default(),
-        &WriteOptions::default(),
+        &WriteOptions {
+            await_durable: false,
+            ..WriteOptions::default()
+        },
     )
     .await
     .expect("put failed");

@@ -655,6 +655,7 @@ mod tests {
                 #[cfg(dst)]
                 now: 0,
                 seqnum: 42,
+                ..Default::default()
             },
         );
         handler.handle(msg).await.unwrap();
@@ -700,6 +701,7 @@ mod tests {
                 #[cfg(dst)]
                 now: 0,
                 seqnum: 1,
+                ..Default::default()
             },
         );
         handler.handle(msg).await.unwrap();

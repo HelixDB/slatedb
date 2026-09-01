@@ -496,7 +496,7 @@ pub struct SortedRun {
     /// Held behind an `Arc` so cloning a `SortedRun` (e.g. per read in the
     /// scan path) is a single refcount bump rather than a deep clone of every
     /// view's `Bytes` handles.
-    sst_views: Arc<[SsTableView]>,
+    pub sst_views: Arc<[SsTableView]>,
 }
 
 impl SortedRun {

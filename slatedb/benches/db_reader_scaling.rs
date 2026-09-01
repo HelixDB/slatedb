@@ -175,7 +175,10 @@ async fn write_wal(db: &Db, index: usize, segmentation: Segmentation) -> Bytes {
         &key,
         b"value-value-value-value-value",
         &PutOptions::default(),
-        &WriteOptions::default(),
+        &WriteOptions {
+            await_durable: false,
+            ..WriteOptions::default()
+        },
     )
     .await
     .expect("put failed");
@@ -495,7 +498,10 @@ async fn benchmark_bulk_iterator(full: bool) {
             &key,
             b"value",
             &PutOptions::default(),
-            &WriteOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..WriteOptions::default()
+            },
         )
         .await
         .expect("put failed");
@@ -587,7 +593,10 @@ async fn benchmark_iterator_contention(full: bool) {
             &key_for(index, Segmentation::None),
             b"value",
             &PutOptions::default(),
-            &WriteOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..WriteOptions::default()
+            },
         )
         .await
         .expect("put failed");
@@ -1034,7 +1043,10 @@ async fn build_pinned_generations(
                 &key,
                 b"value",
                 &PutOptions::default(),
-                &WriteOptions::default(),
+                &WriteOptions {
+                    await_durable: false,
+                    ..WriteOptions::default()
+                },
             )
             .await
             .expect("put failed");

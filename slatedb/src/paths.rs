@@ -62,11 +62,11 @@ impl PathResolver {
     }
 
     pub(crate) fn wal_path(&self) -> Path {
-        Path::from(format!("{}/{}/", &self.root_path, WAL_PATH))
+        Path::from(format!("{}/{}/", self.root_path, WAL_PATH))
     }
 
     pub(crate) fn compacted_path(&self) -> Path {
-        Path::from(format!("{}/{}/", &self.root_path, COMPACTED_PATH))
+        Path::from(format!("{}/{}/", self.root_path, COMPACTED_PATH))
     }
 
     pub(crate) fn parse_table_id(&self, path: &Path) -> Result<Option<SsTableId>, SlateDBError> {

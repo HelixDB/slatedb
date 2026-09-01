@@ -370,20 +370,14 @@ pub(crate) async fn seed_database(
     wait_for_durability: bool,
 ) -> Result<(), crate::Error> {
     let put_options = PutOptions::default();
-    let write_options = WriteOptions::default();
-    let mut last_handle = None;
+    let write_options = WriteOptions {
+        await_durable: wait_for_durability,
+        ..Default::default()
+    };
 
     for (key, value) in table.iter() {
-        last_handle = Some(
-            db.put_with_options(key, value, &put_options, &write_options)
-                .await?,
-        );
-    }
-
-    if wait_for_durability {
-        if let Some(handle) = last_handle {
-            handle.await_durable().await?;
-        }
+        db.put_with_options(key, value, &put_options, &write_options)
+            .await?;
     }
 
     Ok(())

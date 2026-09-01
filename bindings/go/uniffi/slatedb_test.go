@@ -679,7 +679,7 @@ func TestDbCrudAndMetadata(t *testing.T) {
 	}
 
 	putOptions := slatedb.PutOptions{Ttl: slatedb.TtlDefault{}}
-	writeOptions := slatedb.WriteOptions{Seqnum: 0}
+	writeOptions := slatedb.WriteOptions{AwaitDurable: true, Seqnum: 0}
 
 	firstWrite, err := handle.db.Put([]byte("alpha"), []byte("one"))
 	if err != nil {
@@ -965,7 +965,7 @@ func TestDbBatchWriteAndConsumption(t *testing.T) {
 		t.Fatalf("WriteBatch.PutWithOptions(): %v", err)
 	}
 
-	secondBatchWrite, err := handle.db.WriteWithOptions(secondBatch, slatedb.WriteOptions{Seqnum: 0})
+	secondBatchWrite, err := handle.db.WriteWithOptions(secondBatch, slatedb.WriteOptions{AwaitDurable: true, Seqnum: 0})
 	if err != nil {
 		t.Fatalf("WriteWithOptions(): %v", err)
 	}
@@ -1032,7 +1032,7 @@ func TestDbMerge(t *testing.T) {
 		[]byte("merge"),
 		[]byte(":two"),
 		slatedb.MergeOptions{Ttl: slatedb.TtlDefault{}},
-		slatedb.WriteOptions{Seqnum: 0},
+		slatedb.WriteOptions{AwaitDurable: true, Seqnum: 0},
 	)
 	if err != nil {
 		t.Fatalf("MergeWithOptions(): %v", err)
@@ -3135,7 +3135,7 @@ func TestDbTtl(t *testing.T) {
 	key, value := []byte("alpha"), []byte("one")
 
 	putOptions := slatedb.PutOptions{Ttl: slatedb.TtlExpireAtMillis{Field0: 1}}
-	writeOptions := slatedb.WriteOptions{Seqnum: 0}
+	writeOptions := slatedb.WriteOptions{AwaitDurable: true, Seqnum: 0}
 	write, err := handle.db.PutWithOptions(key, value, putOptions, writeOptions)
 	if err != nil {
 		t.Fatalf("Put(alpha): %v", err)
@@ -3195,7 +3195,7 @@ const batchSeedTtlMillis = 3_600_000
 func seedBatchRows(t *testing.T, db *slatedb.Db) {
 	t.Helper()
 
-	writeOptions := slatedb.WriteOptions{Seqnum: 0}
+	writeOptions := slatedb.WriteOptions{AwaitDurable: true, Seqnum: 0}
 	for _, row := range batchSeedRows {
 		putOptions := slatedb.PutOptions{Ttl: row.ttl}
 		write, err := db.PutWithOptions([]byte(row.key), []byte(row.value), putOptions, writeOptions)
@@ -3454,7 +3454,7 @@ func openBenchDB(b *testing.B) *slatedb.Db {
 		db.Destroy()
 	})
 
-	writeOptions := slatedb.WriteOptions{Seqnum: 0}
+	writeOptions := slatedb.WriteOptions{AwaitDurable: false, Seqnum: 0}
 	putOptions := slatedb.PutOptions{Ttl: slatedb.TtlDefault{}}
 	for i := 0; i < benchScanRows; i++ {
 		key := []byte(fmt.Sprintf("bench:%06d", i))

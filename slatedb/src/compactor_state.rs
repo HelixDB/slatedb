@@ -801,8 +801,8 @@ impl Compactions {
         let latest_finished = self
             .core
             .recent_compactions
-            .iter()
-            .filter_map(|(_, c)| {
+            .values()
+            .filter_map(|c| {
                 if c.status().finished() {
                     Some(c.id())
                 } else {

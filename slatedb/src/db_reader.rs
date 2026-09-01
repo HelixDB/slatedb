@@ -2382,6 +2382,7 @@ mod tests {
             .await
             .unwrap();
         let write_opts = WriteOptions {
+            await_durable: false,
             ..Default::default()
         };
         db.put_with_options(b"abc-1", b"v1", &PutOptions::default(), &write_opts)
@@ -2475,6 +2476,7 @@ mod tests {
             .await
             .unwrap();
         let write_opts = WriteOptions {
+            await_durable: false,
             ..Default::default()
         };
         db.put_with_options(b"abc-1", b"v1", &PutOptions::default(), &write_opts)
@@ -3062,6 +3064,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_durable_write_is_visible_to_reader_opened_immediately() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/default_durable_write_is_visible_to_reader");
+        let test_provider = TestProvider::new(path, Arc::clone(&object_store));
+        let db = test_provider.new_db(Settings::default()).await.unwrap();
+
+        db.put(b"key", b"value").await.unwrap();
+
+        let reader = test_provider
+            .new_db_reader(DbReaderOptions::default(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            reader.get(b"key").await.unwrap(),
+            Some(Bytes::from_static(b"value"))
+        );
+    }
+
+    #[tokio::test]
     async fn reader_snapshot_should_remain_stable_while_wal_replay_advances() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let path = Path::from("/tmp/test_db_reader_snapshot_wal_isolation");
@@ -3076,7 +3097,10 @@ mod tests {
             .await
             .unwrap();
 
-        let write_options = WriteOptions::default();
+        let write_options = WriteOptions {
+            await_durable: false,
+            ..Default::default()
+        };
         db.put_with_options(b"key", b"v1", &PutOptions::default(), &write_options)
             .await
             .unwrap();
@@ -3160,7 +3184,10 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let write_options = WriteOptions::default();
+        let write_options = WriteOptions {
+            await_durable: false,
+            ..Default::default()
+        };
         db.put_with_options(b"key", b"v1", &PutOptions::default(), &write_options)
             .await
             .unwrap();
@@ -3269,7 +3296,10 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let write_options = WriteOptions::default();
+        let write_options = WriteOptions {
+            await_durable: false,
+            ..Default::default()
+        };
         db.put_with_options(b"key", b"v1", &PutOptions::default(), &write_options)
             .await
             .unwrap();
@@ -3426,7 +3456,10 @@ mod tests {
             })
             .await
             .unwrap();
-        let write_options = WriteOptions::default();
+        let write_options = WriteOptions {
+            await_durable: false,
+            ..Default::default()
+        };
         db.put_with_options(b"key", b"v1", &PutOptions::default(), &write_options)
             .await
             .unwrap();
@@ -3527,7 +3560,10 @@ mod tests {
             })
             .await
             .unwrap();
-        let write_options = WriteOptions::default();
+        let write_options = WriteOptions {
+            await_durable: false,
+            ..Default::default()
+        };
         db.put_with_options(b"a", b"old", &PutOptions::default(), &write_options)
             .await
             .unwrap();
@@ -5089,7 +5125,10 @@ mod tests {
             b"key",
             b"value",
             &PutOptions::default(),
-            &WriteOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -5293,6 +5332,7 @@ mod tests {
             b"a",
             &MergeOptions::default(),
             &WriteOptions {
+                await_durable: false,
                 ..Default::default()
             },
         )
@@ -5303,6 +5343,7 @@ mod tests {
             b"b",
             &MergeOptions::default(),
             &WriteOptions {
+                await_durable: false,
                 ..Default::default()
             },
         )
@@ -5345,6 +5386,7 @@ mod tests {
             b"c",
             &MergeOptions::default(),
             &WriteOptions {
+                await_durable: false,
                 ..Default::default()
             },
         )
@@ -5355,6 +5397,7 @@ mod tests {
             b"d",
             &MergeOptions::default(),
             &WriteOptions {
+                await_durable: false,
                 ..Default::default()
             },
         )

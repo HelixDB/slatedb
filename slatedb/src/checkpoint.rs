@@ -54,7 +54,7 @@ mod tests {
     use crate::block_cache_policy::BlockCachePolicy;
     use crate::checkpoint::Checkpoint;
     use crate::checkpoint::CheckpointCreateResult;
-    use crate::config::{CheckpointOptions, CheckpointScope, Settings};
+    use crate::config::{CheckpointOptions, CheckpointScope, PutOptions, Settings, WriteOptions};
     use crate::db::Db;
     use crate::db_state::{SsTableId, SsTableView};
     use crate::format::sst::SsTableFormat;
@@ -343,8 +343,16 @@ mod tests {
             .await
             .unwrap();
 
-        db.put(b"k1", b"v1").await.unwrap();
-        db.put(b"k2", b"v2").await.unwrap();
+        let write_options = WriteOptions {
+            await_durable: false,
+            ..Default::default()
+        };
+        db.put_with_options(b"k1", b"v1", &PutOptions::default(), &write_options)
+            .await
+            .unwrap();
+        db.put_with_options(b"k2", b"v2", &PutOptions::default(), &write_options)
+            .await
+            .unwrap();
 
         let checkpoint = db
             .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())

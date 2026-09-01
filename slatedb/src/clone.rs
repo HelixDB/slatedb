@@ -1475,6 +1475,7 @@ mod tests {
             .await
             .unwrap();
         let write_options = WriteOptions {
+            await_durable: false,
             ..Default::default()
         };
         let put_options = PutOptions::default();
@@ -1565,6 +1566,7 @@ mod tests {
             .await
             .unwrap();
         let write_options = WriteOptions {
+            await_durable: false,
             ..Default::default()
         };
         let put_options = PutOptions::default();

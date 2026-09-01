@@ -65,6 +65,7 @@ fn merge_options() -> MergeOptions {
 
 fn write_options() -> WriteOptions {
     WriteOptions {
+        await_durable: false,
         ..WriteOptions::default()
     }
 }

@@ -731,10 +731,7 @@ impl ManifestWriterHandler {
             self.db.oracle.advance_durable_seq(uploaded.last_seq);
         }
         self.resolve_pending_flushes();
-        for (checkpoint, result) in attached_checkpoints
-            .into_iter()
-            .zip(checkpoint_results.into_iter())
-        {
+        for (checkpoint, result) in attached_checkpoints.into_iter().zip(checkpoint_results) {
             debug!("checkpoint created [id={}]", result.id);
             let _ = checkpoint.sender.send(Ok(result));
         }

@@ -1845,6 +1845,7 @@ mod tests {
             ..Settings::default()
         };
         let write_opts = WriteOptions {
+            await_durable: false,
             ..Default::default()
         };
 
@@ -1927,7 +1928,10 @@ mod tests {
             wal_enabled: false,
             ..Settings::default()
         };
-        let write_opts = WriteOptions::default();
+        let write_opts = WriteOptions {
+            await_durable: false,
+            ..Default::default()
+        };
 
         // Two parents with disjoint single-key SSTs (the union path rejects overlaps).
         for (path, key) in [(&parent_path1, b"a"), (&parent_path2, b"z")] {

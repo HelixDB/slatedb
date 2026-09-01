@@ -243,10 +243,10 @@ pub trait DbReadOps {
 /// allowing consumers to write generic code or test doubles over the writer
 /// surface without depending on the concrete `Db` type.
 ///
-/// Write methods return after updating the in-memory WAL and MemTable. They do
-/// not wait for the write to become durable in object storage. Call
-/// [`WriteHandle::await_durable`] on the returned handle to wait for one write,
-/// or [`Self::flush`] to flush all pending writes.
+/// Durability behavior is controlled by [`WriteOptions::await_durable`], which
+/// defaults to `true`. When it is `false`, call [`WriteHandle::await_durable`]
+/// on the returned handle to wait for one write, or [`Self::flush`] to flush
+/// all pending writes.
 #[async_trait::async_trait]
 pub trait DbWriteOps {
     /// The transaction type returned by [`Self::begin`]. Stub
@@ -257,7 +257,7 @@ pub trait DbWriteOps {
     /// Write a value into the database with default `PutOptions` and
     /// `WriteOptions`.
     ///
-    /// This method does not wait for durability. See [`DbWriteOps`] for
+    /// The default write options wait for durability. See [`DbWriteOps`] for
     /// details.
     ///
     /// ## Arguments
@@ -278,8 +278,7 @@ pub trait DbWriteOps {
     /// Write a value into the database with custom `PutOptions` and
     /// `WriteOptions`.
     ///
-    /// This method does not wait for durability. See [`DbWriteOps`] for
-    /// details.
+    /// Durability behavior follows `write_opts`. See [`DbWriteOps`] for details.
     ///
     /// ## Arguments
     /// - `key`: the key to write
@@ -302,7 +301,7 @@ pub trait DbWriteOps {
 
     /// Delete a key from the database with default `WriteOptions`.
     ///
-    /// This method does not wait for durability. See [`DbWriteOps`] for
+    /// The default write options wait for durability. See [`DbWriteOps`] for
     /// details.
     ///
     /// ## Arguments
@@ -317,8 +316,7 @@ pub trait DbWriteOps {
 
     /// Delete a key from the database with custom `WriteOptions`.
     ///
-    /// This method does not wait for durability. See [`DbWriteOps`] for
-    /// details.
+    /// Durability behavior follows `options`. See [`DbWriteOps`] for details.
     ///
     /// ## Arguments
     /// - `key`: the key to delete
@@ -335,7 +333,7 @@ pub trait DbWriteOps {
     /// Merge a value into the database with default `MergeOptions` and
     /// `WriteOptions`.
     ///
-    /// This method does not wait for durability. See [`DbWriteOps`] for
+    /// The default write options wait for durability. See [`DbWriteOps`] for
     /// details.
     ///
     /// Merge operations allow applications to bypass the traditional
@@ -367,8 +365,7 @@ pub trait DbWriteOps {
     /// Merge a value into the database with custom `MergeOptions` and
     /// `WriteOptions`.
     ///
-    /// This method does not wait for durability. See [`DbWriteOps`] for
-    /// details.
+    /// Durability behavior follows `write_opts`. See [`DbWriteOps`] for details.
     ///
     /// ## Arguments
     /// - `key`: the key to merge into
@@ -392,7 +389,7 @@ pub trait DbWriteOps {
 
     /// Write a batch of put/delete operations atomically to the database.
     ///
-    /// This method does not wait for durability. See [`DbWriteOps`] for
+    /// The default write options wait for durability. See [`DbWriteOps`] for
     /// details.
     ///
     /// ## Arguments
@@ -408,8 +405,7 @@ pub trait DbWriteOps {
     /// Write a batch of put/delete operations atomically to the database with
     /// custom `WriteOptions`.
     ///
-    /// This method does not wait for durability. See [`DbWriteOps`] for
-    /// details.
+    /// Durability behavior follows `options`. See [`DbWriteOps`] for details.
     ///
     /// ## Arguments
     /// - `batch`: the batch of operations to write

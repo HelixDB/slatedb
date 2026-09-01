@@ -86,7 +86,9 @@ fn compute_prefix(lhs: &[u8], rhs: &[u8]) -> usize {
 }
 
 fn compute_prefix_chunks<const N: usize>(lhs: &[u8], rhs: &[u8]) -> usize {
-    let off = std::iter::zip(lhs.chunks_exact(N), rhs.chunks_exact(N))
+    let (lhs_chunks, _) = lhs.as_chunks::<N>();
+    let (rhs_chunks, _) = rhs.as_chunks::<N>();
+    let off = std::iter::zip(lhs_chunks, rhs_chunks)
         .take_while(|(a, b)| a == b)
         .count()
         * N;
