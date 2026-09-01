@@ -828,7 +828,7 @@ mod tests {
 
     #[test]
     fn database_missing_has_stable_code_without_changing_broad_kind() {
-        let public_err = Error::from(SlateDBError::DatabaseMissing);
+        let public_err = Error::from(DatabaseMissing);
 
         assert_eq!(public_err.kind(), ErrorKind::Data);
         assert_eq!(public_err.code(), Some(ErrorCode::DatabaseMissing));
@@ -837,7 +837,7 @@ mod tests {
     #[test]
     fn other_data_errors_do_not_claim_database_is_missing() {
         for err in [
-            SlateDBError::LatestTransactionalObjectVersionMissing,
+            LatestTransactionalObjectVersionMissing,
             SlateDBError::ManifestMissing(7),
             SlateDBError::InvalidDBState,
         ] {

@@ -1493,7 +1493,7 @@ mod tests {
             .prefix("objstore_cache_usage_snapshot_")
             .tempdir()
             .unwrap();
-        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let recorder = MetricsRecorderHelper::noop();
         let usage = Arc::new(FsCacheUsage {
             initialized: AtomicBool::new(false),
             used_bytes: AtomicU64::new(0),
@@ -1567,7 +1567,7 @@ mod tests {
             .prefix("objstore_cache_usage_updates_")
             .tempdir()
             .unwrap();
-        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let recorder = MetricsRecorderHelper::noop();
         let storage = FsCacheStorage::new(
             temp_dir.path().to_path_buf(),
             None,

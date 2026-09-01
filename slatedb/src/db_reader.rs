@@ -957,10 +957,7 @@ impl DbReaderInner {
     /// The `(last replayed WAL id, last committed seq)` the reader has already
     /// reached: the watermark of the most recently replayed table, or the
     /// manifest's own boundary when nothing has been replayed into `tables`.
-    fn replayed_watermark(
-        core: &ManifestCore,
-        tables: &ReplayMemtables,
-    ) -> (u64, u64) {
+    fn replayed_watermark(core: &ManifestCore, tables: &ReplayMemtables) -> (u64, u64) {
         match tables.front() {
             Some(latest_replayed_table) => (
                 latest_replayed_table.recent_flushed_wal_id(),
@@ -982,8 +979,8 @@ impl DbReaderInner {
         mut publish: Option<ReplayPublisher<'_>>,
         db_stats: Option<&DbStats>,
     ) -> Result<(u64, u64), SlateDBError> {
-        let (mut replay_after_wal_id, mut last_committed_seq) = replay_cursor
-            .unwrap_or_else(|| Self::replayed_watermark(core, into_tables));
+        let (mut replay_after_wal_id, mut last_committed_seq) =
+            replay_cursor.unwrap_or_else(|| Self::replayed_watermark(core, into_tables));
         let wal_id_start = replay_after_wal_id
             .checked_add(1)
             .ok_or(SlateDBError::InvalidDBState)?;
@@ -2086,7 +2083,7 @@ mod tests {
             },
             db_cache::{test_utils::TestCache, DbCache},
             db_reader::{DbReader, DbReaderInner, DbReaderMode, DbReaderOptions},
-            db_state::{SsTableId, SstType},
+            db_state::SstType,
             db_stats::DbStats,
             db_status::DbStatusManager,
             dispatcher::MessageHandler,
@@ -3079,10 +3076,7 @@ mod tests {
             .await
             .unwrap();
 
-        let write_options = WriteOptions {
-            await_durable: false,
-            ..WriteOptions::default()
-        };
+        let write_options = WriteOptions::default();
         db.put_with_options(b"key", b"v1", &PutOptions::default(), &write_options)
             .await
             .unwrap();
@@ -3166,10 +3160,7 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let write_options = WriteOptions {
-            await_durable: false,
-            ..WriteOptions::default()
-        };
+        let write_options = WriteOptions::default();
         db.put_with_options(b"key", b"v1", &PutOptions::default(), &write_options)
             .await
             .unwrap();
@@ -3278,10 +3269,7 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let write_options = WriteOptions {
-            await_durable: false,
-            ..WriteOptions::default()
-        };
+        let write_options = WriteOptions::default();
         db.put_with_options(b"key", b"v1", &PutOptions::default(), &write_options)
             .await
             .unwrap();
@@ -3438,10 +3426,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let write_options = WriteOptions {
-            await_durable: false,
-            ..WriteOptions::default()
-        };
+        let write_options = WriteOptions::default();
         db.put_with_options(b"key", b"v1", &PutOptions::default(), &write_options)
             .await
             .unwrap();
@@ -3542,10 +3527,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let write_options = WriteOptions {
-            await_durable: false,
-            ..WriteOptions::default()
-        };
+        let write_options = WriteOptions::default();
         db.put_with_options(b"a", b"old", &PutOptions::default(), &write_options)
             .await
             .unwrap();
@@ -4054,7 +4036,9 @@ mod tests {
         let reader = DbReader::open_internal(
             test_provider.manifest_store(),
             test_provider.table_store(),
+            test_provider.wal_store(),
             DbReaderMode::ManagedCheckpoint,
+            None,
             None,
             None,
             reader_options,
@@ -5105,10 +5089,7 @@ mod tests {
             b"key",
             b"value",
             &PutOptions::default(),
-            &WriteOptions {
-                await_durable: false,
-                ..WriteOptions::default()
-            },
+            &WriteOptions::default(),
         )
         .await
         .unwrap();

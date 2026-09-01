@@ -228,7 +228,7 @@ impl DbTransaction {
 
         let db_state = self.db_inner.state.read().view();
 
-        let mut key_to_idx = std::collections::HashMap::<Bytes, usize>::with_capacity(keys.len());
+        let mut key_to_idx = HashMap::<Bytes, usize>::with_capacity(keys.len());
         let mut unique_keys = Vec::<Bytes>::with_capacity(keys.len());
         let mut output_positions = Vec::<Vec<usize>>::with_capacity(keys.len());
 
