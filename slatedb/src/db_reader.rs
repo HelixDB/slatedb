@@ -421,7 +421,8 @@ impl DbReaderInner {
                     &status_manager,
                     Arc::clone(&system_clock),
                     SlateDbWalReaderOptions {
-                        read_ahead_bytes: options.max_memtable_bytes as usize,
+                        sst_batch_size: options.wal_replay.max_concurrent_objects,
+                        read_ahead_bytes: options.wal_replay.block_working_memory_limit(),
                         ..SlateDbWalReaderOptions::default()
                     },
                 ),

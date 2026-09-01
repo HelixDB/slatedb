@@ -70,7 +70,7 @@ pub(crate) struct StartCompactionJobArgs {
     /// The clock tick representing the time the compaction occurs. This is used
     /// to make decisions about retention of expiring records.
     pub(crate) compaction_clock_tick: i64,
-    /// Whether the destination sorted run is the last (newest) run after compaction.
+    /// Whether the destination sorted run is the last (oldest) run after compaction.
     pub(crate) is_dest_last_run: bool,
     /// Optional minimum sequence to retain; lower sequences may be dropped by retention. This
     /// value is used only when planning the compaction. Once the compaction has started, if it is
@@ -387,17 +387,22 @@ impl TokioCompactionExecutorInner {
         let sr_merge_iter = MergeIterator::new(sr_iters)?.with_dedup(false);
 
         let merge_iter = MergeIterator::new([l0_merge_iter, sr_merge_iter])?.with_dedup(false);
-        let merge_iter: Box<dyn TrackedRowEntryIterator> =
-            if let Some(merge_operator) = self.merge_operator.clone() {
-                Box::new(MergeOperatorIterator::new(
-                    merge_operator,
-                    merge_iter,
-                    false,
-                    retention_min_seq,
-                ))
+        let merge_iter: Box<dyn TrackedRowEntryIterator> = if let Some(merge_operator) =
+            self.merge_operator.clone()
+        {
+            let merge_iter =
+                MergeOperatorIterator::new(merge_operator, merge_iter, false, retention_min_seq);
+            let merge_iter = if job_args.is_dest_last_run {
+                // The oldest run is part of this compaction, so a missing
+                // base is authoritative rather than hidden in a lower run.
+                merge_iter.with_resolved_missing_base()
             } else {
-                Box::new(MergeOperatorRequiredIterator::new(merge_iter))
+                merge_iter
             };
+            Box::new(merge_iter)
+        } else {
+            Box::new(MergeOperatorRequiredIterator::new(merge_iter))
+        };
 
         let mut retention_iter = RetentionIterator::new(
             merge_iter,
@@ -1012,6 +1017,7 @@ mod tests {
     use crate::bytes_range::BytesRange;
     use crate::format::sst::SsTableFormat;
     use crate::manifest::ManifestCore;
+    use crate::merge_operator::{MergeOperator, MergeOperatorError, MergeResult};
     use crate::object_stores::ObjectStores;
     use crate::proptest_util::arbitrary;
     use crate::sst_iter::SstView;
@@ -1033,6 +1039,50 @@ mod tests {
     use std::cmp::Ordering;
     use std::collections::HashSet;
     use std::time::Duration;
+
+    struct TombstoneOnRemoveMergeOperator;
+
+    impl MergeOperator for TombstoneOnRemoveMergeOperator {
+        fn merge(
+            &self,
+            _key: &Bytes,
+            existing_value: Option<Bytes>,
+            value: Bytes,
+        ) -> Result<Bytes, MergeOperatorError> {
+            Ok(existing_value.unwrap_or(value))
+        }
+
+        fn merge_batch(
+            &self,
+            _key: &Bytes,
+            existing_value: Option<Bytes>,
+            operands: &[Bytes],
+        ) -> Result<Bytes, MergeOperatorError> {
+            existing_value
+                .or_else(|| operands.last().cloned())
+                .ok_or(MergeOperatorError::EmptyBatch)
+        }
+
+        fn merge_batch_with_base(
+            &self,
+            _key: &Bytes,
+            _existing_value: Option<Bytes>,
+            operands: &[Bytes],
+        ) -> Result<MergeResult, MergeOperatorError> {
+            if operands
+                .last()
+                .is_some_and(|operand| operand.as_ref() == b"remove")
+            {
+                Ok(MergeResult::Tombstone)
+            } else {
+                operands
+                    .last()
+                    .cloned()
+                    .map(MergeResult::Value)
+                    .ok_or(MergeOperatorError::EmptyBatch)
+            }
+        }
+    }
 
     async fn write_sst(
         table_store: &Arc<TableStore>,
@@ -2884,8 +2934,13 @@ mod tests {
         }
     }
 
+    #[rstest]
+    #[case::non_terminal(false)]
+    #[case::terminal(true)]
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_compaction_job_should_retain_merges_newer_than_retention_min_seq_num() {
+    async fn test_compaction_job_should_retain_merges_newer_than_retention_min_seq_num(
+        #[case] is_dest_last_run: bool,
+    ) {
         let ctx = TestContextBuilder::new("testdb")
             .with_merge_operator(Arc::new(StringConcatMergeOperator {}))
             .build()
@@ -2916,7 +2971,7 @@ mod tests {
         let retention_min_seq_num = 2;
 
         let result = ctx
-            .run_compaction(vec![l0], false, Some(retention_min_seq_num))
+            .run_compaction(vec![l0], is_dest_last_run, Some(retention_min_seq_num))
             .await
             .unwrap();
 
@@ -2945,11 +3000,69 @@ mod tests {
         assert_eq!(next.seq, retention_min_seq_num + 1);
         let next = iter.next().await.unwrap().unwrap();
         assert_eq!(next.key, Bytes::from(b"foo".as_slice()));
-        assert_eq!(
-            next.value,
-            ValueDeletable::Merge(Bytes::from(b"01".as_slice()))
-        );
+        let expected_boundary = if is_dest_last_run {
+            ValueDeletable::Value(Bytes::from_static(b"01"))
+        } else {
+            ValueDeletable::Merge(Bytes::from_static(b"01"))
+        };
+        assert_eq!(next.value, expected_boundary);
         assert_eq!(next.seq, retention_min_seq_num);
+        assert!(iter.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_terminal_compaction_should_drop_tombstone_result_without_base() {
+        let ctx = TestContextBuilder::new("testdb-terminal-merge-tombstone")
+            .with_merge_operator(Arc::new(TombstoneOnRemoveMergeOperator))
+            .build()
+            .await;
+        let table_store = ctx.table_store.clone();
+
+        let mut sst_builder = table_store.table_builder();
+        sst_builder
+            .add(RowEntry::new_merge(b"foo", b"remove", 1))
+            .await
+            .unwrap();
+        let encoded_sst = sst_builder.build().await.unwrap();
+        let id = SsTableId::Compacted(Ulid::new());
+        let l0 = table_store.write_sst(&id, &encoded_sst).await.unwrap();
+
+        let result = ctx.run_compaction(vec![l0], true, None).await.unwrap();
+
+        assert!(result.sst_views.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_non_terminal_compaction_should_preserve_tombstone_capable_merge_without_base() {
+        let ctx = TestContextBuilder::new("testdb-non-terminal-merge-tombstone")
+            .with_merge_operator(Arc::new(TombstoneOnRemoveMergeOperator))
+            .build()
+            .await;
+        let table_store = ctx.table_store.clone();
+
+        let mut sst_builder = table_store.table_builder();
+        sst_builder
+            .add(RowEntry::new_merge(b"foo", b"remove", 1))
+            .await
+            .unwrap();
+        let encoded_sst = sst_builder.build().await.unwrap();
+        let id = SsTableId::Compacted(Ulid::new());
+        let l0 = table_store.write_sst(&id, &encoded_sst).await.unwrap();
+
+        let result = ctx.run_compaction(vec![l0], false, None).await.unwrap();
+
+        assert_eq!(result.sst_views.len(), 1);
+        let mut iter = SstIterator::new(
+            SstView::Borrowed(&result.sst_views[0], BytesRange::from(..)),
+            table_store,
+            SstIteratorOptions::default(),
+        )
+        .unwrap();
+        iter.init().await.unwrap();
+        assert_eq!(
+            iter.next().await.unwrap(),
+            Some(RowEntry::new_merge(b"foo", b"remove", 1))
+        );
         assert!(iter.next().await.unwrap().is_none());
     }
 

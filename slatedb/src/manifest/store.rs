@@ -50,6 +50,25 @@ impl FenceableManifest {
         Ok(Self { inner: fr, clock })
     }
 
+    pub(crate) async fn init_writer_with_epoch(
+        stored_manifest: StoredManifest,
+        manifest_update_timeout: Duration,
+        system_clock: Arc<dyn SystemClock>,
+        writer_epoch: u64,
+    ) -> Result<Self, SlateDBError> {
+        let clock = system_clock.clone();
+        let fr = FenceableTransactionalObject::init_with_epoch(
+            stored_manifest.inner,
+            manifest_update_timeout,
+            system_clock,
+            writer_epoch,
+            |m: &Manifest| m.writer_epoch,
+            |m: &mut Manifest, epoch: u64| m.writer_epoch = epoch,
+        )
+        .await?;
+        Ok(Self { inner: fr, clock })
+    }
+
     pub(crate) async fn init_compactor(
         stored_manifest: StoredManifest,
         manifest_update_timeout: Duration,
@@ -810,6 +829,48 @@ mod tests {
                 .unwrap();
             let manifest = ms.read_latest_manifest().await.unwrap();
             assert_eq!(manifest.manifest.writer_epoch, i);
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_writer_epoch_rejects_equal_and_stale_claims_without_advancing() {
+        let store = new_memory_manifest_store();
+        StoredManifest::create_new_db(
+            store.clone(),
+            ManifestCore::new(),
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+        let timeout = Duration::from_secs(300);
+
+        let stored = StoredManifest::load(store.clone(), Arc::new(DefaultSystemClock::new()))
+            .await
+            .unwrap();
+        let claimed = FenceableManifest::init_writer_with_epoch(
+            stored,
+            timeout,
+            Arc::new(DefaultSystemClock::new()),
+            12,
+        )
+        .await
+        .unwrap();
+        assert_eq!(claimed.local_epoch(), 12);
+
+        for stale_epoch in [11, 12] {
+            let stored = StoredManifest::load(store.clone(), Arc::new(DefaultSystemClock::new()))
+                .await
+                .unwrap();
+            let result = FenceableManifest::init_writer_with_epoch(
+                stored,
+                timeout,
+                Arc::new(DefaultSystemClock::new()),
+                stale_epoch,
+            )
+            .await;
+            assert!(matches!(result, Err(SlateDBError::Fenced)));
+            let latest = store.read_latest_manifest().await.unwrap();
+            assert_eq!(latest.manifest.writer_epoch, 12);
         }
     }
 

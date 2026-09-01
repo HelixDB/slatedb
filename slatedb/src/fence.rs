@@ -9,6 +9,7 @@ use crate::Settings;
 use fail_parallel::{fail_point_send, FailPointTx};
 use slatedb_common::metrics::MetricsRecorderHelper;
 use slatedb_common::SystemClock;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -87,6 +88,7 @@ impl WriterFencer {
     pub(crate) async fn fence(
         mut self,
         stored_manifest: StoredManifest,
+        writer_epoch: Option<NonZeroU64>,
     ) -> Result<WriterFenceResult, SlateDBError> {
         let wal_writer_init = match self.wal_writer_init.take() {
             Some(wal_writer_init) => wal_writer_init,
@@ -104,12 +106,25 @@ impl WriterFencer {
             ),
         };
 
-        let manifest = FenceableManifest::init_writer(
-            stored_manifest,
-            self.manifest_update_timeout,
-            self.system_clock.clone(),
-        )
-        .await?;
+        let manifest = match writer_epoch {
+            Some(writer_epoch) => {
+                FenceableManifest::init_writer_with_epoch(
+                    stored_manifest,
+                    self.manifest_update_timeout,
+                    self.system_clock.clone(),
+                    writer_epoch.get(),
+                )
+                .await?
+            }
+            None => {
+                FenceableManifest::init_writer(
+                    stored_manifest,
+                    self.manifest_update_timeout,
+                    self.system_clock.clone(),
+                )
+                .await?
+            }
+        };
         self.fail_point_send("FenceManifest");
 
         let mut manifest = manifest.into();
@@ -414,7 +429,7 @@ mod tests {
         h.put(&db, 1, false).await;
         let fencer = h.fencer.take().unwrap();
 
-        let result = fencer.fence(h.stored_manifest.take().unwrap()).await;
+        let result = fencer.fence(h.stored_manifest.take().unwrap(), None).await;
 
         assert!(result.is_ok());
         h.put(&db, 2, true).await;
@@ -461,7 +476,7 @@ mod tests {
 
         let fencer = h.fencer.take().unwrap();
         let stored_manifest = h.stored_manifest.take().unwrap();
-        let jh = tokio::task::spawn(async move { fencer.fence(stored_manifest).await });
+        let jh = tokio::task::spawn(async move { fencer.fence(stored_manifest, None).await });
         // wait for LoadEmptyWalId pause
         assert_eq!(h.event_rx.recv().await.unwrap(), "LoadEmptyWalId");
 
@@ -563,7 +578,7 @@ mod tests {
         // spawn WriterFencer on another task
         let fencer = h.fencer.take().unwrap();
         let stored_manifest = h.stored_manifest.take().unwrap();
-        let jh = tokio::task::spawn(async move { fencer.fence(stored_manifest).await });
+        let jh = tokio::task::spawn(async move { fencer.fence(stored_manifest, None).await });
         // wait for fencer to load empty wal id and pause
         h.event_rx.recv().await.unwrap();
 

@@ -330,7 +330,7 @@ mod tests {
 
         // when: encoding and decoding
         let encoded = block.encode();
-        let decoded = Block::decode(encoded);
+        let decoded = Block::decode(encoded).unwrap();
 
         // then: blocks are equal
         assert_eq!(block.data, decoded.data);
@@ -569,7 +569,7 @@ mod tests {
 
         // Verify the block can be encoded and decoded
         let encoded = block.encode();
-        let decoded = Block::decode(encoded);
+        let decoded = Block::decode(encoded).unwrap();
 
         assert_eq!(block.data, decoded.data);
         assert_eq!(block.offsets, decoded.offsets);

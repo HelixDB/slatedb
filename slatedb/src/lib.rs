@@ -53,7 +53,7 @@ pub use db_cache::CacheTarget;
 pub use db_iter::{DbIterator, DbRecencyIterator};
 pub use db_reader::{DbReader, DbReaderMode};
 pub use db_snapshot::DbSnapshot;
-pub use db_transaction::DbTransaction;
+pub use db_transaction::{DbTransaction, DisjointMergeBatchEntry};
 pub use error::{CloseReason, Error, ErrorCode, ErrorKind};
 pub use filter::BloomFilter;
 pub use filter_policy::{
@@ -65,7 +65,7 @@ pub use garbage_collector::{GarbageCollectorBuilder, GcFilter};
 pub use instrumented_object_store::stats as instrumented_object_store_stats;
 pub use iter::IterationOrder;
 pub use manifest::VersionedManifest;
-pub use merge_operator::{MergeOperator, MergeOperatorError};
+pub use merge_operator::{MergeOperator, MergeOperatorError, MergeResult};
 pub use ops::{DbCacheManagerOps, DbMetadataOps, DbReadOps, DbTransactionOps, DbWriteOps};
 pub use paths::PathResolver;
 pub use prefix_extractor::{PrefixExtractor, PrefixTarget};
@@ -160,6 +160,7 @@ mod peeking_iterator;
 #[cfg(test)]
 mod proptest_util;
 mod reader;
+mod replay_task_scope;
 mod retention_iterator;
 mod retrying_object_store;
 mod segment_iterator;

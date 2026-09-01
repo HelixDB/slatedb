@@ -1,22 +1,26 @@
 #![allow(dead_code)] // This store is intentionally implemented before its call sites are migrated.
 
 use std::collections::VecDeque;
+use std::mem::size_of;
 use std::ops::Range;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use fail_parallel::{fail_point, FailPointRegistry};
-use futures::future::join_all;
+use futures::{future::join_all, StreamExt};
 use log::debug;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions};
 use serde::Serialize;
+use slatedb_common::object_metadata::IdentifiedObjectMetadata;
 
 use crate::db_state::{SsTableId, SsTableInfo, SstType};
 use crate::error::SlateDBError;
 use crate::flatbuffer_types::SsTableIndexOwned;
 use crate::format::block::Block;
-use crate::format::sst::{EncodedSsTable, SsTableFormat};
+use crate::format::sst::{
+    EncodedSsTable, SsTableFormat, CHECKSUM_SIZE, METADATA_OFFSET_SIZE, VERSION_SIZE,
+};
 use crate::object_store_tag::{ObjectStoreCallTag, TableStoreKind};
 use crate::paths::PathResolver;
 use crate::sst_io::{read_obj, read_with_validation_retry, ReadOnlyObject};
@@ -102,9 +106,173 @@ impl WalTableStore {
         self.sst_format.wal_table_builder()
     }
 
+    #[cfg(test)]
+    pub(crate) fn wal_table_builder(&self) -> EncodedWalSsTableBuilder {
+        self.table_builder()
+    }
+
     pub(crate) fn estimate_encoded_size(&self, num_entries: usize, size_entries: usize) -> usize {
         self.sst_format
             .estimate_encoded_size_wal(num_entries, size_entries)
+    }
+
+    pub(crate) fn validate_wal_sst_replay_memory(
+        &self,
+        encoded_sst: &EncodedSsTable,
+        metadata_memory_limit: usize,
+        block_memory_limit: usize,
+    ) -> Result<(), SlateDBError> {
+        let index_encoded_bytes = usize::try_from(encoded_sst.info.index_len).map_err(|_| {
+            SlateDBError::WalReplayMemoryLimitExceeded {
+                kind: "encoded and decoded WAL index",
+                required_bytes: usize::MAX,
+                limit_bytes: metadata_memory_limit,
+            }
+        })?;
+        let metadata_encoded_bytes = encoded_sst
+            .footer
+            .len()
+            .checked_sub(METADATA_OFFSET_SIZE + VERSION_SIZE)
+            .and_then(|footer_bytes| footer_bytes.checked_sub(index_encoded_bytes))
+            .ok_or(SlateDBError::InvalidDBState)?;
+        let retained_info_bytes = encoded_sst
+            .info
+            .first_entry
+            .as_ref()
+            .map_or(0, Bytes::len)
+            .checked_add(encoded_sst.info.last_entry.as_ref().map_or(0, Bytes::len))
+            .ok_or(SlateDBError::WalReplayMemoryLimitExceeded {
+                kind: "encoded and decoded WAL metadata",
+                required_bytes: usize::MAX,
+                limit_bytes: metadata_memory_limit,
+            })?;
+        let metadata_required_bytes = metadata_encoded_bytes
+            .checked_add(retained_info_bytes)
+            .ok_or(SlateDBError::WalReplayMemoryLimitExceeded {
+                kind: "encoded and decoded WAL metadata",
+                required_bytes: usize::MAX,
+                limit_bytes: metadata_memory_limit,
+            })?;
+        if metadata_required_bytes > metadata_memory_limit {
+            return Err(SlateDBError::WalReplayMemoryLimitExceeded {
+                kind: "encoded and decoded WAL metadata",
+                required_bytes: metadata_required_bytes,
+                limit_bytes: metadata_memory_limit,
+            });
+        }
+
+        let index_payload_bytes = index_encoded_bytes
+            .checked_sub(CHECKSUM_SIZE)
+            .ok_or(SlateDBError::InvalidDBState)?;
+        let transformed_index_bytes = match &self.sst_format.block_transformer {
+            Some(transformer) => transformer.max_decoded_len(index_payload_bytes).ok_or(
+                SlateDBError::WalReplayMemoryLimitExceeded {
+                    kind: "transformed WAL index",
+                    required_bytes: usize::MAX,
+                    limit_bytes: metadata_memory_limit,
+                },
+            )?,
+            None => 0,
+        };
+        let index_required_bytes = retained_info_bytes
+            .checked_add(index_encoded_bytes)
+            .and_then(|bytes| bytes.checked_add(transformed_index_bytes))
+            .and_then(|bytes| bytes.checked_add(encoded_sst.index.size()))
+            .ok_or(SlateDBError::WalReplayMemoryLimitExceeded {
+                kind: "encoded and decoded WAL index",
+                required_bytes: usize::MAX,
+                limit_bytes: metadata_memory_limit,
+            })?;
+        if index_required_bytes > metadata_memory_limit {
+            return Err(SlateDBError::WalReplayMemoryLimitExceeded {
+                kind: "encoded and decoded WAL index",
+                required_bytes: index_required_bytes,
+                limit_bytes: metadata_memory_limit,
+            });
+        }
+
+        for block in &encoded_sst.unconsumed_blocks {
+            let encoded_payload_bytes = block
+                .encoded_bytes
+                .len()
+                .checked_sub(CHECKSUM_SIZE)
+                .ok_or(SlateDBError::InvalidDBState)?;
+            let transformed_block_bytes = match &self.sst_format.block_transformer {
+                Some(transformer) => transformer.max_decoded_len(encoded_payload_bytes).ok_or(
+                    SlateDBError::WalReplayMemoryLimitExceeded {
+                        kind: "transformed WAL block",
+                        required_bytes: usize::MAX,
+                        limit_bytes: block_memory_limit,
+                    },
+                )?,
+                None => 0,
+            };
+            let offsets_bytes = block
+                .block
+                .offsets
+                .len()
+                .checked_mul(size_of::<u16>())
+                .ok_or(SlateDBError::WalReplayMemoryLimitExceeded {
+                    kind: "encoded and decoded WAL block",
+                    required_bytes: usize::MAX,
+                    limit_bytes: block_memory_limit,
+                })?;
+            let required_bytes = block
+                .encoded_bytes
+                .len()
+                .checked_add(transformed_block_bytes)
+                .and_then(|bytes| bytes.checked_add(block.block.size()))
+                .and_then(|bytes| bytes.checked_add(offsets_bytes))
+                .ok_or(SlateDBError::WalReplayMemoryLimitExceeded {
+                    kind: "encoded and decoded WAL block",
+                    required_bytes: usize::MAX,
+                    limit_bytes: block_memory_limit,
+                })?;
+            if required_bytes > block_memory_limit {
+                return Err(SlateDBError::WalReplayMemoryLimitExceeded {
+                    kind: "encoded and decoded WAL block",
+                    required_bytes,
+                    limit_bytes: block_memory_limit,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn list_wal_ssts_for_replay(
+        &self,
+        id_range: Range<u64>,
+    ) -> Result<Vec<IdentifiedObjectMetadata<SsTableId>>, SlateDBError> {
+        if id_range.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let wal_path = self.path_resolver.wal_path();
+        let mut files = if id_range.start == 0 {
+            self.object_store.list(Some(&wal_path))
+        } else {
+            let offset = self.path(id_range.start - 1);
+            self.object_store.list_with_offset(Some(&wal_path), &offset)
+        };
+        let mut wal_files = Vec::new();
+        while let Some(file) = files.next().await.transpose()? {
+            let Ok(Some(SsTableId::Wal(wal_id))) =
+                self.path_resolver.parse_table_id(&file.location)
+            else {
+                continue;
+            };
+            if wal_id >= id_range.end {
+                break;
+            }
+            if wal_id >= id_range.start {
+                wal_files.push(IdentifiedObjectMetadata::from_object_meta(
+                    SsTableId::Wal(wal_id),
+                    file,
+                ));
+            }
+        }
+        wal_files.sort_by_key(|metadata| metadata.id.unwrap_wal_id());
+        Ok(wal_files)
     }
 
     /// Writes a WAL SST with create-if-absent semantics required for fencing.

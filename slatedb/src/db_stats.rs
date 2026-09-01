@@ -40,12 +40,27 @@ pub const SST_FILTER_NEGATIVE_COUNT: &str = db_stat_name!("sst_filter_negative_c
 ///   write_amp = (`WAL_FLUSH_BYTES` + `L0_FLUSH_BYTES` + `compactor::stats::BYTES_COMPACTED`)
 ///               / `MEMTABLE_WRITE_BYTES`
 pub const MEMTABLE_WRITE_BYTES: &str = db_stat_name!("memtable_write_bytes");
+pub const CONFLICT_METADATA_RETAINED_BYTES: &str =
+    db_stat_name!("conflict_metadata_retained_bytes");
+pub const CONFLICT_METADATA_RETAINED_TOKENS: &str =
+    db_stat_name!("conflict_metadata_retained_tokens");
+pub const CONFLICT_METADATA_QUOTA_REJECTIONS: &str =
+    db_stat_name!("conflict_metadata_quota_rejections");
 pub const READER_WAL_REPLAY_SSTS: &str = db_stat_name!("reader_wal_replay_ssts");
 pub const READER_WAL_REPLAY_BYTES: &str = db_stat_name!("reader_wal_replay_bytes");
 pub const READER_WAL_REPLAY_BATCHES: &str = db_stat_name!("reader_wal_replay_batches");
 pub const READER_REPLAY_MEMTABLES: &str = db_stat_name!("reader_replay_memtables");
 pub const READER_ACTIVE_CHECKPOINTS: &str = db_stat_name!("reader_active_checkpoints");
 pub const READER_MANIFEST_POLLS: &str = db_stat_name!("reader_manifest_polls");
+pub const READER_WAL_REPLAY_OBJECT_STORE_CALLS: &str =
+    db_stat_name!("reader_wal_replay_object_store_calls");
+pub const REPLAY_SOURCE_LABEL: &str = "source";
+pub const REPLAY_OPERATION_LABEL: &str = "operation";
+pub const REPLAY_OPERATION_LIST: &str = "list";
+pub const REPLAY_SOURCE_READER_OPEN: &str = "reader_open";
+pub const REPLAY_SOURCE_CHECKPOINT_RECOVERY: &str = "checkpoint_recovery";
+pub const REPLAY_SOURCE_RUNTIME_MANIFEST: &str = "runtime_manifest";
+pub const REPLAY_SOURCE_RUNTIME_TAIL: &str = "runtime_tail";
 
 /// Label key distinguishing filter metrics for point lookups from those for
 /// prefix scans. Value is one of [`FILTER_KIND_POINT`] or
@@ -81,12 +96,19 @@ pub(crate) struct DbStatsInner {
     pub(crate) merge_operator_read_operands: Arc<dyn CounterFn>,
     pub(crate) merge_operator_flush_operands: Arc<dyn CounterFn>,
     pub(crate) memtable_write_bytes: Arc<dyn CounterFn>,
+    pub(crate) conflict_metadata_retained_bytes: Arc<dyn GaugeFn>,
+    pub(crate) conflict_metadata_retained_tokens: Arc<dyn GaugeFn>,
+    pub(crate) conflict_metadata_quota_rejections: Arc<dyn CounterFn>,
     pub(crate) reader_wal_replay_ssts: Arc<dyn CounterFn>,
     pub(crate) reader_wal_replay_bytes: Arc<dyn CounterFn>,
     pub(crate) reader_wal_replay_batches: Arc<dyn CounterFn>,
     pub(crate) reader_replay_memtables: Arc<dyn GaugeFn>,
     pub(crate) reader_active_checkpoints: Arc<dyn GaugeFn>,
     pub(crate) reader_manifest_polls: Arc<dyn CounterFn>,
+    #[allow(dead_code)]
+    pub(crate) reader_wal_replay_list_reader_open: Arc<dyn CounterFn>,
+    #[allow(dead_code)]
+    pub(crate) reader_wal_replay_list_checkpoint_recovery: Arc<dyn CounterFn>,
 }
 
 #[derive(Clone)]
@@ -173,6 +195,15 @@ impl DbStats {
                 .description(MERGE_OPERATOR_OPERANDS_DESCRIPTION)
                 .register(),
             memtable_write_bytes: recorder.counter(MEMTABLE_WRITE_BYTES).register(),
+            conflict_metadata_retained_bytes: recorder
+                .gauge(CONFLICT_METADATA_RETAINED_BYTES)
+                .register(),
+            conflict_metadata_retained_tokens: recorder
+                .gauge(CONFLICT_METADATA_RETAINED_TOKENS)
+                .register(),
+            conflict_metadata_quota_rejections: recorder
+                .counter(CONFLICT_METADATA_QUOTA_REJECTIONS)
+                .register(),
             reader_wal_replay_ssts: recorder.counter(READER_WAL_REPLAY_SSTS).register(),
             reader_wal_replay_bytes: recorder.counter(READER_WAL_REPLAY_BYTES).register(),
             reader_wal_replay_batches: recorder.counter(READER_WAL_REPLAY_BATCHES).register(),
@@ -187,7 +218,38 @@ impl DbStats {
                 .counter(READER_MANIFEST_POLLS)
                 .description("Number of successful DbReader manifest polls completed")
                 .register(),
+            reader_wal_replay_list_reader_open: recorder
+                .counter(READER_WAL_REPLAY_OBJECT_STORE_CALLS)
+                .labels(&[
+                    (REPLAY_SOURCE_LABEL, REPLAY_SOURCE_READER_OPEN),
+                    (REPLAY_OPERATION_LABEL, REPLAY_OPERATION_LIST),
+                ])
+                .register(),
+            reader_wal_replay_list_checkpoint_recovery: recorder
+                .counter(READER_WAL_REPLAY_OBJECT_STORE_CALLS)
+                .labels(&[
+                    (REPLAY_SOURCE_LABEL, REPLAY_SOURCE_CHECKPOINT_RECOVERY),
+                    (REPLAY_OPERATION_LABEL, REPLAY_OPERATION_LIST),
+                ])
+                .register(),
         };
+        // Register zero-valued runtime series so live monitoring can prove
+        // runtime replay did not LIST without conflating fencing, GC, or
+        // maintenance operations from the same object store.
+        recorder
+            .counter(READER_WAL_REPLAY_OBJECT_STORE_CALLS)
+            .labels(&[
+                (REPLAY_SOURCE_LABEL, REPLAY_SOURCE_RUNTIME_MANIFEST),
+                (REPLAY_OPERATION_LABEL, REPLAY_OPERATION_LIST),
+            ])
+            .register();
+        recorder
+            .counter(READER_WAL_REPLAY_OBJECT_STORE_CALLS)
+            .labels(&[
+                (REPLAY_SOURCE_LABEL, REPLAY_SOURCE_RUNTIME_TAIL),
+                (REPLAY_OPERATION_LABEL, REPLAY_OPERATION_LIST),
+            ])
+            .register();
         DbStats {
             inner: Arc::new(inner),
         }

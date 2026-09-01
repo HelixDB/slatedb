@@ -1,9 +1,13 @@
+use crate::batch::DisjointMergeDiscriminators;
 use crate::bytes_range::BytesRange;
+use crate::db_stats::DbStats;
+use crate::error::SlateDBError;
 use crate::oracle::{DbOracle, Oracle};
 use crate::utils::IdGenerator;
 use bytes::Bytes;
 use log::warn;
 use parking_lot::RwLock;
+use slatedb_common::metrics::{CounterFn, GaugeFn};
 use slatedb_common::DbRand;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::RangeBounds;
@@ -22,16 +26,19 @@ pub enum IsolationLevel {
 }
 
 /// Conflict behavior for a transaction's final operations on one key.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TransactionWriteKind {
     /// The key conflicts with every concurrent write to the same key.
     Exclusive,
     /// The key is merge-only and may coexist with another merge-only,
     /// commutative write to the same key.
     CommutativeMerge,
+    /// Merge operations may coexist only when their logical discriminator
+    /// sets do not overlap.
+    DisjointMerge(DisjointMergeDiscriminators),
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct TransactionState {
     /// The sequence number when the transaction started. This is used to establish
     /// a snapshot of this transaction.
@@ -52,6 +59,18 @@ pub(crate) struct TransactionState {
 }
 
 impl TransactionState {
+    fn conflict_metadata_usage(&self) -> (usize, usize) {
+        self.writes.values().fold((0, 0), |(bytes, tokens), kind| {
+            let TransactionWriteKind::DisjointMerge(discriminators) = kind else {
+                return (bytes, tokens);
+            };
+            (
+                bytes.saturating_add(discriminators.payload_bytes()),
+                tokens.saturating_add(discriminators.len()),
+            )
+        })
+    }
+
     /// Add writes to this transaction's write set for conflict detection.
     ///
     /// Exclusive behavior dominates when a key is tracked more than once so a
@@ -61,7 +80,18 @@ impl TransactionState {
             self.writes
                 .entry(key)
                 .and_modify(|existing| {
-                    if *existing != kind {
+                    let compatible = match (&mut *existing, &kind) {
+                        (
+                            TransactionWriteKind::CommutativeMerge,
+                            TransactionWriteKind::CommutativeMerge,
+                        ) => true,
+                        (
+                            TransactionWriteKind::DisjointMerge(existing),
+                            TransactionWriteKind::DisjointMerge(next),
+                        ) => existing.extend_from(next),
+                        _ => false,
+                    };
+                    if !compatible {
                         *existing = TransactionWriteKind::Exclusive;
                     }
                 })
@@ -106,6 +136,16 @@ pub(crate) struct TransactionManager {
     inner: Arc<RwLock<TransactionManagerInner>>,
     /// Random number generator for generating transaction IDs
     db_rand: Arc<DbRand>,
+    max_transaction_conflict_metadata_bytes: usize,
+    max_retained_conflict_metadata_bytes: usize,
+    conflict_metadata_metrics: Option<ConflictMetadataMetrics>,
+}
+
+#[derive(Clone)]
+struct ConflictMetadataMetrics {
+    retained_bytes: Arc<dyn GaugeFn>,
+    retained_tokens: Arc<dyn GaugeFn>,
+    quota_rejections: Arc<dyn CounterFn>,
 }
 
 struct TransactionManagerInner {
@@ -120,20 +160,74 @@ struct TransactionManagerInner {
     ///   committed_seq` and follow the same GC rule.
     /// - If there are no active transactions, this deque can be fully drained.
     recent_committed_txns: VecDeque<TransactionState>,
+    /// Exact discriminator payload retained by active and recent transactions.
+    ///
+    /// These counters make quota admission and metric publication independent
+    /// of the number of concurrently retained transaction states.
+    retained_conflict_metadata_bytes: usize,
+    retained_conflict_metadata_tokens: usize,
     /// The oracle for tracking the last committed sequence number.
     oracle: Arc<DbOracle>,
 }
 
 impl TransactionManager {
+    #[cfg(test)]
     pub(crate) fn new(oracle: Arc<DbOracle>, db_rand: Arc<DbRand>) -> Self {
+        Self::new_inner(oracle, db_rand, usize::MAX, usize::MAX, None)
+    }
+
+    pub(crate) fn new_with_limits(
+        oracle: Arc<DbOracle>,
+        db_rand: Arc<DbRand>,
+        max_transaction_conflict_metadata_bytes: usize,
+        max_retained_conflict_metadata_bytes: usize,
+        db_stats: &DbStats,
+    ) -> Self {
+        Self::new_inner(
+            oracle,
+            db_rand,
+            max_transaction_conflict_metadata_bytes,
+            max_retained_conflict_metadata_bytes,
+            Some(ConflictMetadataMetrics {
+                retained_bytes: db_stats.conflict_metadata_retained_bytes.clone(),
+                retained_tokens: db_stats.conflict_metadata_retained_tokens.clone(),
+                quota_rejections: db_stats.conflict_metadata_quota_rejections.clone(),
+            }),
+        )
+    }
+
+    fn new_inner(
+        oracle: Arc<DbOracle>,
+        db_rand: Arc<DbRand>,
+        max_transaction_conflict_metadata_bytes: usize,
+        max_retained_conflict_metadata_bytes: usize,
+        conflict_metadata_metrics: Option<ConflictMetadataMetrics>,
+    ) -> Self {
         Self {
             inner: Arc::new(RwLock::new(TransactionManagerInner {
                 active_txns: HashMap::new(),
                 recent_committed_txns: VecDeque::new(),
+                retained_conflict_metadata_bytes: 0,
+                retained_conflict_metadata_tokens: 0,
                 oracle,
             })),
             db_rand,
+            max_transaction_conflict_metadata_bytes,
+            max_retained_conflict_metadata_bytes,
+            conflict_metadata_metrics,
         }
+    }
+
+    fn update_conflict_metadata_metrics(&self, inner: &TransactionManagerInner) {
+        let Some(metrics) = &self.conflict_metadata_metrics else {
+            return;
+        };
+        metrics
+            .retained_bytes
+            .set(i64::try_from(inner.retained_conflict_metadata_bytes).unwrap_or(i64::MAX));
+        metrics
+            .retained_tokens
+            .set(i64::try_from(inner.retained_conflict_metadata_tokens).unwrap_or(i64::MAX));
     }
 
     /// Register a read-write transaction state.
@@ -184,8 +278,16 @@ impl TransactionManager {
     /// Here's a chance to recycle the recent committed txns.
     pub(crate) fn drop_txn(&self, txn_id: &Uuid) {
         let mut inner = self.inner.write();
-        inner.active_txns.remove(txn_id);
+        if let Some(txn_state) = inner.active_txns.remove(txn_id) {
+            let (bytes, tokens) = txn_state.conflict_metadata_usage();
+            inner.retained_conflict_metadata_bytes =
+                inner.retained_conflict_metadata_bytes.saturating_sub(bytes);
+            inner.retained_conflict_metadata_tokens = inner
+                .retained_conflict_metadata_tokens
+                .saturating_sub(tokens);
+        }
         inner.recycle_recent_committed_txns();
+        self.update_conflict_metadata_metrics(&inner);
     }
 
     /// Track writes for a transaction. This is used for conflict detection.
@@ -194,11 +296,47 @@ impl TransactionManager {
         &self,
         txn_id: &Uuid,
         writes: &HashMap<Bytes, TransactionWriteKind>,
-    ) {
+    ) -> Result<(), SlateDBError> {
         let mut inner = self.inner.write();
-        if let Some(txn_state) = inner.active_txns.get_mut(txn_id) {
-            txn_state.track_writes(writes.iter().map(|(key, kind)| (key.clone(), *kind)));
+        let Some(txn_state) = inner.active_txns.get(txn_id) else {
+            return Ok(());
+        };
+        let mut proposed = txn_state.clone();
+        proposed.track_writes(writes.iter().map(|(key, kind)| (key.clone(), kind.clone())));
+        let (current_bytes, current_tokens) = txn_state.conflict_metadata_usage();
+        let (proposed_bytes, proposed_tokens) = proposed.conflict_metadata_usage();
+        if proposed_bytes > self.max_transaction_conflict_metadata_bytes {
+            if let Some(metrics) = &self.conflict_metadata_metrics {
+                metrics.quota_rejections.increment(1);
+            }
+            return Err(SlateDBError::ConflictMetadataLimitExceeded {
+                requested: proposed_bytes,
+                limit: self.max_transaction_conflict_metadata_bytes,
+            });
         }
+
+        let requested_bytes = inner
+            .retained_conflict_metadata_bytes
+            .saturating_sub(current_bytes)
+            .saturating_add(proposed_bytes);
+        if requested_bytes > self.max_retained_conflict_metadata_bytes {
+            if let Some(metrics) = &self.conflict_metadata_metrics {
+                metrics.quota_rejections.increment(1);
+            }
+            return Err(SlateDBError::ConflictMetadataLimitExceeded {
+                requested: requested_bytes,
+                limit: self.max_retained_conflict_metadata_bytes,
+            });
+        }
+
+        inner.retained_conflict_metadata_bytes = requested_bytes;
+        inner.retained_conflict_metadata_tokens = inner
+            .retained_conflict_metadata_tokens
+            .saturating_sub(current_tokens)
+            .saturating_add(proposed_tokens);
+        inner.active_txns.insert(*txn_id, proposed);
+        self.update_conflict_metadata_metrics(&inner);
+        Ok(())
     }
 
     #[cfg(test)]
@@ -208,7 +346,7 @@ impl TransactionManager {
             .cloned()
             .map(|key| (key, TransactionWriteKind::Exclusive))
             .collect();
-        self.track_writes(txn_id, &writes);
+        self.track_writes(txn_id, &writes).unwrap();
     }
 
     /// Track a key read operation (for SSI)
@@ -273,6 +411,7 @@ impl TransactionManager {
 
         // update the last_committed_seq, so the writes will be visible to the readers.
         inner.oracle.advance_committed_seq(committed_seq);
+        self.update_conflict_metadata_metrics(&inner);
     }
 
     /// Track a write batch for conflict detection. This is used for regular write operations
@@ -303,6 +442,7 @@ impl TransactionManager {
 
         // update the last_committed_seq, so the writes will be visible to the readers.
         inner.oracle.advance_committed_seq(committed_seq);
+        self.update_conflict_metadata_metrics(&inner);
     }
 
     /// The min started_seq of all active transactions. This value
@@ -323,6 +463,20 @@ impl TransactionManager {
 }
 
 impl TransactionManagerInner {
+    #[cfg(test)]
+    fn conflict_metadata_usage(&self) -> (usize, usize) {
+        self.active_txns
+            .values()
+            .chain(self.recent_committed_txns.iter())
+            .fold((0, 0), |(bytes, tokens), state| {
+                let (state_bytes, state_tokens) = state.conflict_metadata_usage();
+                (
+                    bytes.saturating_add(state_bytes),
+                    tokens.saturating_add(state_tokens),
+                )
+            })
+    }
+
     fn track_recent_committed_state(&mut self, txn_state: TransactionState) {
         self.recent_committed_txns.push_back(txn_state);
 
@@ -330,6 +484,8 @@ impl TransactionManagerInner {
             // No active write transactions remain, so there is nobody left that can
             // conflict with this committed state or any older committed state.
             self.recent_committed_txns.clear();
+            self.retained_conflict_metadata_bytes = 0;
+            self.retained_conflict_metadata_tokens = 0;
         }
     }
 
@@ -349,9 +505,17 @@ impl TransactionManagerInner {
             // A transaction can be garbage collected when all active transactions
             // have started_seq strictly greater than the transaction's committed_seq.
             // This means we keep transactions where committed_seq >= min_seq.
+            let mut released_bytes = 0_usize;
+            let mut released_tokens = 0_usize;
             self.recent_committed_txns.retain(|txn| {
                 if let Some(committed_seq) = txn.committed_seq {
-                    committed_seq >= min_seq
+                    let retained = committed_seq >= min_seq;
+                    if !retained {
+                        let (bytes, tokens) = txn.conflict_metadata_usage();
+                        released_bytes = released_bytes.saturating_add(bytes);
+                        released_tokens = released_tokens.saturating_add(tokens);
+                    }
+                    retained
                 } else {
                     // If committed_seq is not set, this shouldn't happen in practice.
                     warn!(
@@ -360,9 +524,17 @@ impl TransactionManagerInner {
                     true
                 }
             });
+            self.retained_conflict_metadata_bytes = self
+                .retained_conflict_metadata_bytes
+                .saturating_sub(released_bytes);
+            self.retained_conflict_metadata_tokens = self
+                .retained_conflict_metadata_tokens
+                .saturating_sub(released_tokens);
         } else {
             // No active transactions, can drain the entire deque
             self.recent_committed_txns.clear();
+            self.retained_conflict_metadata_bytes = 0;
+            self.retained_conflict_metadata_tokens = 0;
         }
     }
 
@@ -387,13 +559,18 @@ impl TransactionManagerInner {
                     let Some(other_kind) = committed_txn.writes.get(key) else {
                         continue;
                     };
-                    if !matches!(
-                        (kind, other_kind),
+                    let compatible = match (kind, other_kind) {
                         (
                             TransactionWriteKind::CommutativeMerge,
-                            TransactionWriteKind::CommutativeMerge
-                        )
-                    ) {
+                            TransactionWriteKind::CommutativeMerge,
+                        ) => true,
+                        (
+                            TransactionWriteKind::DisjointMerge(current),
+                            TransactionWriteKind::DisjointMerge(committed),
+                        ) => current.is_disjoint(committed),
+                        _ => false,
+                    };
+                    if !compatible {
                         return true;
                     }
                 }
@@ -479,6 +656,20 @@ mod tests {
             .collect()
     }
 
+    fn disjoint_writes(
+        key: &'static str,
+        discriminators: impl IntoIterator<Item = &'static str>,
+    ) -> HashMap<Bytes, TransactionWriteKind> {
+        [(
+            Bytes::from(key),
+            TransactionWriteKind::DisjointMerge(DisjointMergeDiscriminators::from_bytes(
+                discriminators.into_iter().map(Bytes::from),
+            )),
+        )]
+        .into_iter()
+        .collect()
+    }
+
     struct CheckConflictTestCase {
         name: &'static str,
         recent_committed_txns: Vec<TransactionState>,
@@ -492,6 +683,55 @@ mod tests {
         let status_reporter = DbStatusManager::new(0);
         let oracle = Arc::new(DbOracle::new(0, 0, 0, Arc::new(status_reporter)));
         TransactionManager::new(oracle, db_rand)
+    }
+
+    fn assert_cached_conflict_metadata_is_exact(txn_manager: &TransactionManager) {
+        let inner = txn_manager.inner.read();
+        assert_eq!(
+            (
+                inner.retained_conflict_metadata_bytes,
+                inner.retained_conflict_metadata_tokens,
+            ),
+            inner.conflict_metadata_usage()
+        );
+    }
+
+    #[test]
+    fn conflict_metadata_accounting_stays_exact_across_commit_drop_and_recycle() {
+        let txn_manager = create_transaction_manager();
+        let guard = txn_manager.new_txn_with_id(0, Uuid::new_v4());
+        let committed = txn_manager.new_txn_with_id(0, Uuid::new_v4());
+        let committed_writes = [(
+            Bytes::from_static(b"committed"),
+            TransactionWriteKind::DisjointMerge(DisjointMergeDiscriminators::from_tokens([1, 2])),
+        )]
+        .into_iter()
+        .collect();
+
+        txn_manager
+            .track_writes(&committed, &committed_writes)
+            .unwrap();
+        assert_cached_conflict_metadata_is_exact(&txn_manager);
+        txn_manager.track_recent_committed_txn(&committed, 1);
+        assert_cached_conflict_metadata_is_exact(&txn_manager);
+
+        let dropped = txn_manager.new_txn_with_id(1, Uuid::new_v4());
+        let dropped_writes = [(
+            Bytes::from_static(b"dropped"),
+            TransactionWriteKind::DisjointMerge(DisjointMergeDiscriminators::from_tokens([3])),
+        )]
+        .into_iter()
+        .collect();
+        txn_manager.track_writes(&dropped, &dropped_writes).unwrap();
+        assert_cached_conflict_metadata_is_exact(&txn_manager);
+        txn_manager.drop_txn(&dropped);
+        assert_cached_conflict_metadata_is_exact(&txn_manager);
+
+        txn_manager.drop_txn(&guard);
+        assert_cached_conflict_metadata_is_exact(&txn_manager);
+        let inner = txn_manager.inner.read();
+        assert_eq!(inner.retained_conflict_metadata_bytes, 0);
+        assert_eq!(inner.retained_conflict_metadata_tokens, 0);
     }
 
     #[test]
@@ -790,6 +1030,57 @@ mod tests {
             exclusive_then_commutative.writes.get(b"key".as_slice()),
             Some(&TransactionWriteKind::Exclusive)
         );
+
+        let mut repeated_disjoint = TransactionState {
+            started_seq: 0,
+            committed_seq: None,
+            writes: HashMap::new(),
+            read_keys: HashSet::new(),
+            read_ranges: Vec::new(),
+        };
+        repeated_disjoint.track_writes(disjoint_writes("key", ["member-a"]));
+        repeated_disjoint.track_writes(disjoint_writes("key", ["member-b"]));
+        assert_eq!(
+            repeated_disjoint.writes.get(b"key".as_slice()),
+            Some(&TransactionWriteKind::DisjointMerge(
+                DisjointMergeDiscriminators::from_bytes([
+                    Bytes::from_static(b"member-a"),
+                    Bytes::from_static(b"member-b")
+                ])
+            ))
+        );
+
+        repeated_disjoint.track_writes(commutative_writes(["key"]));
+        assert_eq!(
+            repeated_disjoint.writes.get(b"key".as_slice()),
+            Some(&TransactionWriteKind::Exclusive)
+        );
+    }
+
+    #[test]
+    fn test_disjoint_merge_conflicts_only_on_overlapping_discriminators() {
+        let txn_manager = create_transaction_manager();
+        txn_manager
+            .inner
+            .write()
+            .recent_committed_txns
+            .push_back(TransactionState {
+                started_seq: 50,
+                committed_seq: Some(150),
+                writes: disjoint_writes("key", ["member-a", "member-b"]),
+                read_keys: HashSet::new(),
+                read_ranges: Vec::new(),
+            });
+
+        let inner = txn_manager.inner.read();
+        assert!(
+            !inner.has_write_write_conflict(&disjoint_writes("key", ["member-c", "member-d"]), 100)
+        );
+        assert!(
+            inner.has_write_write_conflict(&disjoint_writes("key", ["member-b", "member-c"]), 100)
+        );
+        assert!(inner.has_write_write_conflict(&commutative_writes(["key"]), 100));
+        assert!(inner.has_write_write_conflict(&exclusive_writes(["key"]), 100));
     }
 
     #[test]
@@ -803,6 +1094,33 @@ mod tests {
                 started_seq: 50,
                 committed_seq: Some(150),
                 writes: commutative_writes(["foo5"]),
+                read_keys: HashSet::new(),
+                read_ranges: Vec::new(),
+            });
+        let read_keys = [Bytes::from_static(b"foo5")].into_iter().collect();
+
+        let inner = txn_manager.inner.read();
+        assert!(inner.has_read_write_conflict(&read_keys, Vec::new(), 100));
+        assert!(inner.has_read_write_conflict(
+            &HashSet::new(),
+            vec![BytesRange::from(
+                Bytes::from_static(b"foo0")..=Bytes::from_static(b"foo9")
+            )],
+            100
+        ));
+    }
+
+    #[test]
+    fn test_disjoint_writes_remain_visible_to_point_and_range_read_conflicts() {
+        let txn_manager = create_transaction_manager();
+        txn_manager
+            .inner
+            .write()
+            .recent_committed_txns
+            .push_back(TransactionState {
+                started_seq: 50,
+                committed_seq: Some(150),
+                writes: disjoint_writes("foo5", ["member"]),
                 read_keys: HashSet::new(),
                 read_ranges: Vec::new(),
             });

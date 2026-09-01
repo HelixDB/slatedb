@@ -1047,12 +1047,12 @@ mod tests {
 
         // Convert filtered versions back to expected order
         let mut actual_entries = Vec::new();
-        for (_, entry) in filtered_versions.iter() {
+        for entry in filtered_versions.values() {
             actual_entries.push(entry.clone());
         }
 
         // Sort by sequence number (descending) to match expected order
-        actual_entries.sort_by(|a, b| b.seq.cmp(&a.seq));
+        actual_entries.sort_by_key(|entry| Reverse(entry.seq));
 
         assert_eq!(
             actual_entries.len(),

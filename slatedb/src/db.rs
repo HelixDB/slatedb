@@ -172,7 +172,13 @@ impl DbInner {
             merge_operator.clone(),
         );
 
-        let txn_manager = Arc::new(TransactionManager::new(oracle.clone(), rand.clone()));
+        let txn_manager = Arc::new(TransactionManager::new_with_limits(
+            oracle.clone(),
+            rand.clone(),
+            settings.max_transaction_conflict_metadata_bytes,
+            settings.max_retained_conflict_metadata_bytes,
+            &db_stats,
+        ));
         let snapshot_manager = Arc::new(SnapshotManager::new(oracle.clone(), rand.clone()));
         let wal_observer = DbWalObserver::new(
             wal_observer,
@@ -498,6 +504,9 @@ impl DbInner {
     }
 
     async fn replay_wal(&self, wal_iterator: Box<dyn WalIterator>) -> Result<(), SlateDBError> {
+        let replay_started = self.system_clock.now();
+        let mut replayed_entries = 0_u64;
+        let mut replayed_bytes = 0_u64;
         let mut current_memtable_wal_id = self
             .state
             .read()
@@ -506,6 +515,7 @@ impl DbInner {
             .value
             .core
             .replay_after_wal_id;
+        let replay_range_start = current_memtable_wal_id.saturating_add(1);
         let writer_epoch = self.state.read().state().manifest.value.writer_epoch;
         fail_point!(
             Arc::clone(&self.fp_registry),
@@ -564,6 +574,11 @@ impl DbInner {
                     .table
                     .record_touched_segments(touched_segments);
             }
+            let metadata = replayed_table.table.metadata();
+            replayed_entries = replayed_entries
+                .saturating_add(u64::try_from(metadata.entry_num).unwrap_or(u64::MAX));
+            replayed_bytes = replayed_bytes
+                .saturating_add(u64::try_from(metadata.entries_size_in_bytes).unwrap_or(u64::MAX));
             // Replayed rows come from WAL SSTs in remote storage, so they are already
             // durable. Update `last_remote_persisted_seq` before replaying to avoid a race with
             // the memtable flusher. The flusher calls flush_wals() to guarantee all data in the
@@ -584,6 +599,22 @@ impl DbInner {
         let guard = self.state.read();
         self.status_manager
             .report_memtable_segments(collect_touched_segments(&guard.view()));
+        let replay_range_end = current_memtable_wal_id.saturating_add(1);
+        let replay_wal_count = replay_range_end.saturating_sub(replay_range_start);
+        info!(
+            "SlateDB WAL replay completed [writer_epoch={}, replay_start_wal_id={}, replay_end_wal_id={}, replay_wal_count={}, last_replayed_wal_id={}, replayed_entries={}, replayed_bytes={}, elapsed_ms={}]",
+            writer_epoch,
+            replay_range_start,
+            replay_range_end,
+            replay_wal_count,
+            current_memtable_wal_id,
+            replayed_entries,
+            replayed_bytes,
+            self.system_clock
+                .now()
+                .signed_duration_since(replay_started)
+                .num_milliseconds()
+        );
 
         Ok(())
     }
@@ -7717,12 +7748,17 @@ mod tests {
             min_filter_keys,
             l0_sst_size_bytes,
             max_wal_flushes_before_l0_flush: 4096,
+            wal_replay: crate::config::WalReplaySettings::default(),
             compactor_options,
             compression_codec: None,
             object_store_cache_options: ObjectStoreCacheOptions::default(),
             garbage_collector_options: None,
             metric_level: MetricLevel::default(),
             default_ttl_millis,
+            max_transaction_conflict_metadata_bytes:
+                crate::config::DEFAULT_MAX_TRANSACTION_CONFLICT_METADATA_BYTES,
+            max_retained_conflict_metadata_bytes:
+                crate::config::DEFAULT_MAX_RETAINED_CONFLICT_METADATA_BYTES,
             object_store_max_retries: None,
             block_format: None,
         }
@@ -10828,6 +10864,67 @@ mod tests {
             .expect("write after oversized WAL replay should succeed");
 
         recovered.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn acknowledged_wal_larger_than_full_object_limit_recovers_on_reopen() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = "/tmp/acknowledged_oversized_wal_range_replay";
+        let mut settings = test_db_options(0, 1024 * 1024, None);
+        settings.flush_interval = Some(Duration::from_millis(10));
+        settings.wal_replay = crate::config::WalReplaySettings {
+            max_concurrent_objects: 4,
+            max_inflight_bytes: 128 * 1024,
+        };
+        let source = Db::builder(path, object_store.clone())
+            .with_settings(settings.clone())
+            .build()
+            .await
+            .unwrap();
+        let wal_store = crate::wal::slatedb::store::WalTableStore::new(
+            object_store.clone(),
+            SsTableFormat::default(),
+            path,
+            TableStoreKind::Main,
+        );
+        let mut batch = WriteBatch::new();
+        for id in 0..64 {
+            batch.put(format!("oversized-{id:03}"), vec![id as u8; 2048]);
+        }
+
+        source
+            .write(batch)
+            .await
+            .expect("the large multi-block WAL was not acknowledged");
+        let last_flushed_wal_id = source
+            .inner
+            .wal_observer
+            .status()
+            .unwrap()
+            .last_flushed_wal_id;
+        assert!(last_flushed_wal_id > 0);
+        let listed = wal_store
+            .list_wal_ssts_for_replay(1..last_flushed_wal_id + 1)
+            .await
+            .unwrap();
+        assert!(listed.iter().any(|wal| wal.metadata.size > 96 * 1024));
+
+        // Keep the source open to model a crash. The replacement writer must
+        // recover the acknowledged WAL rather than relying on clean shutdown.
+        let recovered = Db::builder(path, object_store)
+            .with_settings(settings)
+            .build()
+            .await
+            .expect("replacement writer could not range-replay the oversized WAL");
+        for id in 0..64 {
+            assert_eq!(
+                recovered.get(format!("oversized-{id:03}")).await.unwrap(),
+                Some(Bytes::from(vec![id as u8; 2048]))
+            );
+        }
+
+        recovered.close().await.unwrap();
+        drop(source);
     }
 
     /// RFC-0024: WAL replay through a conforming extractor preserves the

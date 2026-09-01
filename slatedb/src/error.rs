@@ -34,6 +34,24 @@ pub(crate) enum SlateDBError {
     #[error("empty block")]
     EmptyBlock,
 
+    #[error(
+        "corrupt SST data: {reason}{}",
+        .path.as_ref().map(|path| format!(" in {path}")).unwrap_or_default()
+    )]
+    CorruptSst {
+        reason: &'static str,
+        path: Option<Path>,
+    },
+
+    #[error(
+        "WAL replay memory limit exceeded: {kind} requires {required_bytes} bytes, limit is {limit_bytes} bytes"
+    )]
+    WalReplayMemoryLimitExceeded {
+        kind: &'static str,
+        required_bytes: usize,
+        limit_bytes: usize,
+    },
+
     #[error("empty RowEntry key")]
     EmptyKey,
 
@@ -70,6 +88,9 @@ pub(crate) enum SlateDBError {
     #[error("invalid deletion")]
     #[allow(unused)]
     InvalidDeletion,
+
+    #[error("disjoint merge batch contains duplicate key {key:?}")]
+    DuplicateDisjointMergeKey { key: Bytes },
 
     #[error("invalid sst error")]
     InvalidFlatbuffer(#[from] flatbuffers::InvalidFlatbuffer),
@@ -248,6 +269,10 @@ pub(crate) enum SlateDBError {
     #[error("invalid manifest poll interval. interval=`{0:?}`")]
     InvalidManifestPollInterval(Duration),
 
+    #[error("invalid WAL poll interval. interval=`{0:?}`")]
+    #[allow(dead_code)]
+    InvalidWalPollInterval(Duration),
+
     #[error("checkpoint lifetime must be at least double the manifest poll interval. lifetime=`{lifetime:?}`, interval=`{interval:?}`")]
     CheckpointLifetimeTooShort {
         lifetime: Duration,
@@ -297,6 +322,11 @@ pub(crate) enum SlateDBError {
     #[error("transaction conflict")]
     TransactionConflict,
 
+    #[error(
+        "transaction conflict metadata limit exceeded: requested={requested} bytes, limit={limit} bytes"
+    )]
+    ConflictMetadataLimitExceeded { requested: usize, limit: usize },
+
     #[error("iterator not initialized")]
     IteratorNotInitialized,
 
@@ -326,6 +356,10 @@ impl SlateDBError {
     pub(crate) fn with_path(self, path: &Path) -> Self {
         match self {
             SlateDBError::ChecksumMismatch { path: None } => SlateDBError::ChecksumMismatch {
+                path: Some(path.clone()),
+            },
+            SlateDBError::CorruptSst { reason, path: None } => SlateDBError::CorruptSst {
+                reason,
                 path: Some(path.clone()),
             },
             other => other,
@@ -376,6 +410,7 @@ impl SlateDBError {
             SlateDBError::InvalidFlatbuffer(_)
             | SlateDBError::EmptyBlock
             | SlateDBError::EmptyBlockMeta
+            | SlateDBError::CorruptSst { .. }
             | SlateDBError::InvalidFilterBlock
             | SlateDBError::BlockTransformError => Some(RetryReason::BlockDecodeError),
             _ => None,
@@ -506,6 +541,9 @@ pub enum ErrorKind {
 pub enum ErrorCode {
     /// A reader cannot open because no database manifest exists.
     DatabaseMissing,
+
+    /// Transaction conflict metadata exceeded its configured hard limit.
+    ConflictMetadataLimitExceeded,
 }
 
 impl From<ErrorKind> for CloseReason {
@@ -708,7 +746,8 @@ impl From<SlateDBError> for Error {
             SlateDBError::InvalidSSTBatchSize(_) => Error::invalid(msg),
             SlateDBError::InvalidConfiguration(_) => Error::invalid(msg),
             SlateDBError::InvalidCheckpointLifetime(_) => Error::invalid(msg),
-            SlateDBError::InvalidManifestPollInterval(_) => Error::invalid(msg),
+            SlateDBError::InvalidManifestPollInterval(_)
+            | SlateDBError::InvalidWalPollInterval(_) => Error::invalid(msg),
             SlateDBError::CheckpointLifetimeTooShort { .. } => Error::invalid(msg),
             SlateDBError::DbReaderSnapshotUnsupportedInFollowLatest => Error::invalid(msg),
             SlateDBError::SeekKeyOutOfRange { .. } => Error::invalid(msg),
@@ -728,9 +767,13 @@ impl From<SlateDBError> for Error {
             SlateDBError::EmptySegmentPrefix { .. } => Error::invalid(msg),
             SlateDBError::InvalidClockTick { .. } => Error::invalid(msg),
             SlateDBError::InvalidDeletion => Error::invalid(msg),
+            SlateDBError::DuplicateDisjointMergeKey { .. } => Error::invalid(msg),
             SlateDBError::MergeOperatorError(err) => Error::invalid(msg).with_source(Box::new(err)),
             SlateDBError::MergeOperatorMissing => Error::invalid(msg),
             SlateDBError::IncompatibleMergeTtls { .. } => Error::invalid(msg),
+            SlateDBError::ConflictMetadataLimitExceeded { .. } => {
+                Error::invalid(msg).with_code(ErrorCode::ConflictMetadataLimitExceeded)
+            }
             SlateDBError::IteratorNotInitialized => Error::invalid(msg),
             SlateDBError::InvalidSequenceOrder { .. } => Error::invalid(msg),
             SlateDBError::InvalidEnvironmentVariable { .. } => Error::invalid(msg),
@@ -761,6 +804,8 @@ impl From<SlateDBError> for Error {
             SlateDBError::InvalidTransactionalObjectState => Error::data(msg),
             SlateDBError::EmptyManifest => Error::data(msg),
             SlateDBError::EmptyBlock => Error::data(msg),
+            SlateDBError::CorruptSst { .. } => Error::data(msg),
+            SlateDBError::WalReplayMemoryLimitExceeded { .. } => Error::data(msg),
             SlateDBError::EmptyKey => Error::data(msg),
             SlateDBError::EmptyBlockMeta => Error::data(msg),
             SlateDBError::InvalidFilterBlock => Error::data(msg),

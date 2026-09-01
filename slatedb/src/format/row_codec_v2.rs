@@ -2,7 +2,7 @@
 use crate::error::SlateDBError;
 use crate::format::row::RowFlags;
 use crate::types::ValueDeletable;
-use crate::utils::{decode_varint, encode_varint, varint_len};
+use crate::utils::{decode_varint_checked, encode_varint, varint_len};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// Intermediate representation for V2 row encoding.
@@ -170,14 +170,16 @@ impl SstRowCodecV2 {
 
     /// Decode a V2 row entry from the data buffer.
     pub(crate) fn decode(&self, data: &mut impl Buf) -> Result<SstRowEntryV2, SlateDBError> {
-        let shared_bytes = decode_varint(data);
-        let unshared_bytes = decode_varint(data) as usize;
-        let value_len = decode_varint(data) as usize;
+        let shared_bytes = decode_varint_checked(data)?;
+        let unshared_bytes = decode_varint_checked(data)? as usize;
+        let value_len = decode_varint_checked(data)? as usize;
 
         // Read key_delta
+        require_remaining(data, unshared_bytes, "truncated V2 row key suffix")?;
         let key_suffix = data.copy_to_bytes(unshared_bytes);
 
         // Read value
+        require_remaining(data, value_len, "truncated V2 row value")?;
         let value_bytes = if value_len > 0 {
             Some(data.copy_to_bytes(value_len))
         } else {
@@ -185,10 +187,18 @@ impl SstRowCodecV2 {
         };
 
         // Read seq & flags
+        require_remaining(data, 9, "truncated V2 row sequence or flags")?;
         let seq = data.get_u64();
         let flags = self.decode_flags(data.get_u8())?;
 
+        if flags.contains(RowFlags::TOMBSTONE) && value_len != 0 {
+            return Err(corrupt_row("V2 tombstone contains value bytes"));
+        }
+
         // Read timestamps
+        let timestamp_bytes = usize::from(flags.contains(RowFlags::HAS_EXPIRE_TS)) * 8
+            + usize::from(flags.contains(RowFlags::HAS_CREATE_TS)) * 8;
+        require_remaining(data, timestamp_bytes, "truncated V2 row timestamp")?;
         let (expire_ts, create_ts) =
             if flags.contains(RowFlags::HAS_EXPIRE_TS | RowFlags::HAS_CREATE_TS) {
                 (Some(data.get_i64()), Some(data.get_i64()))
@@ -221,14 +231,18 @@ impl SstRowCodecV2 {
 
     /// Decode only the key portion for seek optimization.
     /// Returns (shared_bytes, key_suffix).
-    pub(crate) fn decode_key_only(&self, data: &mut impl Buf) -> (u32, Bytes) {
-        let shared_bytes = decode_varint(data);
-        let unshared_bytes = decode_varint(data) as usize;
-        let _value_len = decode_varint(data);
+    pub(crate) fn decode_key_only(
+        &self,
+        data: &mut impl Buf,
+    ) -> Result<(u32, Bytes), SlateDBError> {
+        let shared_bytes = decode_varint_checked(data)?;
+        let unshared_bytes = decode_varint_checked(data)? as usize;
+        let _value_len = decode_varint_checked(data)?;
 
+        require_remaining(data, unshared_bytes, "truncated V2 row key suffix")?;
         let key_suffix = data.copy_to_bytes(unshared_bytes);
 
-        (shared_bytes, key_suffix)
+        Ok((shared_bytes, key_suffix))
     }
 
     fn decode_flags(&self, flags: u8) -> Result<RowFlags, SlateDBError> {
@@ -247,6 +261,21 @@ impl SstRowCodecV2 {
         }
         Ok(parsed)
     }
+}
+
+fn require_remaining(
+    data: &impl Buf,
+    required: usize,
+    reason: &'static str,
+) -> Result<(), SlateDBError> {
+    if data.remaining() < required {
+        return Err(corrupt_row(reason));
+    }
+    Ok(())
+}
+
+fn corrupt_row(reason: &'static str) -> SlateDBError {
+    SlateDBError::CorruptSst { reason, path: None }
 }
 
 #[cfg(test)]
@@ -343,7 +372,7 @@ mod tests {
 
         // when: decoding key only
         let mut slice = buf.as_slice();
-        let (decoded_shared, decoded_suffix) = codec.decode_key_only(&mut slice);
+        let (decoded_shared, decoded_suffix) = codec.decode_key_only(&mut slice).unwrap();
 
         // then: key info is correct
         assert_eq!(decoded_shared, shared_bytes);

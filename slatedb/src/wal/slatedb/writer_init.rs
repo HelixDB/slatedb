@@ -19,6 +19,9 @@ use super::store::WalTableStore;
 pub(crate) struct SlateDbWalWriterInitOptions {
     max_wal_bytes_size: usize,
     max_wal_flushes_before_l0_flush: u64,
+    max_replay_metadata_bytes: usize,
+    max_replay_block_bytes: usize,
+    max_replay_concurrent_objects: usize,
     max_flush_interval: Option<Duration>,
 }
 
@@ -27,6 +30,9 @@ impl From<&Settings> for SlateDbWalWriterInitOptions {
         Self {
             max_wal_bytes_size: settings.l0_sst_size_bytes,
             max_wal_flushes_before_l0_flush: settings.max_wal_flushes_before_l0_flush,
+            max_replay_metadata_bytes: settings.wal_replay.metadata_working_memory_limit(),
+            max_replay_block_bytes: settings.wal_replay.block_working_memory_limit(),
+            max_replay_concurrent_objects: settings.wal_replay.max_concurrent_objects,
             max_flush_interval: settings.flush_interval,
         }
     }
@@ -38,6 +44,9 @@ pub(crate) struct SlateDbWalWriterInit {
     table_store: Arc<WalTableStore>,
     max_wal_bytes_size: usize,
     max_wal_flushes_before_l0_flush: u64,
+    max_replay_metadata_bytes: usize,
+    max_replay_block_bytes: usize,
+    max_replay_concurrent_objects: usize,
     max_flush_interval: Option<Duration>,
     empty_wal_id: u64,
     task_executor: Arc<MessageHandlerExecutor>,
@@ -65,6 +74,9 @@ impl SlateDbWalWriterInit {
             table_store,
             max_wal_bytes_size: options.max_wal_bytes_size,
             max_wal_flushes_before_l0_flush: options.max_wal_flushes_before_l0_flush,
+            max_replay_metadata_bytes: options.max_replay_metadata_bytes,
+            max_replay_block_bytes: options.max_replay_block_bytes,
+            max_replay_concurrent_objects: options.max_replay_concurrent_objects,
             max_flush_interval: options.max_flush_interval,
             empty_wal_id,
             task_executor,
@@ -120,7 +132,8 @@ impl wal::WriterInit for SlateDbWalWriterInit {
                     replay_after_wal_id + 1,
                     WalIteratorEndBound::Exclusive(empty_wal_id + 1),
                     SlateDbWalReaderOptions {
-                        read_ahead_bytes: self.max_wal_bytes_size,
+                        sst_batch_size: self.max_replay_concurrent_objects,
+                        read_ahead_bytes: self.max_replay_block_bytes,
                         ..SlateDbWalReaderOptions::default()
                     }
                     .into(),
@@ -133,6 +146,8 @@ impl wal::WriterInit for SlateDbWalWriterInit {
                     self.table_store.clone(),
                     self.max_wal_bytes_size,
                     self.max_wal_flushes_before_l0_flush,
+                    self.max_replay_metadata_bytes,
+                    self.max_replay_block_bytes,
                     self.max_flush_interval,
                     self.task_executor.clone(),
                 )

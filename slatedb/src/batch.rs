@@ -4,7 +4,7 @@
 //! collection of write operations (puts and/or deletes) that are applied
 //! atomically to the database.
 
-use crate::config::{MergeOptions, PutOptions};
+use crate::config::{MergeOptions, PutOptions, Ttl};
 use crate::db_common::extract_segment_prefix;
 use crate::error::SlateDBError;
 use crate::iter::{IterationOrder, RowEntryIterator};
@@ -14,9 +14,208 @@ use crate::types::{RowEntry, ValueDeletable};
 use async_trait::async_trait;
 use bytes::Bytes;
 use smallvec::{smallvec, SmallVec};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::iter::Peekable;
+use std::mem::size_of;
 use std::ops::RangeBounds;
+use std::sync::Arc;
+
+const INLINE_MERGE_DISCRIMINATOR_LEN: usize = 16;
+
+/// Transaction-only logical member identity for a disjoint merge.
+///
+/// Graph membership discriminators are eight or nine bytes, so they remain
+/// inline. Longer opaque discriminators retain the public API contract and
+/// spill through `SmallVec` only when required.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct MergeDiscriminator(SmallVec<[u8; INLINE_MERGE_DISCRIMINATOR_LEN]>);
+
+/// A non-empty, immutable discriminator set shared between batch and
+/// transaction conflict tracking.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DisjointMergeDiscriminators(DisjointMergeDiscriminatorSet);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DisjointMergeDiscriminatorSet {
+    Bytes(Arc<[MergeDiscriminator]>),
+    Tokens(Arc<[u128]>),
+}
+
+impl DisjointMergeDiscriminators {
+    pub(crate) fn from_bytes<D, I>(discriminators: I) -> Self
+    where
+        D: AsRef<[u8]>,
+        I: IntoIterator<Item = D>,
+    {
+        let mut discriminators = discriminators
+            .into_iter()
+            .map(|discriminator| {
+                let discriminator = discriminator.as_ref();
+                assert!(
+                    !discriminator.is_empty(),
+                    "disjoint merge discriminators cannot be empty"
+                );
+                MergeDiscriminator(SmallVec::from_slice(discriminator))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !discriminators.is_empty(),
+            "disjoint merge discriminators cannot be empty"
+        );
+        discriminators.sort_unstable();
+        discriminators.dedup();
+        Self(DisjointMergeDiscriminatorSet::Bytes(discriminators.into()))
+    }
+
+    pub(crate) fn from_tokens(tokens: impl IntoIterator<Item = u128>) -> Self {
+        let mut tokens = tokens.into_iter().collect::<Vec<_>>();
+        assert!(
+            !tokens.is_empty(),
+            "disjoint merge discriminators cannot be empty"
+        );
+        tokens.sort_unstable();
+        tokens.dedup();
+        Self(DisjointMergeDiscriminatorSet::Tokens(tokens.into()))
+    }
+
+    fn extend(&mut self, newer: Self) -> bool {
+        match (&mut self.0, newer.0) {
+            (
+                DisjointMergeDiscriminatorSet::Bytes(existing),
+                DisjointMergeDiscriminatorSet::Bytes(newer),
+            ) => {
+                *existing = merge_sorted(existing, &newer).into();
+                true
+            }
+            (
+                DisjointMergeDiscriminatorSet::Tokens(existing),
+                DisjointMergeDiscriminatorSet::Tokens(newer),
+            ) => {
+                *existing = merge_sorted(existing, &newer).into();
+                true
+            }
+            (DisjointMergeDiscriminatorSet::Bytes(_), DisjointMergeDiscriminatorSet::Tokens(_))
+            | (DisjointMergeDiscriminatorSet::Tokens(_), DisjointMergeDiscriminatorSet::Bytes(_)) => {
+                false
+            }
+        }
+    }
+
+    pub(crate) fn extend_from(&mut self, newer: &Self) -> bool {
+        match (&mut self.0, &newer.0) {
+            (
+                DisjointMergeDiscriminatorSet::Bytes(existing),
+                DisjointMergeDiscriminatorSet::Bytes(newer),
+            ) => {
+                *existing = merge_sorted(existing, newer).into();
+                true
+            }
+            (
+                DisjointMergeDiscriminatorSet::Tokens(existing),
+                DisjointMergeDiscriminatorSet::Tokens(newer),
+            ) => {
+                *existing = merge_sorted(existing, newer).into();
+                true
+            }
+            (DisjointMergeDiscriminatorSet::Bytes(_), DisjointMergeDiscriminatorSet::Tokens(_))
+            | (DisjointMergeDiscriminatorSet::Tokens(_), DisjointMergeDiscriminatorSet::Bytes(_)) => {
+                false
+            }
+        }
+    }
+
+    pub(crate) fn is_disjoint(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (
+                DisjointMergeDiscriminatorSet::Bytes(current),
+                DisjointMergeDiscriminatorSet::Bytes(other),
+            ) => sorted_slices_are_disjoint(current, other),
+            (
+                DisjointMergeDiscriminatorSet::Tokens(current),
+                DisjointMergeDiscriminatorSet::Tokens(other),
+            ) => sorted_slices_are_disjoint(current, other),
+            (DisjointMergeDiscriminatorSet::Bytes(_), DisjointMergeDiscriminatorSet::Tokens(_))
+            | (DisjointMergeDiscriminatorSet::Tokens(_), DisjointMergeDiscriminatorSet::Bytes(_)) => {
+                false
+            }
+        }
+    }
+
+    pub(crate) fn payload_bytes(&self) -> usize {
+        match &self.0 {
+            DisjointMergeDiscriminatorSet::Bytes(discriminators) => discriminators
+                .iter()
+                .fold(0, |bytes, value| bytes.saturating_add(value.0.len())),
+            DisjointMergeDiscriminatorSet::Tokens(tokens) => {
+                tokens.len().saturating_mul(size_of::<u128>())
+            }
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        match &self.0 {
+            DisjointMergeDiscriminatorSet::Bytes(discriminators) => discriminators.len(),
+            DisjointMergeDiscriminatorSet::Tokens(tokens) => tokens.len(),
+        }
+    }
+
+    #[cfg(test)]
+    fn all_inline(&self) -> bool {
+        match &self.0 {
+            DisjointMergeDiscriminatorSet::Bytes(discriminators) => discriminators
+                .iter()
+                .all(|discriminator| !discriminator.0.spilled()),
+            DisjointMergeDiscriminatorSet::Tokens(_) => true,
+        }
+    }
+
+    #[cfg(test)]
+    fn strong_count(&self) -> usize {
+        match &self.0 {
+            DisjointMergeDiscriminatorSet::Bytes(discriminators) => {
+                Arc::strong_count(discriminators)
+            }
+            DisjointMergeDiscriminatorSet::Tokens(tokens) => Arc::strong_count(tokens),
+        }
+    }
+}
+
+fn merge_sorted<T: Clone + Ord>(left: &[T], right: &[T]) -> Vec<T> {
+    let mut merged = Vec::with_capacity(left.len() + right.len());
+    let (mut left_index, mut right_index) = (0, 0);
+    while left_index < left.len() && right_index < right.len() {
+        match left[left_index].cmp(&right[right_index]) {
+            std::cmp::Ordering::Less => {
+                merged.push(left[left_index].clone());
+                left_index += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                merged.push(left[left_index].clone());
+                left_index += 1;
+                right_index += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                merged.push(right[right_index].clone());
+                right_index += 1;
+            }
+        }
+    }
+    merged.extend_from_slice(&left[left_index..]);
+    merged.extend_from_slice(&right[right_index..]);
+    merged
+}
+
+fn sorted_slices_are_disjoint<T: Ord>(left: &[T], right: &[T]) -> bool {
+    let (mut left_index, mut right_index) = (0, 0);
+    while left_index < left.len() && right_index < right.len() {
+        match left[left_index].cmp(&right[right_index]) {
+            std::cmp::Ordering::Less => left_index += 1,
+            std::cmp::Ordering::Equal => return false,
+            std::cmp::Ordering::Greater => right_index += 1,
+        }
+    }
+    true
+}
 
 /// A batch of write operations (puts, deletes, and merges). All operations in
 /// the batch are applied atomically to the database. Put and delete operations
@@ -53,18 +252,24 @@ pub struct WriteBatch {
     pub(crate) ops: BTreeMap<Bytes, SmallVec<[WriteOp; 1]>>,
     pub(crate) op_count: usize,
     pub(crate) has_merge_ops: bool,
-    /// Keys whose surviving operations are exclusively commutative merges.
+    /// Compatibility metadata for keys whose surviving operations are merges.
     ///
     /// This is transaction conflict metadata only. It is never encoded into a
     /// [`RowEntry`] or persisted by the WAL, memtable, or compaction paths. The
     /// set is boxed and allocated lazily so ordinary write batches retain their
     /// existing inline size and pay no allocation for this opt-in metadata.
-    commutative_merge_keys: Option<Box<CommutativeMergeKeys>>,
+    compatible_merge_keys: Option<Box<CompatibleMergeKeys>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum MergeConflictKind {
+    Commutative,
+    Disjoint(DisjointMergeDiscriminators),
 }
 
 #[derive(Clone, Debug, Default)]
-struct CommutativeMergeKeys {
-    keys: HashSet<Bytes>,
+struct CompatibleMergeKeys {
+    keys: HashMap<Bytes, MergeConflictKind>,
 }
 
 impl Default for WriteBatch {
@@ -158,7 +363,7 @@ impl WriteBatch {
             ops: BTreeMap::new(),
             op_count: 0,
             has_merge_ops: false,
-            commutative_merge_keys: None,
+            compatible_merge_keys: None,
         }
     }
 
@@ -237,7 +442,7 @@ impl WriteBatch {
     /// - if the value size is larger than u32::MAX
     pub fn put_bytes_with_options(&mut self, key: Bytes, value: Bytes, options: &PutOptions) {
         self.assert_kv(&key, &value);
-        self.remove_commutative_merge_key(&key);
+        self.remove_compatible_merge_key(&key);
 
         // put will overwrite the existing key so we can safely
         // remove all previous entries.
@@ -265,7 +470,7 @@ impl WriteBatch {
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        self.merge_with_conflict_kind(key, value, options, false);
+        self.merge_with_conflict_kind(key, value, options, None);
     }
 
     /// Merge a key-value pair whose operands are commutative.
@@ -278,7 +483,56 @@ impl WriteBatch {
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        self.merge_with_conflict_kind(key, value, &MergeOptions::default(), true);
+        self.merge_with_conflict_kind(
+            key,
+            value,
+            &MergeOptions::default(),
+            Some(MergeConflictKind::Commutative),
+        );
+    }
+
+    pub(crate) fn merge_disjoint<K, V, D, I>(&mut self, key: K, value: V, discriminators: I)
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+        D: AsRef<[u8]>,
+        I: IntoIterator<Item = D>,
+    {
+        self.merge_disjoint_with_discriminators(
+            key,
+            value,
+            DisjointMergeDiscriminators::from_bytes(discriminators),
+        );
+    }
+
+    pub(crate) fn merge_disjoint_tokens<K, V, I>(&mut self, key: K, value: V, tokens: I)
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+        I: IntoIterator<Item = u128>,
+    {
+        self.merge_disjoint_with_discriminators(
+            key,
+            value,
+            DisjointMergeDiscriminators::from_tokens(tokens),
+        );
+    }
+
+    pub(crate) fn merge_disjoint_with_discriminators<K, V>(
+        &mut self,
+        key: K,
+        value: V,
+        discriminators: DisjointMergeDiscriminators,
+    ) where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        self.merge_with_conflict_kind(
+            key,
+            value,
+            &MergeOptions { ttl: Ttl::NoExpiry },
+            Some(MergeConflictKind::Disjoint(discriminators)),
+        );
     }
 
     fn merge_with_conflict_kind<K, V>(
@@ -286,7 +540,7 @@ impl WriteBatch {
         key: K,
         value: V,
         options: &MergeOptions,
-        commutative: bool,
+        conflict_kind: Option<MergeConflictKind>,
     ) where
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
@@ -296,19 +550,33 @@ impl WriteBatch {
         let key = Bytes::copy_from_slice(key.as_ref());
         let value = value.as_ref();
         let op = WriteOp::Merge(Bytes::copy_from_slice(value), options.clone());
-        let existing_operations_are_commutative = self.ops.contains_key(&key)
-            && self
-                .commutative_merge_keys
-                .as_ref()
-                .is_some_and(|keys| keys.keys.contains(&key));
         let is_first_operation = !self.ops.contains_key(&key);
-        if commutative && (is_first_operation || existing_operations_are_commutative) {
-            self.commutative_merge_keys
+        let existing_kind = self
+            .compatible_merge_keys
+            .as_mut()
+            .and_then(|keys| keys.keys.remove(&key));
+        let combined_kind = match (is_first_operation, existing_kind, conflict_kind) {
+            (true, _, conflict_kind) => conflict_kind,
+            (false, Some(MergeConflictKind::Commutative), Some(MergeConflictKind::Commutative)) => {
+                Some(MergeConflictKind::Commutative)
+            }
+            (
+                false,
+                Some(MergeConflictKind::Disjoint(mut existing)),
+                Some(MergeConflictKind::Disjoint(next)),
+            ) => existing
+                .extend(next)
+                .then_some(MergeConflictKind::Disjoint(existing)),
+            _ => None,
+        };
+
+        if let Some(kind) = combined_kind {
+            self.compatible_merge_keys
                 .get_or_insert_default()
                 .keys
-                .insert(key.clone());
+                .insert(key.clone(), kind);
         } else {
-            self.remove_commutative_merge_key(&key);
+            self.remove_compatible_merge_key(&key);
         }
 
         if let Some(ops) = self.ops.get_mut(&key) {
@@ -326,7 +594,7 @@ impl WriteBatch {
         self.assert_kv(&key, &[]);
 
         let key = Bytes::copy_from_slice(key.as_ref());
-        self.remove_commutative_merge_key(&key);
+        self.remove_compatible_merge_key(&key);
 
         // delete will overwrite the existing key so we can safely
         // remove all previous entries.
@@ -362,20 +630,27 @@ impl WriteBatch {
         self.ops.keys().cloned().collect()
     }
 
-    /// Returns whether every surviving operation for `key` is a commutative merge.
-    pub(crate) fn is_commutative_merge_key(&self, key: &[u8]) -> bool {
-        self.commutative_merge_keys
+    pub(crate) fn merge_conflict_kind(&self, key: &[u8]) -> Option<&MergeConflictKind> {
+        self.compatible_merge_keys
             .as_ref()
-            .is_some_and(|keys| keys.keys.contains(key))
+            .and_then(|keys| keys.keys.get(key))
     }
 
-    fn remove_commutative_merge_key(&mut self, key: &[u8]) {
-        let Some(keys) = self.commutative_merge_keys.as_mut() else {
+    #[cfg(test)]
+    fn is_commutative_merge_key(&self, key: &[u8]) -> bool {
+        matches!(
+            self.merge_conflict_kind(key),
+            Some(MergeConflictKind::Commutative)
+        )
+    }
+
+    fn remove_compatible_merge_key(&mut self, key: &[u8]) {
+        let Some(keys) = self.compatible_merge_keys.as_mut() else {
             return;
         };
         keys.keys.remove(key);
         if keys.keys.is_empty() {
-            self.commutative_merge_keys = None;
+            self.compatible_merge_keys = None;
         }
     }
 
@@ -925,13 +1200,13 @@ mod tests {
         only_commutative.merge_commutative(b"key", b"first");
         only_commutative.merge_commutative(b"key", b"second");
         assert!(only_commutative.is_commutative_merge_key(b"key"));
-        assert!(only_commutative.commutative_merge_keys.is_some());
+        assert!(only_commutative.compatible_merge_keys.is_some());
 
         let mut commutative_then_ordinary = WriteBatch::new();
         commutative_then_ordinary.merge_commutative(b"key", b"first");
         commutative_then_ordinary.merge(b"key", b"second");
         assert!(!commutative_then_ordinary.is_commutative_merge_key(b"key"));
-        assert!(commutative_then_ordinary.commutative_merge_keys.is_none());
+        assert!(commutative_then_ordinary.compatible_merge_keys.is_none());
 
         let mut ordinary_then_commutative = WriteBatch::new();
         ordinary_then_commutative.merge(b"key", b"first");
@@ -973,6 +1248,137 @@ mod tests {
         assert_eq!(ordinary.ops, commutative.ops);
         assert!(!ordinary.is_commutative_merge_key(b"key"));
         assert!(commutative.is_commutative_merge_key(b"key"));
+    }
+
+    #[test]
+    fn disjoint_merge_classification_unions_discriminators() {
+        let mut batch = WriteBatch::new();
+        batch.merge_disjoint(b"key", b"first", [Bytes::from_static(b"member-a")]);
+        batch.merge_disjoint(
+            b"key",
+            b"second",
+            [
+                Bytes::from_static(b"member-a"),
+                Bytes::from_static(b"member-b"),
+            ],
+        );
+
+        assert_eq!(
+            batch.merge_conflict_kind(b"key"),
+            Some(&MergeConflictKind::Disjoint(
+                DisjointMergeDiscriminators::from_bytes([
+                    Bytes::from_static(b"member-a"),
+                    Bytes::from_static(b"member-b"),
+                ])
+            ))
+        );
+        assert_eq!(batch.op_count(), 2);
+    }
+
+    #[test]
+    fn disjoint_merge_metadata_keeps_short_members_inline_and_shares_clones() {
+        let discriminators =
+            DisjointMergeDiscriminators::from_bytes([[1_u8; 8].as_slice(), [2_u8; 9].as_slice()]);
+        assert!(discriminators.all_inline());
+        assert_eq!(discriminators.strong_count(), 1);
+
+        let shared = discriminators.clone();
+        assert_eq!(discriminators.strong_count(), 2);
+        assert_eq!(shared.strong_count(), 2);
+
+        let spilled = DisjointMergeDiscriminators::from_bytes([[3_u8; 17]]);
+        assert!(!spilled.all_inline());
+    }
+
+    #[test]
+    fn token_discriminators_union_without_changing_byte_discriminator_safety() {
+        let mut tokens = WriteBatch::new();
+        tokens.merge_disjoint_tokens(b"key", b"first", [1, 2]);
+        tokens.merge_disjoint_tokens(b"key", b"second", [2, 3]);
+        assert_eq!(
+            tokens.merge_conflict_kind(b"key"),
+            Some(&MergeConflictKind::Disjoint(
+                DisjointMergeDiscriminators::from_tokens([1, 2, 3])
+            ))
+        );
+
+        let mut mixed = WriteBatch::new();
+        mixed.merge_disjoint_tokens(b"key", b"token", [1]);
+        mixed.merge_disjoint(b"key", b"bytes", [1_u128.to_be_bytes()]);
+        assert_eq!(mixed.merge_conflict_kind(b"key"), None);
+
+        let mut reverse_mixed = WriteBatch::new();
+        reverse_mixed.merge_disjoint(b"key", b"bytes", [2_u128.to_be_bytes()]);
+        reverse_mixed.merge_disjoint_tokens(b"key", b"token", [1]);
+        assert_eq!(reverse_mixed.merge_conflict_kind(b"key"), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "disjoint merge discriminators cannot be empty")]
+    fn disjoint_merge_rejects_empty_token_set() {
+        WriteBatch::new().merge_disjoint_tokens(b"key", b"operand", []);
+    }
+
+    #[test]
+    fn mixed_merge_compatibility_is_exclusive_in_every_order() {
+        let discriminator = || [Bytes::from_static(b"member")];
+
+        let mut disjoint_then_ordinary = WriteBatch::new();
+        disjoint_then_ordinary.merge_disjoint(b"key", b"first", discriminator());
+        disjoint_then_ordinary.merge(b"key", b"second");
+        assert_eq!(disjoint_then_ordinary.merge_conflict_kind(b"key"), None);
+
+        let mut ordinary_then_disjoint = WriteBatch::new();
+        ordinary_then_disjoint.merge(b"key", b"first");
+        ordinary_then_disjoint.merge_disjoint(b"key", b"second", discriminator());
+        assert_eq!(ordinary_then_disjoint.merge_conflict_kind(b"key"), None);
+
+        let mut disjoint_then_commutative = WriteBatch::new();
+        disjoint_then_commutative.merge_disjoint(b"key", b"first", discriminator());
+        disjoint_then_commutative.merge_commutative(b"key", b"second");
+        assert_eq!(disjoint_then_commutative.merge_conflict_kind(b"key"), None);
+
+        let mut commutative_then_disjoint = WriteBatch::new();
+        commutative_then_disjoint.merge_commutative(b"key", b"first");
+        commutative_then_disjoint.merge_disjoint(b"key", b"second", discriminator());
+        assert_eq!(commutative_then_disjoint.merge_conflict_kind(b"key"), None);
+    }
+
+    #[test]
+    fn put_and_delete_make_disjoint_merges_exclusive() {
+        let discriminator = || [Bytes::from_static(b"member")];
+
+        let mut put_after_merge = WriteBatch::new();
+        put_after_merge.merge_disjoint(b"key", b"merge", discriminator());
+        put_after_merge.put(b"key", b"put");
+        assert_eq!(put_after_merge.merge_conflict_kind(b"key"), None);
+
+        let mut merge_after_put = WriteBatch::new();
+        merge_after_put.put(b"key", b"put");
+        merge_after_put.merge_disjoint(b"key", b"merge", discriminator());
+        assert_eq!(merge_after_put.merge_conflict_kind(b"key"), None);
+
+        let mut delete_after_merge = WriteBatch::new();
+        delete_after_merge.merge_disjoint(b"key", b"merge", discriminator());
+        delete_after_merge.delete(b"key");
+        assert_eq!(delete_after_merge.merge_conflict_kind(b"key"), None);
+
+        let mut merge_after_delete = WriteBatch::new();
+        merge_after_delete.delete(b"key");
+        merge_after_delete.merge_disjoint(b"key", b"merge", discriminator());
+        assert_eq!(merge_after_delete.merge_conflict_kind(b"key"), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "disjoint merge discriminators cannot be empty")]
+    fn disjoint_merge_rejects_empty_discriminator_set() {
+        WriteBatch::new().merge_disjoint(b"key", b"operand", HashSet::<Bytes>::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "disjoint merge discriminators cannot be empty")]
+    fn disjoint_merge_rejects_empty_discriminator() {
+        WriteBatch::new().merge_disjoint(b"key", b"operand", [Bytes::new()]);
     }
 
     #[test]
@@ -1471,8 +1877,7 @@ mod tests {
         ];
         assert_iterator(&mut iter, expected).await;
 
-        let merge_operator =
-            Some(std::sync::Arc::new(StringConcatMergeOperator) as MergeOperatorType);
+        let merge_operator = Some(Arc::new(StringConcatMergeOperator) as MergeOperatorType);
         let (result, _, _) = batch
             .extract_entries(100, 1000, None, merge_operator, None)
             .await
@@ -1546,8 +1951,7 @@ mod tests {
         batch.merge(b"key1", b"merge3");
 
         // When: extracting entries with a merge operator
-        let merge_operator =
-            Some(std::sync::Arc::new(StringConcatMergeOperator) as MergeOperatorType);
+        let merge_operator = Some(Arc::new(StringConcatMergeOperator) as MergeOperatorType);
         let (result, _, _) = batch
             .extract_entries(100, 1000, None, merge_operator, None)
             .await
@@ -1580,8 +1984,7 @@ mod tests {
             },
         );
 
-        let merge_operator =
-            Some(std::sync::Arc::new(StringConcatMergeOperator) as MergeOperatorType);
+        let merge_operator = Some(Arc::new(StringConcatMergeOperator) as MergeOperatorType);
         let (result, _, _) = batch
             .extract_entries(100, 1000, None, merge_operator, None)
             .await
@@ -1614,8 +2017,7 @@ mod tests {
             },
         );
 
-        let merge_operator =
-            Some(std::sync::Arc::new(StringConcatMergeOperator) as MergeOperatorType);
+        let merge_operator = Some(Arc::new(StringConcatMergeOperator) as MergeOperatorType);
         let err = batch
             .extract_entries(100, 1000, None, merge_operator, None)
             .await
@@ -1653,8 +2055,7 @@ mod tests {
             },
         );
 
-        let merge_operator =
-            Some(std::sync::Arc::new(StringConcatMergeOperator) as MergeOperatorType);
+        let merge_operator = Some(Arc::new(StringConcatMergeOperator) as MergeOperatorType);
         let (result, _, _) = batch
             .extract_entries(100, 1000, None, merge_operator, None)
             .await
@@ -1679,8 +2080,7 @@ mod tests {
             },
         );
 
-        let merge_operator =
-            Some(std::sync::Arc::new(StringConcatMergeOperator) as MergeOperatorType);
+        let merge_operator = Some(Arc::new(StringConcatMergeOperator) as MergeOperatorType);
         let err = batch
             .extract_entries(100, 1000, None, merge_operator, None)
             .await
@@ -1701,8 +2101,7 @@ mod tests {
             },
         );
 
-        let merge_operator =
-            Some(std::sync::Arc::new(StringConcatMergeOperator) as MergeOperatorType);
+        let merge_operator = Some(Arc::new(StringConcatMergeOperator) as MergeOperatorType);
         let err = batch
             .extract_entries(100, 1000, None, merge_operator, None)
             .await
@@ -1720,8 +2119,7 @@ mod tests {
         batch.merge(b"key1", b"merge2");
 
         // When: extracting entries with a merge operator
-        let merge_operator =
-            Some(std::sync::Arc::new(StringConcatMergeOperator) as MergeOperatorType);
+        let merge_operator = Some(Arc::new(StringConcatMergeOperator) as MergeOperatorType);
         let (result, _, _) = batch
             .extract_entries(100, 1000, None, merge_operator, None)
             .await
@@ -1746,8 +2144,7 @@ mod tests {
         batch.merge(b"key1", b"merge2");
 
         // When: extracting entries with a merge operator
-        let merge_operator =
-            Some(std::sync::Arc::new(StringConcatMergeOperator) as MergeOperatorType);
+        let merge_operator = Some(Arc::new(StringConcatMergeOperator) as MergeOperatorType);
         let (result, _, _) = batch
             .extract_entries(100, 1000, None, merge_operator, None)
             .await
