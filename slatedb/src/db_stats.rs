@@ -105,7 +105,9 @@ pub(crate) struct DbStatsInner {
     pub(crate) reader_replay_memtables: Arc<dyn GaugeFn>,
     pub(crate) reader_active_checkpoints: Arc<dyn GaugeFn>,
     pub(crate) reader_manifest_polls: Arc<dyn CounterFn>,
+    #[allow(dead_code)]
     pub(crate) reader_wal_replay_list_reader_open: Arc<dyn CounterFn>,
+    #[allow(dead_code)]
     pub(crate) reader_wal_replay_list_checkpoint_recovery: Arc<dyn CounterFn>,
 }
 

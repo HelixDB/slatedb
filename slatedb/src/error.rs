@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::bytes_range::BytesRange;
 use crate::error::SlateDBError::{
-    LatestTransactionalObjectVersionMissing, TransactionalObjectVersionExists,
+    DatabaseMissing, LatestTransactionalObjectVersionMissing, TransactionalObjectVersionExists,
 };
 use crate::merge_operator::MergeOperatorError;
 use slatedb_txn_obj::TransactionalObjectError;
@@ -101,8 +101,8 @@ pub(crate) enum SlateDBError {
     #[error("wal store reconfiguration unsupported")]
     WalStoreReconfigurationError,
 
-    #[error("wal truncated")]
-    WalTruncated,
+    #[error("wal truncated at wal file `{0}`")]
+    WalTruncated(u64),
 
     #[error("wal unavailable")]
     WalUnavailable(Arc<dyn std::error::Error + Sync + Send + 'static>),
@@ -251,8 +251,8 @@ pub(crate) enum SlateDBError {
     #[error("clone source paths must be unique, found duplicate: `{0}`")]
     DuplicatedCloneSourcePath(Path),
 
-    #[error("Manifest union of sources with WAL is not supported, source with WAL: `{paths:?}`")]
-    InvalidUnionSourceWithWal { paths: Vec<Path> },
+    #[error("Projection and/or union with WAL is not supported, sources with WAL: `{paths:?}`")]
+    InvalidCloneSourceWithWal { paths: Vec<Path> },
 
     #[error("Source manifest set must not be empty")]
     InvalidUnionSetEmpty(),
@@ -270,6 +270,7 @@ pub(crate) enum SlateDBError {
     InvalidManifestPollInterval(Duration),
 
     #[error("invalid WAL poll interval. interval=`{0:?}`")]
+    #[allow(dead_code)]
     InvalidWalPollInterval(Duration),
 
     #[error("checkpoint lifetime must be at least double the manifest poll interval. lifetime=`{lifetime:?}`, interval=`{interval:?}`")]
@@ -277,6 +278,9 @@ pub(crate) enum SlateDBError {
         lifetime: Duration,
         interval: Duration,
     },
+
+    #[error("invalid sst batch size. size=`{0}`")]
+    InvalidSSTBatchSize(usize),
 
     #[error("invalid configuration: {0}")]
     InvalidConfiguration(String),
@@ -739,6 +743,7 @@ impl From<SlateDBError> for Error {
             }
             SlateDBError::InvalidObjectStorePath(_) => Error::invalid(msg),
             SlateDBError::UnknownConfigurationFormat(_) => Error::invalid(msg),
+            SlateDBError::InvalidSSTBatchSize(_) => Error::invalid(msg),
             SlateDBError::InvalidConfiguration(_) => Error::invalid(msg),
             SlateDBError::InvalidCheckpointLifetime(_) => Error::invalid(msg),
             SlateDBError::InvalidManifestPollInterval(_)
@@ -749,7 +754,7 @@ impl From<SlateDBError> for Error {
             SlateDBError::SeekKeyLessThanLastReturnedKey => Error::invalid(msg),
             SlateDBError::IdenticalClonePaths { .. } => Error::invalid(msg),
             SlateDBError::DuplicatedCloneSourcePath(_) => Error::invalid(msg),
-            SlateDBError::InvalidUnionSourceWithWal { .. } => Error::invalid(msg),
+            SlateDBError::InvalidCloneSourceWithWal { .. } => Error::invalid(msg),
             SlateDBError::InvalidUnionSetEmpty() => Error::invalid(msg),
             SlateDBError::InvalidUnion(_) => Error::invalid(msg),
             SlateDBError::InvalidProjection { .. } => Error::invalid(msg),
@@ -793,9 +798,9 @@ impl From<SlateDBError> for Error {
             SlateDBError::CheckpointAlreadyExists(_) => Error::data(msg),
             SlateDBError::InvalidVersion { .. } => Error::data(msg),
             SlateDBError::ManifestMissing(_) => Error::data(msg),
-            SlateDBError::LatestTransactionalObjectVersionMissing => Error::data(msg),
-            SlateDBError::DatabaseMissing => Error::data(msg).with_code(ErrorCode::DatabaseMissing),
-            SlateDBError::TransactionalObjectVersionExists => Error::data(msg),
+            LatestTransactionalObjectVersionMissing => Error::data(msg),
+            DatabaseMissing => Error::data(msg).with_code(ErrorCode::DatabaseMissing),
+            TransactionalObjectVersionExists => Error::data(msg),
             SlateDBError::InvalidTransactionalObjectState => Error::data(msg),
             SlateDBError::EmptyManifest => Error::data(msg),
             SlateDBError::EmptyBlock => Error::data(msg),
@@ -809,6 +814,7 @@ impl From<SlateDBError> for Error {
             SlateDBError::CloneExternalDbMissing => Error::data(msg),
             SlateDBError::CloneIncorrectExternalDbCheckpoint { .. } => Error::data(msg),
             SlateDBError::CloneIncorrectFinalCheckpoint { .. } => Error::data(msg),
+            SlateDBError::WalTruncated(_) => Error::data(msg),
             SlateDBError::WalDataError(src) => Error::data(msg).with_source(Box::new(src)),
 
             // Internal errors
@@ -824,7 +830,6 @@ impl From<SlateDBError> for Error {
             SlateDBError::TransactionalObjectError(err) => {
                 Error::internal(msg).with_source(Box::new(err))
             }
-            SlateDBError::WalTruncated => Error::internal(msg),
             SlateDBError::WalInternalError(src) => Error::internal(msg).with_source(Box::new(src)),
         }
     }
@@ -868,7 +873,7 @@ mod tests {
 
     #[test]
     fn database_missing_has_stable_code_without_changing_broad_kind() {
-        let public_err = Error::from(SlateDBError::DatabaseMissing);
+        let public_err = Error::from(DatabaseMissing);
 
         assert_eq!(public_err.kind(), ErrorKind::Data);
         assert_eq!(public_err.code(), Some(ErrorCode::DatabaseMissing));
@@ -877,7 +882,7 @@ mod tests {
     #[test]
     fn other_data_errors_do_not_claim_database_is_missing() {
         for err in [
-            SlateDBError::LatestTransactionalObjectVersionMissing,
+            LatestTransactionalObjectVersionMissing,
             SlateDBError::ManifestMissing(7),
             SlateDBError::InvalidDBState,
         ] {

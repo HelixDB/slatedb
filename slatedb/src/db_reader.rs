@@ -1,56 +1,58 @@
-use crate::bytes_range::{ByteRangeBounds, BytesRange};
-use crate::cached_object_store::CachedObjectStore;
-use crate::clock::MonotonicClock;
-use crate::config::{CheckpointOptions, DbReaderOptions, ReadOptions, ScanOptions};
-use crate::db_cache::CacheTarget;
-use crate::db_cache_manager;
-use crate::db_common::extract_segment_prefix;
-use crate::db_iter::DbIteratorGuard;
-use crate::db_state::{collect_touched_segments, SsTableId};
-use crate::db_stats::DbStats;
-use crate::db_status::{ClosedResultWriter, DbStatus, DbStatusManager};
-use crate::dispatcher::{MessageHandler, MessageHandlerExecutor, MessageTickerDef, Notifier};
-use crate::error::SlateDBError;
-use crate::manifest::store::{ManifestStore, StoredManifest};
-use crate::manifest::{Manifest, ManifestCore, VersionedManifest};
-use crate::mem_table::{ImmutableMemtable, KVTable, WritableKVTable};
-use crate::merge_operator::MergeOperatorType;
-use crate::oracle::DbReaderOracle;
-use crate::paths::PathResolver;
-use crate::prefix_extractor::PrefixExtractor;
-use crate::reader::{DbStateReader, Reader, ScanContext};
-use crate::replay_task_scope::ReplayTaskScope;
-use crate::tablestore::TableStore;
-use crate::types::KeyValue;
-use crate::utils::{panic_string, IdGenerator};
-use crate::wal_replay::{
-    ExactWalReplayIterator, ExactWalReplaySource, ReplayedMemtable, RuntimeWalReplayError,
-    RuntimeWalReplayIterator, RuntimeWalReplayOptions, RuntimeWalReplaySource, WalReplayOptions,
+use crate::wal::slatedb::reader::SlateDbWalReaderOptions;
+use {
+    crate::{
+        bytes_range::{ByteRangeBounds, BytesRange},
+        cached_object_store::CachedObjectStore,
+        clock::MonotonicClock,
+        config::{CheckpointOptions, DbReaderOptions, ReadOptions, ScanOptions},
+        db_cache::CacheTarget,
+        db_cache_manager,
+        db_common::extract_segment_prefix,
+        db_iter::DbIteratorGuard,
+        db_state::{collect_touched_segments, SsTableId},
+        db_stats::DbStats,
+        db_status::{ClosedResultWriter, DbStatus, DbStatusManager},
+        dispatcher::{MessageHandler, MessageHandlerExecutor, MessageTickerDef},
+        error::SlateDBError,
+        manifest::{
+            store::{ManifestStore, StoredManifest},
+            Manifest, ManifestCore, VersionedManifest,
+        },
+        mem_table::{ImmutableMemtable, KVTable, WritableKVTable},
+        merge_operator::MergeOperatorType,
+        oracle::DbReaderOracle,
+        paths::PathResolver,
+        prefix_extractor::PrefixExtractor,
+        reader::{DbStateReader, Reader, ScanContext},
+        tablestore::TableStore,
+        types::KeyValue,
+        utils::IdGenerator,
+        wal::slatedb::store::WalTableStore,
+        wal::WalReader as WalReaderTrait,
+        wal_replay::{WalReplayIterator, WalReplayOptions},
+        Checkpoint, DbCacheManagerOps, DbIterator, DbMetadataOps, DbReadOps, DbSnapshot,
+    },
+    async_trait::async_trait,
+    bytes::Bytes,
+    futures::stream::BoxStream,
+    log::{info, warn},
+    object_store::{path::Path, ObjectStore},
+    parking_lot::RwLock,
+    slatedb_common::{clock::SystemClock, DbRand},
+    std::{
+        collections::{BTreeSet, HashMap},
+        ops::Sub,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, LazyLock, Weak,
+        },
+    },
+    tokio::runtime::Handle,
+    tokio::sync::Notify,
+    uuid::Uuid,
 };
-use crate::{Checkpoint, DbIterator, DbSnapshot};
-use crate::{DbCacheManagerOps, DbMetadataOps, DbReadOps};
-use async_trait::async_trait;
-use bytes::Bytes;
-use futures::{stream::BoxStream, FutureExt};
-use log::{error, info, warn};
-use object_store::path::Path;
-use object_store::ObjectStore;
-use parking_lot::RwLock;
-use slatedb_common::clock::SystemClock;
-use slatedb_common::DbRand;
-use std::collections::{BTreeSet, HashMap};
-use std::ops::Sub;
-use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::LazyLock;
-use std::sync::{Arc, Weak};
-use tokio::runtime::Handle;
-use tokio::sync::Notify;
-use uuid::Uuid;
 
 pub(crate) const DB_READER_TASK_NAME: &str = "manifest_poller";
-const MAX_RUNTIME_WALS_PER_TURN: u64 = 64;
-const MAX_RUNTIME_REPLAY_TURN_TIME: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Determines how a [`DbReader`] chooses and refreshes the database state it reads.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -82,6 +84,39 @@ impl From<Option<Uuid>> for DbReaderMode {
     }
 }
 
+/// Where a reader stops replaying the WAL when it builds its state.
+///
+/// This is only reached when replay is wanted at all; a reader configured with
+/// [`DbReaderOptions::skip_wal_replay`] reads no WAL, which
+/// [`WalReplayEnd::for_reader`] expresses as `None`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WalReplayEnd {
+    /// Stop at the manifest's `next_wal_sst_id`, replaying exactly the WAL that
+    /// the manifest itself records as durable.
+    Manifest,
+
+    /// Ask the configured WAL reader for the newest WAL file and replay through it,
+    /// picking up writes made after the manifest was written.
+    Latest,
+}
+
+impl WalReplayEnd {
+    /// Returns `None` when the reader is configured to skip WAL replay, in which
+    /// case it observes only the state recorded in the manifest (L0 and below).
+    fn for_reader(mode: DbReaderMode, options: &DbReaderOptions) -> Option<Self> {
+        if options.skip_wal_replay {
+            return None;
+        }
+        Some(match mode {
+            // A pinned checkpoint reads the state its manifest captured, so it
+            // stops at that manifest's WAL boundary instead of following WAL
+            // files written after the checkpoint was taken.
+            DbReaderMode::Checkpoint(_) => Self::Manifest,
+            DbReaderMode::ManagedCheckpoint | DbReaderMode::FollowLatest => Self::Latest,
+        })
+    }
+}
+
 /// Read-only interface for accessing a database from either
 /// the latest persistent state or from an arbitrary checkpoint.
 ///
@@ -98,6 +133,7 @@ pub struct DbReader {
 pub(crate) struct DbReaderInner {
     manifest_store: Arc<ManifestStore>,
     table_store: Arc<TableStore>,
+    wal_reader: Arc<dyn WalReaderTrait>,
     options: DbReaderOptions,
     mode: DbReaderMode,
     state: RwLock<Arc<ReaderState>>,
@@ -108,8 +144,6 @@ pub(crate) struct DbReaderInner {
     status_manager: DbStatusManager,
     segment_extractor: Option<Arc<dyn PrefixExtractor>>,
     rand: Arc<DbRand>,
-    /// Root ownership scope for every replay task in this reader tenure.
-    replay_tasks: ReplayTaskScope,
     /// Kept alive so the underlying `MetricsRecorder` is not dropped while
     /// metric handles in `DbStats` (and other stats structs) are still in use.
     /// See: https://github.com/slatedb/slatedb/issues/1469
@@ -117,58 +151,9 @@ pub(crate) struct DbReaderInner {
     recorder: slatedb_common::metrics::MetricsRecorderHelper,
 }
 
+#[derive(Debug)]
 enum DbReaderMessage {
     PollManifest,
-    PollWalTail,
-    ContinueWalTail,
-    WalTailComplete(Result<RuntimeReplayTurn, SlateDBError>),
-    ManifestRefreshComplete(Result<Option<ManifestRefreshCandidate>, SlateDBError>),
-}
-
-impl std::fmt::Debug for DbReaderMessage {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(match self {
-            Self::PollManifest => "PollManifest",
-            Self::PollWalTail => "PollWalTail",
-            Self::ContinueWalTail => "ContinueWalTail",
-            Self::WalTailComplete(Ok(_)) => "WalTailComplete(Ok)",
-            Self::WalTailComplete(Err(_)) => "WalTailComplete(Err)",
-            Self::ManifestRefreshComplete(Ok(Some(_))) => "ManifestRefreshComplete(Ok(Some))",
-            Self::ManifestRefreshComplete(Ok(None)) => "ManifestRefreshComplete(Ok(None))",
-            Self::ManifestRefreshComplete(Err(_)) => "ManifestRefreshComplete(Err)",
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ReaderReplayPath {
-    ExactOpen {
-        include_unmanifested: bool,
-        source: ExactWalReplaySource,
-    },
-    RuntimeManifest,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RuntimeMissingPolicy {
-    Error,
-    ExactNextIsCaughtUp(u64),
-}
-
-struct RuntimeReplayTurn {
-    manifest_id: u64,
-    base_last_wal_id: u64,
-    imm_memtable: ReplayMemtables,
-    last_wal_id: u64,
-    last_committed_seq: u64,
-    caught_up: bool,
-    reached_turn_limit: bool,
-}
-
-struct ManifestRefreshCandidate {
-    base_manifest_id: u64,
-    base_last_wal_id: u64,
-    state: ReaderState,
 }
 
 #[derive(Clone)]
@@ -403,6 +388,8 @@ impl DbReaderInner {
     async fn new(
         manifest_store: Arc<ManifestStore>,
         table_store: Arc<TableStore>,
+        wal_store: Arc<WalTableStore>,
+        wal_reader: Option<Arc<dyn WalReaderTrait>>,
         options: DbReaderOptions,
         mode: DbReaderMode,
         merge_operator: Option<MergeOperatorType>,
@@ -422,27 +409,39 @@ impl DbReaderInner {
         } else {
             (manifest.id(), manifest.manifest().clone())
         };
-        let include_unmanifested =
-            !matches!(mode, DbReaderMode::Checkpoint(_)) && !options.skip_wal_replay;
+        let status_manager = DbStatusManager::new_with_initial_values(
+            initial_manifest.core.last_l0_seq,
+            VersionedManifest::from_manifest(manifest_id, initial_manifest.clone()),
+            BTreeSet::default(),
+        );
+        let wal_reader = wal_reader.unwrap_or_else(|| {
+            Arc::new(
+                crate::wal::slatedb::reader::SlateDbWalReader::new_with_status_manager(
+                    wal_store,
+                    &status_manager,
+                    Arc::clone(&system_clock),
+                    SlateDbWalReaderOptions {
+                        sst_batch_size: options.wal_replay.max_concurrent_objects,
+                        read_ahead_bytes: options.wal_replay.block_working_memory_limit(),
+                        ..SlateDbWalReaderOptions::default()
+                    },
+                ),
+            )
+        });
         let db_stats = DbStats::new(&recorder);
-        let replay_tasks = ReplayTaskScope::new();
         let initial_state = Arc::new(
             Self::build_reader_state(
                 checkpoint,
                 manifest_id,
                 initial_manifest,
                 ReplayMemtables::default(),
-                ReaderReplayPath::ExactOpen {
-                    include_unmanifested,
-                    source: ExactWalReplaySource::ReaderOpen,
-                },
+                WalReplayEnd::for_reader(mode, &options),
                 Arc::clone(&table_store),
+                wal_reader.as_ref(),
                 &options,
                 segment_extractor.as_ref(),
                 None,
                 &db_stats,
-                Some(replay_tasks.clone()),
-                &system_clock,
             )
             .await?,
         );
@@ -452,13 +451,15 @@ impl DbReaderInner {
             initial_state.core().last_l0_clock_tick,
         ));
 
-        // initial_state contains the last_committed_seq after WAL replay. in no-wal mode, we can simply fallback
-        // to last_l0_seq.
         let initial_durable_seq = initial_state
             .last_remote_persisted_seq
             .max(initial_state.core().last_l0_seq);
-        let status_manager = DbStatusManager::new_with_initial_values(
-            initial_durable_seq,
+        status_manager.report_durable_seq(
+            initial_state
+                .last_remote_persisted_seq
+                .max(initial_state.core().last_l0_seq),
+        );
+        status_manager.report_manifest_and_memtable_segments(
             VersionedManifest::from(initial_state.as_ref()),
             collect_touched_segments(initial_state.as_ref()),
         );
@@ -479,6 +480,7 @@ impl DbReaderInner {
         let inner = Self {
             manifest_store,
             table_store,
+            wal_reader,
             options,
             mode,
             state,
@@ -489,7 +491,6 @@ impl DbReaderInner {
             status_manager,
             segment_extractor,
             rand,
-            replay_tasks,
             recorder,
         };
         Ok(inner)
@@ -704,22 +705,58 @@ impl DbReaderInner {
             .report_manifest_and_memtable_segments(versioned_manifest, touched_segments);
     }
 
+    async fn maybe_replay_new_wals(&self) -> Result<(), SlateDBError> {
+        if self.options.skip_wal_replay {
+            return Ok(());
+        }
+        let current_state = Arc::clone(&self.state.read());
+        let mut imm_memtable = current_state.imm_memtable.clone();
+        let generation = Arc::clone(&current_state.generation);
+        let mut publish =
+            |imm_memtable: &ReplayMemtables, last_wal_id: u64, last_committed_seq: u64| {
+                self.oracle.advance_durable_seq(last_committed_seq);
+                self.db_stats
+                    .reader_replay_memtables
+                    .set(imm_memtable.len() as i64);
+                let mut write_guard = self.state.write();
+                *write_guard = Arc::new(ReaderState {
+                    generation: Arc::clone(&generation),
+                    imm_memtable: imm_memtable.clone(),
+                    last_wal_id,
+                    last_remote_persisted_seq: last_committed_seq,
+                });
+                drop(write_guard);
+                self.status_manager
+                    .report_memtable_segments(collect_touched_segments(self.state.read().as_ref()));
+            };
+
+        Self::replay_wal_into(
+            Arc::clone(&self.table_store),
+            self.wal_reader.as_ref(),
+            &self.options,
+            current_state.core(),
+            &mut imm_memtable,
+            Some((
+                current_state.last_wal_id,
+                current_state.last_remote_persisted_seq,
+            )),
+            WalReplayEnd::Latest,
+            self.segment_extractor.as_ref(),
+            Some(&mut publish),
+            Some(&self.db_stats),
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn rebuild_checkpoint_state(
         &self,
         new_checkpoint: Checkpoint,
     ) -> Result<ReaderState, SlateDBError> {
         let manifest_id = new_checkpoint.manifest_id;
         let manifest = self.manifest_store.read_manifest(manifest_id).await?;
-        self.rebuild_state(
-            Some(new_checkpoint),
-            manifest_id,
-            manifest,
-            ReaderReplayPath::ExactOpen {
-                include_unmanifested: !self.options.skip_wal_replay,
-                source: ExactWalReplaySource::CheckpointRecovery,
-            },
-        )
-        .await
+        self.rebuild_state(Some(new_checkpoint), manifest_id, manifest)
+            .await
     }
 
     async fn rebuild_state(
@@ -727,29 +764,8 @@ impl DbReaderInner {
         checkpoint: Option<Checkpoint>,
         manifest_id: u64,
         manifest: Manifest,
-        replay_path: ReaderReplayPath,
     ) -> Result<ReaderState, SlateDBError> {
         let prior = self.state.read().clone();
-        self.rebuild_state_from(
-            prior,
-            checkpoint,
-            manifest_id,
-            manifest,
-            replay_path,
-            self.replay_tasks.clone(),
-        )
-        .await
-    }
-
-    async fn rebuild_state_from(
-        &self,
-        prior: Arc<ReaderState>,
-        checkpoint: Option<Checkpoint>,
-        manifest_id: u64,
-        manifest: Manifest,
-        replay_path: ReaderReplayPath,
-        replay_tasks: ReplayTaskScope,
-    ) -> Result<ReaderState, SlateDBError> {
         let replay_cursor = Some((
             prior.last_wal_id.max(manifest.core.replay_after_wal_id),
             prior
@@ -788,45 +804,15 @@ impl DbReaderInner {
             manifest_id,
             manifest,
             imm_memtable,
-            replay_path,
+            WalReplayEnd::for_reader(self.mode, &self.options),
             Arc::clone(&self.table_store),
+            self.wal_reader.as_ref(),
             &self.options,
             self.segment_extractor.as_ref(),
             replay_cursor,
             &self.db_stats,
-            Some(replay_tasks),
-            &self.system_clock,
         )
         .await
-    }
-
-    async fn build_latest_manifest_candidate(
-        &self,
-        base: Arc<ReaderState>,
-        replay_tasks: ReplayTaskScope,
-    ) -> Result<Option<ManifestRefreshCandidate>, SlateDBError> {
-        let latest_manifest = self.manifest_store.read_latest_manifest().await?;
-        if latest_manifest.id <= base.generation.manifest_id {
-            return Ok(None);
-        }
-
-        let base_manifest_id = base.generation.manifest_id;
-        let base_last_wal_id = base.last_wal_id;
-        let state = self
-            .rebuild_state_from(
-                base,
-                None,
-                latest_manifest.id,
-                latest_manifest.manifest,
-                ReaderReplayPath::RuntimeManifest,
-                replay_tasks,
-            )
-            .await?;
-        Ok(Some(ManifestRefreshCandidate {
-            base_manifest_id,
-            base_last_wal_id,
-            state,
-        }))
     }
 
     async fn build_reader_state(
@@ -834,49 +820,33 @@ impl DbReaderInner {
         manifest_id: u64,
         manifest: Manifest,
         mut imm_memtable: ReplayMemtables,
-        replay_path: ReaderReplayPath,
+        replay_wals: Option<WalReplayEnd>,
         table_store: Arc<TableStore>,
+        wal_reader: &dyn WalReaderTrait,
         options: &DbReaderOptions,
         segment_extractor: Option<&Arc<dyn PrefixExtractor>>,
         replay_cursor: Option<(u64, u64)>,
         db_stats: &DbStats,
-        replay_tasks: Option<ReplayTaskScope>,
-        system_clock: &Arc<dyn SystemClock>,
     ) -> Result<ReaderState, SlateDBError> {
-        let (last_wal_id, last_committed_seq) = match replay_path {
-            ReaderReplayPath::ExactOpen {
-                include_unmanifested,
-                source,
-            } => {
-                Self::replay_wal_into_exact_with_source(
+        let (last_wal_id, last_committed_seq) = match replay_wals {
+            Some(replay_end) => {
+                Self::replay_wal_into(
                     Arc::clone(&table_store),
+                    wal_reader,
                     options,
                     &manifest.core,
                     &mut imm_memtable,
                     replay_cursor,
-                    include_unmanifested,
-                    source,
+                    replay_end,
                     segment_extractor,
                     None,
                     Some(db_stats),
-                    replay_tasks.clone(),
                 )
                 .await?
             }
-            ReaderReplayPath::RuntimeManifest => {
-                Self::replay_manifest_range_into(
-                    Arc::clone(&table_store),
-                    options,
-                    &manifest.core,
-                    &mut imm_memtable,
-                    replay_cursor,
-                    segment_extractor,
-                    Some(db_stats),
-                    replay_tasks,
-                    system_clock,
-                )
-                .await?
-            }
+            // Skipping replay reads no WAL at all: the reader stays at the
+            // watermark it has already reached (the most recently read manifest)
+            None => Self::replayed_watermark(&manifest.core, &imm_memtable),
         };
 
         db_stats
@@ -891,23 +861,22 @@ impl DbReaderInner {
         })
     }
 
-    #[cfg(test)]
+    async fn refresh_latest_manifest(&self) -> Result<(), SlateDBError> {
+        let latest_manifest = self.manifest_store.read_latest_manifest().await?;
+        self.apply_latest_manifest(latest_manifest).await
+    }
+
     async fn apply_latest_manifest(
         &self,
         latest_manifest: VersionedManifest,
     ) -> Result<(), SlateDBError> {
         let manifest_id = latest_manifest.id;
         if manifest_id <= self.state.read().generation.manifest_id {
-            return Ok(());
+            return self.maybe_replay_new_wals().await;
         }
 
         let new_state = self
-            .rebuild_state(
-                None,
-                manifest_id,
-                latest_manifest.manifest,
-                ReaderReplayPath::RuntimeManifest,
-            )
+            .rebuild_state(None, manifest_id, latest_manifest.manifest)
             .await?;
         self.install_state(new_state);
         info!("refreshed reader to latest manifest [manifest_id={manifest_id}]");
@@ -974,8 +943,7 @@ impl DbReaderInner {
         self: &Arc<Self>,
         task_executor: &MessageHandlerExecutor,
     ) -> Result<(), SlateDBError> {
-        let (tail_tx, tail_rx) = async_channel::unbounded();
-        let poller = ManifestPoller::new(Arc::clone(self), tail_tx, tail_rx);
+        let poller = ManifestPoller::new(Arc::clone(self));
         let (_tx, rx) = async_channel::unbounded();
         let result = task_executor.add_handler(
             DB_READER_TASK_NAME.to_string(),
@@ -987,104 +955,75 @@ impl DbReaderInner {
         result
     }
 
-    #[cfg(test)]
-    async fn replay_wal_into_exact(
-        table_store: Arc<TableStore>,
-        reader_options: &DbReaderOptions,
-        core: &ManifestCore,
-        into_tables: &mut ReplayMemtables,
-        replay_cursor: Option<(u64, u64)>,
-        replay_new_wals: bool,
-        segment_extractor: Option<&Arc<dyn PrefixExtractor>>,
-        publish: Option<ReplayPublisher<'_>>,
-        db_stats: Option<&DbStats>,
-    ) -> Result<(u64, u64), SlateDBError> {
-        Self::replay_wal_into_exact_with_source(
-            table_store,
-            reader_options,
-            core,
-            into_tables,
-            replay_cursor,
-            replay_new_wals,
-            ExactWalReplaySource::ReaderOpen,
-            segment_extractor,
-            publish,
-            db_stats,
-            None,
-        )
-        .await
+    /// The `(last replayed WAL id, last committed seq)` the reader has already
+    /// reached: the watermark of the most recently replayed table, or the
+    /// manifest's own boundary when nothing has been replayed into `tables`.
+    fn replayed_watermark(core: &ManifestCore, tables: &ReplayMemtables) -> (u64, u64) {
+        match tables.front() {
+            Some(latest_replayed_table) => (
+                latest_replayed_table.recent_flushed_wal_id(),
+                latest_replayed_table.table().last_seq().unwrap_or(0),
+            ),
+            None => (core.replay_after_wal_id, core.last_l0_seq),
+        }
     }
 
-    async fn replay_wal_into_exact_with_source(
+    async fn replay_wal_into(
         table_store: Arc<TableStore>,
+        wal_reader: &dyn WalReaderTrait,
         reader_options: &DbReaderOptions,
         core: &ManifestCore,
         into_tables: &mut ReplayMemtables,
         replay_cursor: Option<(u64, u64)>,
-        replay_new_wals: bool,
-        source: ExactWalReplaySource,
+        replay_end: WalReplayEnd,
         segment_extractor: Option<&Arc<dyn PrefixExtractor>>,
         mut publish: Option<ReplayPublisher<'_>>,
         db_stats: Option<&DbStats>,
-        replay_tasks: Option<ReplayTaskScope>,
     ) -> Result<(u64, u64), SlateDBError> {
         let (mut replay_after_wal_id, mut last_committed_seq) =
-            replay_cursor.unwrap_or_else(|| {
-                if let Some(latest_replayed_table) = into_tables.front() {
-                    (
-                        latest_replayed_table.recent_flushed_wal_id(),
-                        latest_replayed_table.table().last_seq().unwrap_or(0),
-                    )
-                } else {
-                    (core.replay_after_wal_id, core.last_l0_seq)
-                }
-            });
-        let replay_list_counter = db_stats.map(|stats| match source {
-            ExactWalReplaySource::ReaderOpen => {
-                Arc::clone(&stats.reader_wal_replay_list_reader_open)
-            }
-            ExactWalReplaySource::CheckpointRecovery => {
-                Arc::clone(&stats.reader_wal_replay_list_checkpoint_recovery)
-            }
-            ExactWalReplaySource::WriterOpen => {
-                unreachable!("writer replay does not use DbReader metrics")
-            }
-        });
-        let wal_id_end = if replay_new_wals {
-            if let Some(counter) = replay_list_counter.as_ref() {
-                counter.increment(1);
-            }
-            table_store.last_seen_wal_id(replay_after_wal_id).await? + 1
-        } else {
-            core.next_wal_sst_id
+            replay_cursor.unwrap_or_else(|| Self::replayed_watermark(core, into_tables));
+        let wal_id_start = replay_after_wal_id
+            .checked_add(1)
+            .ok_or(SlateDBError::InvalidDBState)?;
+        let wal_id_end = match replay_end {
+            WalReplayEnd::Manifest => core.next_wal_sst_id,
+            WalReplayEnd::Latest => wal_reader
+                .last_wal_file_id(replay_after_wal_id)
+                .await?
+                .checked_add(1)
+                .ok_or(SlateDBError::InvalidDBState)?,
         };
+        if wal_id_start >= wal_id_end {
+            return Ok((replay_after_wal_id, last_committed_seq));
+        }
 
         let replay_options = WalReplayOptions {
-            prefetch: reader_options.wal_replay,
             max_memtable_bytes: reader_options.max_memtable_bytes as usize,
-            // Skip entries that we already have in `imm_memtable` (that might be above last_l0_seq).
+            // Skip entries that we already have in `imm_memtable` (that might be above
+            // last_l0_seq).
             min_seq: Some(last_committed_seq),
-            source,
-            task_scope: replay_tasks,
         };
 
-        if let Some(counter) = replay_list_counter {
-            counter.increment(1);
-        }
-        let mut replay_iter = ExactWalReplayIterator::range(
-            (replay_after_wal_id + 1)..wal_id_end,
+        let wal_iter = wal_reader
+            .iterator((wal_id_start..wal_id_end).into())
+            .await?;
+        let mut replay_iter = WalReplayIterator::for_wal_iterator(
+            wal_iter,
             core,
             replay_options,
             Arc::clone(&table_store),
-        )
-        .await?;
+        )?;
 
         while let Some(replayed_table) = match replay_iter.next().await {
             Ok(Some(replayed_table)) => Some(replayed_table),
             Ok(None) => None,
+            Err(SlateDBError::WalTruncated(_)) => None,
             Err(err) => return Err(err),
         } {
-            assert!(replayed_table.last_wal_id > replay_after_wal_id);
+            // `last_wal_id` is a conservative watermark: a table that ends mid-file
+            // is tagged with the last fully replayed WAL ID, which may equal the
+            // watermark of the previous table.
+            assert!(replayed_table.last_wal_id >= replay_after_wal_id);
             let replayed_ssts = replayed_table.last_wal_id - replay_after_wal_id;
             replay_after_wal_id = replayed_table.last_wal_id;
             if let Some(db_stats) = db_stats {
@@ -1123,277 +1062,6 @@ impl DbReaderInner {
         Ok((replay_after_wal_id, last_committed_seq))
     }
 
-    async fn replay_manifest_range_into(
-        table_store: Arc<TableStore>,
-        reader_options: &DbReaderOptions,
-        core: &ManifestCore,
-        into_tables: &mut ReplayMemtables,
-        replay_cursor: Option<(u64, u64)>,
-        segment_extractor: Option<&Arc<dyn PrefixExtractor>>,
-        db_stats: Option<&DbStats>,
-        replay_tasks: Option<ReplayTaskScope>,
-        system_clock: &Arc<dyn SystemClock>,
-    ) -> Result<(u64, u64), SlateDBError> {
-        let mut replay_cursor =
-            replay_cursor.unwrap_or((core.replay_after_wal_id, core.last_l0_seq));
-        while replay_cursor.0.saturating_add(1) < core.next_wal_sst_id {
-            let start = replay_cursor.0.saturating_add(1);
-            let deadline = system_clock.now() + MAX_RUNTIME_REPLAY_TURN_TIME;
-            let completed_before = replay_cursor.0;
-            let mut replay = RuntimeWalReplayIterator::range(
-                start..core.next_wal_sst_id,
-                core,
-                RuntimeWalReplayOptions {
-                    max_memtable_bytes: reader_options.max_memtable_bytes as usize,
-                    min_seq: Some(replay_cursor.1),
-                    max_wals_per_batch: std::num::NonZeroUsize::new(
-                        usize::try_from(MAX_RUNTIME_WALS_PER_TURN)
-                            .expect("runtime WAL turn limit must fit usize"),
-                    ),
-                    source: RuntimeWalReplaySource::Manifest,
-                    task_scope: replay_tasks.clone(),
-                    ..RuntimeWalReplayOptions::default()
-                },
-                Arc::clone(&table_store),
-            )?;
-
-            loop {
-                let completed_wals = replay_cursor.0.saturating_sub(completed_before);
-                if completed_wals >= MAX_RUNTIME_WALS_PER_TURN {
-                    break;
-                }
-                let remaining = deadline
-                    .signed_duration_since(system_clock.now())
-                    .to_std()
-                    .unwrap_or(std::time::Duration::ZERO);
-                let replayed = tokio::select! {
-                    biased;
-                    _ = system_clock.sleep(remaining) => break,
-                    result = replay.next() => result,
-                };
-                if system_clock.now() >= deadline {
-                    break;
-                }
-                let replayed_table = match replayed {
-                    Ok(Some(table)) => table,
-                    Ok(None) => break,
-                    Err(RuntimeWalReplayError::MissingInitialObject { source, .. })
-                    | Err(RuntimeWalReplayError::Replay(source)) => return Err(source),
-                };
-                Self::apply_runtime_replayed_table(
-                    replayed_table,
-                    into_tables,
-                    &mut replay_cursor,
-                    segment_extractor,
-                    db_stats,
-                )?;
-            }
-            drop(replay);
-
-            if replay_cursor.0.saturating_add(1) < core.next_wal_sst_id {
-                tokio::task::yield_now().await;
-            }
-        }
-        Ok(replay_cursor)
-    }
-
-    #[cfg(test)]
-    async fn replay_runtime_range_into(
-        table_store: Arc<TableStore>,
-        reader_options: &DbReaderOptions,
-        core: &ManifestCore,
-        into_tables: &mut ReplayMemtables,
-        replay_cursor: &mut (u64, u64),
-        wal_range: std::ops::Range<u64>,
-        missing_policy: RuntimeMissingPolicy,
-        segment_extractor: Option<&Arc<dyn PrefixExtractor>>,
-        db_stats: Option<&DbStats>,
-        max_wals_per_batch: Option<std::num::NonZeroUsize>,
-        replay_tasks: Option<ReplayTaskScope>,
-    ) -> Result<bool, SlateDBError> {
-        let mut replay = RuntimeWalReplayIterator::range(
-            wal_range,
-            core,
-            RuntimeWalReplayOptions {
-                max_memtable_bytes: reader_options.max_memtable_bytes as usize,
-                min_seq: Some(replay_cursor.1),
-                max_wals_per_batch,
-                source: max_wals_per_batch.map_or(RuntimeWalReplaySource::Manifest, |_| {
-                    RuntimeWalReplaySource::Tail
-                }),
-                task_scope: replay_tasks,
-                ..RuntimeWalReplayOptions::default()
-            },
-            table_store,
-        )?;
-
-        loop {
-            let replayed_table = match replay.next().await {
-                Ok(Some(table)) => table,
-                Ok(None) => break,
-                Err(RuntimeWalReplayError::MissingInitialObject { wal_id, source }) => {
-                    if missing_policy == RuntimeMissingPolicy::ExactNextIsCaughtUp(wal_id) {
-                        return Ok(true);
-                    }
-                    return Err(source);
-                }
-                Err(RuntimeWalReplayError::Replay(source)) => return Err(source),
-            };
-            Self::apply_runtime_replayed_table(
-                replayed_table,
-                into_tables,
-                replay_cursor,
-                segment_extractor,
-                db_stats,
-            )?;
-        }
-
-        Ok(false)
-    }
-
-    fn apply_runtime_replayed_table(
-        replayed_table: ReplayedMemtable,
-        into_tables: &mut ReplayMemtables,
-        replay_cursor: &mut (u64, u64),
-        segment_extractor: Option<&Arc<dyn PrefixExtractor>>,
-        db_stats: Option<&DbStats>,
-    ) -> Result<u64, SlateDBError> {
-        assert!(replayed_table.last_wal_id > replay_cursor.0);
-        let replayed_ssts = replayed_table.last_wal_id - replay_cursor.0;
-        replay_cursor.0 = replayed_table.last_wal_id;
-        if let Some(db_stats) = db_stats {
-            let metadata = replayed_table.table.metadata();
-            db_stats.reader_wal_replay_ssts.increment(replayed_ssts);
-            db_stats
-                .reader_wal_replay_bytes
-                .increment(metadata.entries_size_in_bytes as u64);
-            db_stats.reader_wal_replay_batches.increment(1);
-        }
-        if !replayed_table.table.is_empty() && replayed_table.last_seq > replay_cursor.1 {
-            let first_seq = replayed_table
-                .table
-                .table()
-                .first_seq()
-                .expect("expected first_seq on non-empty table");
-            assert!(first_seq > replay_cursor.1);
-            replay_cursor.1 = replayed_table.last_seq;
-            if let Some(extractor) = segment_extractor {
-                Self::record_replayed_touched_segments(extractor.as_ref(), &replayed_table.table)?;
-            }
-            into_tables.prepend(Arc::new(ImmutableMemtable::new(
-                replayed_table.table,
-                replayed_table.last_wal_id,
-            )));
-        }
-        Ok(replayed_ssts)
-    }
-
-    async fn replay_runtime_turn(
-        inner: Arc<Self>,
-        base: Arc<ReaderState>,
-        replay_tasks: ReplayTaskScope,
-    ) -> Result<RuntimeReplayTurn, SlateDBError> {
-        let manifest_id = base.generation.manifest_id;
-        let base_last_wal_id = base.last_wal_id;
-        let core = base.core();
-        let known_end = core.next_wal_sst_id;
-        let deadline = inner.system_clock.now() + MAX_RUNTIME_REPLAY_TURN_TIME;
-        let mut imm_memtable = base.imm_memtable.clone();
-        let mut cursor = (base.last_wal_id, base.last_remote_persisted_seq);
-        let mut completed_wals = 0_u64;
-        let mut caught_up = false;
-
-        'turn: while completed_wals < MAX_RUNTIME_WALS_PER_TURN
-            && inner.system_clock.now() < deadline
-        {
-            let next_wal_id = cursor
-                .0
-                .checked_add(1)
-                .ok_or(SlateDBError::InvalidDBState)?;
-            let remaining = MAX_RUNTIME_WALS_PER_TURN - completed_wals;
-            let (range_end, missing_policy) = if next_wal_id < known_end {
-                (
-                    next_wal_id
-                        .checked_add(remaining)
-                        .ok_or(SlateDBError::InvalidDBState)?
-                        .min(known_end),
-                    RuntimeMissingPolicy::Error,
-                )
-            } else {
-                (
-                    next_wal_id
-                        .checked_add(1)
-                        .ok_or(SlateDBError::InvalidDBState)?,
-                    RuntimeMissingPolicy::ExactNextIsCaughtUp(next_wal_id),
-                )
-            };
-            let mut replay = RuntimeWalReplayIterator::range(
-                next_wal_id..range_end,
-                core,
-                RuntimeWalReplayOptions {
-                    max_memtable_bytes: inner.options.max_memtable_bytes as usize,
-                    min_seq: Some(cursor.1),
-                    max_wals_per_batch: std::num::NonZeroUsize::new(1),
-                    source: RuntimeWalReplaySource::Tail,
-                    task_scope: Some(replay_tasks.clone()),
-                    ..RuntimeWalReplayOptions::default()
-                },
-                Arc::clone(&inner.table_store),
-            )?;
-
-            loop {
-                let remaining = deadline
-                    .signed_duration_since(inner.system_clock.now())
-                    .to_std()
-                    .unwrap_or(std::time::Duration::ZERO);
-                let replayed = tokio::select! {
-                    biased;
-                    _ = inner.system_clock.sleep(remaining) => break 'turn,
-                    result = replay.next() => result,
-                };
-                // A result completing at the exact deadline is deliberately
-                // discarded even if the runtime happened to poll it first.
-                if inner.system_clock.now() >= deadline {
-                    break 'turn;
-                }
-                let replayed_table = match replayed {
-                    Ok(Some(table)) => table,
-                    Ok(None) => break,
-                    Err(RuntimeWalReplayError::MissingInitialObject { wal_id, source }) => {
-                        if missing_policy == RuntimeMissingPolicy::ExactNextIsCaughtUp(wal_id) {
-                            caught_up = true;
-                            break 'turn;
-                        }
-                        return Err(source);
-                    }
-                    Err(RuntimeWalReplayError::Replay(source)) => return Err(source),
-                };
-                completed_wals = completed_wals.saturating_add(Self::apply_runtime_replayed_table(
-                    replayed_table,
-                    &mut imm_memtable,
-                    &mut cursor,
-                    inner.segment_extractor.as_ref(),
-                    Some(&inner.db_stats),
-                )?);
-                if completed_wals >= MAX_RUNTIME_WALS_PER_TURN {
-                    break 'turn;
-                }
-            }
-        }
-
-        Ok(RuntimeReplayTurn {
-            manifest_id,
-            base_last_wal_id,
-            imm_memtable,
-            last_wal_id: cursor.0,
-            last_committed_seq: cursor.1,
-            caught_up,
-            reached_turn_limit: !caught_up
-                && (completed_wals >= MAX_RUNTIME_WALS_PER_TURN
-                    || inner.system_clock.now() >= deadline),
-        })
-    }
-
     /// Re-derive each replayed entry's segment prefix (RFC-0024) and record the
     /// table's touched-segment set, mirroring the writer's replay path. Durable
     /// WAL entries were validated when accepted, so the antichain check is not
@@ -1424,8 +1092,8 @@ impl DbReaderInner {
     ///
     /// ## Returns
     /// - `Ok(())` if the reader is still open.
-    /// - `Err(SlateDBError::Closed)` if the reader was closed successfully
-    ///   (state.result_reader() returns Ok(())).
+    /// - `Err(SlateDBError::Closed)` if the reader was closed successfully (state.result_reader()
+    ///   returns Ok(())).
     /// - `Err(e)` if the reader was closed with an error, where `e` is the error
     ///   (state.result_reader() returns Err(e)).
     pub(crate) fn check_closed(&self) -> Result<(), SlateDBError> {
@@ -1443,23 +1111,10 @@ impl DbReaderInner {
 struct ManifestPoller {
     inner: Arc<DbReaderInner>,
     generations: HashMap<Uuid, Weak<ReaderGeneration>>,
-    tail_tx: async_channel::Sender<DbReaderMessage>,
-    tail_rx: Option<async_channel::Receiver<DbReaderMessage>>,
-    tail_in_flight: bool,
-    continuation_queued: bool,
-    tail_task: Option<tokio::task::JoinHandle<()>>,
-    tail_scope: Option<ReplayTaskScope>,
-    manifest_refresh_in_flight: bool,
-    manifest_refresh_task: Option<tokio::task::JoinHandle<()>>,
-    manifest_refresh_scope: Option<ReplayTaskScope>,
 }
 
 impl ManifestPoller {
-    fn new(
-        inner: Arc<DbReaderInner>,
-        tail_tx: async_channel::Sender<DbReaderMessage>,
-        tail_rx: async_channel::Receiver<DbReaderMessage>,
-    ) -> Self {
+    fn new(inner: Arc<DbReaderInner>) -> Self {
         let mut generations = HashMap::new();
         if inner.mode == DbReaderMode::ManagedCheckpoint {
             let generation = Arc::clone(&inner.state.read().generation);
@@ -1469,209 +1124,9 @@ impl ManifestPoller {
                 .id;
             generations.insert(checkpoint_id, Arc::downgrade(&generation));
         }
-        let poller = Self {
-            inner,
-            generations,
-            tail_rx: Some(tail_rx),
-            tail_tx,
-            tail_in_flight: false,
-            continuation_queued: false,
-            tail_task: None,
-            tail_scope: None,
-            manifest_refresh_in_flight: false,
-            manifest_refresh_task: None,
-            manifest_refresh_scope: None,
-        };
+        let poller = Self { inner, generations };
         poller.report_active_checkpoints();
         poller
-    }
-
-    fn runtime_tailing_enabled(&self) -> bool {
-        !self.inner.options.skip_wal_replay
-            && !matches!(self.inner.mode, DbReaderMode::Checkpoint(_))
-    }
-
-    fn start_runtime_tail(&mut self) {
-        if self.tail_in_flight || self.manifest_refresh_in_flight || !self.runtime_tailing_enabled()
-        {
-            return;
-        }
-        self.tail_in_flight = true;
-        self.continuation_queued = false;
-        let inner = Arc::clone(&self.inner);
-        let base = Arc::clone(&inner.state.read());
-        let sender = self.tail_tx.clone();
-        let scope = inner.replay_tasks.child();
-        let replay_scope = scope.clone();
-        self.tail_task = Some(scope.spawn(async move {
-            let replay = tokio::select! {
-                biased;
-                _ = replay_scope.cancelled() => return,
-                replay = AssertUnwindSafe(DbReaderInner::replay_runtime_turn(
-                    inner,
-                    base,
-                    replay_scope.clone(),
-                )).catch_unwind() => replay,
-            };
-            let result = match replay {
-                Ok(result) => result,
-                Err(panic) => {
-                    let task_name = "reader_runtime_wal_replay".to_string();
-                    error!(
-                        "runtime WAL replay task panicked [task_name={}, panic={}]",
-                        task_name,
-                        panic_string(&panic),
-                    );
-                    Err(SlateDBError::BackgroundTaskPanic(task_name))
-                }
-            };
-            let _ = sender.send(DbReaderMessage::WalTailComplete(result)).await;
-        }));
-        self.tail_scope = Some(scope);
-    }
-
-    fn start_manifest_refresh(&mut self) {
-        if self.manifest_refresh_in_flight {
-            return;
-        }
-        self.manifest_refresh_in_flight = true;
-        let inner = Arc::clone(&self.inner);
-        let base = Arc::clone(&inner.state.read());
-        let sender = self.tail_tx.clone();
-        let scope = inner.replay_tasks.child();
-        let replay_scope = scope.clone();
-        self.manifest_refresh_task = Some(scope.spawn(async move {
-            let result = tokio::select! {
-                biased;
-                _ = replay_scope.cancelled() => return,
-                result = AssertUnwindSafe(inner.build_latest_manifest_candidate(
-                    base,
-                    replay_scope.clone(),
-                )).catch_unwind() => match result {
-                    Ok(result) => result,
-                    Err(panic) => {
-                        let task_name = "reader_manifest_wal_replay".to_string();
-                        error!(
-                            "manifest WAL replay task panicked [task_name={}, panic={}]",
-                            task_name,
-                            panic_string(&panic),
-                        );
-                        Err(SlateDBError::BackgroundTaskPanic(task_name))
-                    }
-                },
-            };
-            let _ = sender
-                .send(DbReaderMessage::ManifestRefreshComplete(result))
-                .await;
-        }));
-        self.manifest_refresh_scope = Some(scope);
-    }
-
-    fn schedule_tail_continuation(&mut self) {
-        if self.continuation_queued || !self.runtime_tailing_enabled() {
-            return;
-        }
-        self.continuation_queued = true;
-        let _ = self.tail_tx.try_send(DbReaderMessage::ContinueWalTail);
-    }
-
-    async fn finish_tail_task(&mut self) {
-        if let Some(task) = self.tail_task.take() {
-            let _ = task.await;
-        }
-        if let Some(scope) = self.tail_scope.take() {
-            scope.shutdown().await;
-        }
-    }
-
-    async fn cancel_tail_task(&mut self) {
-        if let Some(scope) = self.tail_scope.as_ref() {
-            scope.cancel();
-        }
-        if let Some(task) = self.tail_task.as_ref() {
-            task.abort();
-        }
-        self.finish_tail_task().await;
-        self.tail_in_flight = false;
-    }
-
-    async fn finish_manifest_refresh_task(&mut self) {
-        if let Some(task) = self.manifest_refresh_task.take() {
-            let _ = task.await;
-        }
-        if let Some(scope) = self.manifest_refresh_scope.take() {
-            scope.shutdown().await;
-        }
-    }
-
-    async fn cancel_manifest_refresh_task(&mut self) {
-        if let Some(scope) = self.manifest_refresh_scope.as_ref() {
-            scope.cancel();
-        }
-        if let Some(task) = self.manifest_refresh_task.as_ref() {
-            task.abort();
-        }
-        self.finish_manifest_refresh_task().await;
-        self.manifest_refresh_in_flight = false;
-    }
-
-    async fn apply_manifest_refresh(&mut self, candidate: Option<ManifestRefreshCandidate>) {
-        self.manifest_refresh_in_flight = false;
-        self.finish_manifest_refresh_task().await;
-        let Some(candidate) = candidate else {
-            self.inner.db_stats.reader_manifest_polls.increment(1);
-            self.schedule_tail_continuation();
-            return;
-        };
-        let current = Arc::clone(&self.inner.state.read());
-        if current.generation.manifest_id != candidate.base_manifest_id
-            || current.last_wal_id != candidate.base_last_wal_id
-        {
-            self.start_manifest_refresh();
-            return;
-        }
-
-        let manifest_id = candidate.state.generation.manifest_id;
-        self.inner.install_state(candidate.state);
-        self.inner.db_stats.reader_manifest_polls.increment(1);
-        info!("refreshed reader to latest manifest [manifest_id={manifest_id}]");
-        self.schedule_tail_continuation();
-    }
-
-    async fn apply_runtime_tail(&mut self, turn: RuntimeReplayTurn) {
-        self.tail_in_flight = false;
-        self.finish_tail_task().await;
-        let current = Arc::clone(&self.inner.state.read());
-        if current.generation.manifest_id != turn.manifest_id
-            || current.last_wal_id != turn.base_last_wal_id
-        {
-            self.schedule_tail_continuation();
-            return;
-        }
-
-        let generation = Arc::clone(&current.generation);
-        self.inner
-            .oracle
-            .advance_durable_seq(turn.last_committed_seq);
-        self.inner
-            .db_stats
-            .reader_replay_memtables
-            .set(turn.imm_memtable.len() as i64);
-        let new_state = Arc::new(ReaderState {
-            generation,
-            imm_memtable: turn.imm_memtable,
-            last_wal_id: turn.last_wal_id,
-            last_remote_persisted_seq: turn.last_committed_seq,
-        });
-        let touched_segments = collect_touched_segments(new_state.as_ref());
-        *self.inner.state.write() = new_state;
-        self.inner
-            .status_manager
-            .report_memtable_segments(touched_segments);
-
-        if turn.reached_turn_limit || !turn.caught_up {
-            self.schedule_tail_continuation();
-        }
     }
 
     fn report_active_checkpoints(&self) {
@@ -1789,34 +1244,8 @@ impl ManifestPoller {
     }
 }
 
-struct TailReplayNotifier {
-    receiver: async_channel::Receiver<DbReaderMessage>,
-}
-
-#[async_trait]
-impl Notifier<DbReaderMessage> for TailReplayNotifier {
-    async fn notify(&mut self) -> DbReaderMessage {
-        match self.receiver.recv().await {
-            Ok(message) => message,
-            Err(_) => std::future::pending().await,
-        }
-    }
-}
-
 impl Drop for ManifestPoller {
     fn drop(&mut self) {
-        if let Some(scope) = self.tail_scope.take() {
-            scope.cancel();
-        }
-        if let Some(task) = self.tail_task.take() {
-            task.abort();
-        }
-        if let Some(scope) = self.manifest_refresh_scope.take() {
-            scope.cancel();
-        }
-        if let Some(task) = self.manifest_refresh_task.take() {
-            task.abort();
-        }
         // The gauge tracks only GC checkpoints actively managed by this
         // poller. Reset it even if startup, cleanup, or the poller task fails.
         self.inner.db_stats.reader_active_checkpoints.set(0);
@@ -1826,61 +1255,14 @@ impl Drop for ManifestPoller {
 #[async_trait]
 impl MessageHandler<DbReaderMessage> for ManifestPoller {
     fn tickers(&mut self) -> Vec<MessageTickerDef<DbReaderMessage>> {
-        let mut tickers = vec![MessageTickerDef::new(
+        vec![MessageTickerDef::new(
             self.inner.options.manifest_poll_interval,
             Box::new(|| DbReaderMessage::PollManifest),
-        )];
-        if self.runtime_tailing_enabled() {
-            tickers.push(MessageTickerDef::new(
-                self.inner.options.wal_poll_interval,
-                Box::new(|| DbReaderMessage::PollWalTail),
-            ));
-        }
-        tickers
-    }
-
-    fn notifiers(&mut self) -> Vec<Box<dyn Notifier<DbReaderMessage>>> {
-        self.tail_rx.take().map_or_else(Vec::new, |receiver| {
-            vec![Box::new(TailReplayNotifier { receiver }) as Box<dyn Notifier<DbReaderMessage>>]
-        })
+        )]
     }
 
     async fn handle(&mut self, message: DbReaderMessage) -> Result<(), SlateDBError> {
-        let replay_tasks = self.inner.replay_tasks.clone();
-        tokio::select! {
-            biased;
-            _ = replay_tasks.cancelled() => {
-                self.cancel_tail_task().await;
-                self.cancel_manifest_refresh_task().await;
-                Ok(())
-            }
-            result = async {
-        match message {
-            DbReaderMessage::PollWalTail | DbReaderMessage::ContinueWalTail => {
-                self.continuation_queued = false;
-                self.start_runtime_tail();
-                return Ok(());
-            }
-            DbReaderMessage::WalTailComplete(result) => {
-                let turn = result?;
-                self.apply_runtime_tail(turn).await;
-                return Ok(());
-            }
-            DbReaderMessage::ManifestRefreshComplete(result) => {
-                match result {
-                    Ok(candidate) => self.apply_manifest_refresh(candidate).await,
-                    Err(error) => {
-                        self.manifest_refresh_in_flight = false;
-                        self.finish_manifest_refresh_task().await;
-                        warn!(
-                            "failed to refresh reader to latest manifest [error={error:?}]"
-                        );
-                    }
-                }
-                return Ok(());
-            }
-            DbReaderMessage::PollManifest => {}
-        }
+        assert!(matches!(message, DbReaderMessage::PollManifest));
         match self.inner.mode {
             DbReaderMode::ManagedCheckpoint => {
                 let mut manifest = StoredManifest::load(
@@ -1898,7 +1280,8 @@ impl MessageHandler<DbReaderMessage> for ManifestPoller {
                     let checkpoint = self.inner.create_checkpoint(&mut manifest).await?;
                     self.inner.reestablish_checkpoint(checkpoint).await?;
                     self.register_current_generation();
-                    self.schedule_tail_continuation();
+                } else {
+                    self.inner.maybe_replay_new_wals().await?;
                 }
 
                 self.refresh_live_checkpoints(&mut manifest).await?;
@@ -1906,14 +1289,16 @@ impl MessageHandler<DbReaderMessage> for ManifestPoller {
                 Ok(())
             }
             DbReaderMode::FollowLatest => {
-                self.cancel_tail_task().await;
-                self.start_manifest_refresh();
+                let result = self.inner.refresh_latest_manifest().await;
+                if let Err(error) = result {
+                    warn!("failed to refresh reader to latest manifest [error={error:?}]");
+                } else {
+                    self.inner.db_stats.reader_manifest_polls.increment(1);
+                }
                 Ok(())
             }
             // No polling is needed for a pinned checkpoint, so we just return Ok(()).
             DbReaderMode::Checkpoint(_) => Ok(()),
-        }
-            } => result,
         }
     }
 
@@ -1922,9 +1307,16 @@ impl MessageHandler<DbReaderMessage> for ManifestPoller {
         _messages: BoxStream<'async_trait, DbReaderMessage>,
         _result: Result<(), SlateDBError>,
     ) -> Result<(), SlateDBError> {
-        self.cancel_tail_task().await;
-        self.cancel_manifest_refresh_task().await;
-        if self.inner.mode == DbReaderMode::ManagedCheckpoint {
+        if self.inner.mode != DbReaderMode::ManagedCheckpoint {
+            return Ok(());
+        }
+        let mut manifest = StoredManifest::load(
+            Arc::clone(&self.inner.manifest_store),
+            self.inner.system_clock.clone(),
+        )
+        .await?;
+        let checkpoint_ids = self.generations.keys().copied().collect::<Vec<_>>();
+        if !checkpoint_ids.is_empty() {
             let live_generations = self
                 .generations
                 .values()
@@ -1939,10 +1331,11 @@ impl MessageHandler<DbReaderMessage> for ManifestPoller {
             for generation in live_generations {
                 generation.drain().await;
             }
-            // Managed checkpoints have a finite lease and can safely expire.
-            // Remote cleanup is intentionally not part of reader close: an
-            // unavailable object store must not prevent retirement proof.
-            self.generations.clear();
+            info!(
+                "deleting reader established checkpoints for shutdown [checkpoint_ids={:?}]",
+                checkpoint_ids
+            );
+            manifest.delete_checkpoints(&checkpoint_ids).await?;
         }
         self.inner.db_stats.reader_active_checkpoints.set(0);
         Ok(())
@@ -1951,12 +1344,6 @@ impl MessageHandler<DbReaderMessage> for ManifestPoller {
 
 impl DbReader {
     fn validate_options(mode: DbReaderMode, options: &DbReaderOptions) -> Result<(), SlateDBError> {
-        options.wal_replay.validate()?;
-        if options.wal_poll_interval.is_zero() {
-            return Err(SlateDBError::InvalidWalPollInterval(
-                options.wal_poll_interval,
-            ));
-        }
         if mode != DbReaderMode::ManagedCheckpoint {
             return Ok(());
         }
@@ -1982,7 +1369,7 @@ impl DbReader {
     pub(crate) async fn preload_cache(
         &self,
         cached_obj_store: &CachedObjectStore,
-        path: object_store::path::Path,
+        path: Path,
     ) -> Result<(), SlateDBError> {
         let state = Arc::clone(&self.inner.state.read());
         let external_ssts = state.generation.manifest.external_ssts();
@@ -2069,9 +1456,13 @@ impl DbReader {
     /// # Examples
     ///
     /// ```
-    /// use slatedb::{Db, DbReader, Error};
-    /// use slatedb::object_store::{ObjectStore, memory::InMemory};
-    /// use std::sync::Arc;
+    /// use {
+    ///     slatedb::{
+    ///         object_store::{memory::InMemory, ObjectStore},
+    ///         Db, DbReader, Error,
+    ///     },
+    ///     std::sync::Arc,
+    /// };
     ///
     /// #[tokio::main]
     /// async fn main() -> Result<(), Error> {
@@ -2080,9 +1471,7 @@ impl DbReader {
     ///     let db = Db::open("test_db", Arc::clone(&object_store)).await?;
     ///     db.close().await?;
     ///     // Then open a reader
-    ///     let reader = DbReader::builder("test_db", object_store)
-    ///         .build()
-    ///         .await?;
+    ///     let reader = DbReader::builder("test_db", object_store).build().await?;
     ///     Ok(())
     /// }
     /// ```
@@ -2096,7 +1485,9 @@ impl DbReader {
     pub(crate) async fn open_internal(
         manifest_store: Arc<ManifestStore>,
         table_store: Arc<TableStore>,
+        wal_store: Arc<WalTableStore>,
         mode: DbReaderMode,
+        wal_reader: Option<Arc<dyn WalReaderTrait>>,
         merge_operator: Option<MergeOperatorType>,
         segment_extractor: Option<Arc<dyn PrefixExtractor>>,
         options: DbReaderOptions,
@@ -2126,6 +1517,8 @@ impl DbReader {
             DbReaderInner::new(
                 manifest_store,
                 table_store,
+                wal_store,
+                wal_reader,
                 options,
                 mode,
                 merge_operator,
@@ -2200,9 +1593,14 @@ impl DbReader {
     /// ## Examples
     ///
     /// ```
-    /// use slatedb::{Db, DbReader, DbReaderMode, config::DbReaderOptions, Error};
-    /// use slatedb::object_store::{ObjectStore, memory::InMemory};
-    /// use std::sync::Arc;
+    /// use {
+    ///     slatedb::{
+    ///         config::DbReaderOptions,
+    ///         object_store::{memory::InMemory, ObjectStore},
+    ///         Db, DbReader, DbReaderMode, Error,
+    ///     },
+    ///     std::sync::Arc,
+    /// };
     ///
     /// #[tokio::main]
     /// async fn main() -> Result<(), Error> {
@@ -2212,11 +1610,12 @@ impl DbReader {
     ///     db.flush().await?;
     ///
     ///     let reader = DbReader::open(
-    ///       "test_db",
-    ///       Arc::clone(&object_store),
-    ///       DbReaderMode::ManagedCheckpoint,
-    ///       DbReaderOptions::default(),
-    ///     ).await?;
+    ///         "test_db",
+    ///         Arc::clone(&object_store),
+    ///         DbReaderMode::ManagedCheckpoint,
+    ///         DbReaderOptions::default(),
+    ///     )
+    ///     .await?;
     ///     assert_eq!(reader.get(b"key").await?, Some("value".into()));
     ///     Ok(())
     /// }
@@ -2248,9 +1647,14 @@ impl DbReader {
     /// ## Examples
     ///
     /// ```
-    /// use slatedb::{Db, DbReader, DbReaderMode, config::DbReaderOptions, config::ReadOptions, Error};
-    /// use slatedb::object_store::{ObjectStore, memory::InMemory};
-    /// use std::sync::Arc;
+    /// use {
+    ///     slatedb::{
+    ///         config::{DbReaderOptions, ReadOptions},
+    ///         object_store::{memory::InMemory, ObjectStore},
+    ///         Db, DbReader, DbReaderMode, Error,
+    ///     },
+    ///     std::sync::Arc,
+    /// };
     ///
     /// #[tokio::main]
     /// async fn main() -> Result<(), Error> {
@@ -2260,12 +1664,16 @@ impl DbReader {
     ///     db.flush().await?;
     ///
     ///     let reader = DbReader::open(
-    ///       "test_db",
-    ///       Arc::clone(&object_store),
-    ///       DbReaderMode::ManagedCheckpoint,
-    ///       DbReaderOptions::default(),
-    ///     ).await?;
-    ///     assert_eq!(db.get_with_options(b"key", &ReadOptions::default()).await?, Some("value".into()));
+    ///         "test_db",
+    ///         Arc::clone(&object_store),
+    ///         DbReaderMode::ManagedCheckpoint,
+    ///         DbReaderOptions::default(),
+    ///     )
+    ///     .await?;
+    ///     assert_eq!(
+    ///         db.get_with_options(b"key", &ReadOptions::default()).await?,
+    ///         Some("value".into())
+    ///     );
     ///     Ok(())
     /// }
     /// ```
@@ -2344,9 +1752,14 @@ impl DbReader {
     /// ## Examples
     ///
     /// ```
-    /// use slatedb::{Db, DbReader, DbReaderMode, config::DbReaderOptions, Error};
-    /// use slatedb::object_store::{ObjectStore, memory::InMemory};
-    /// use std::sync::Arc;
+    /// use {
+    ///     slatedb::{
+    ///         config::DbReaderOptions,
+    ///         object_store::{memory::InMemory, ObjectStore},
+    ///         Db, DbReader, DbReaderMode, Error,
+    ///     },
+    ///     std::sync::Arc,
+    /// };
     ///
     /// #[tokio::main]
     /// async fn main() -> Result<(), Error> {
@@ -2357,11 +1770,12 @@ impl DbReader {
     ///     db.flush().await?;
     ///
     ///     let reader = DbReader::open(
-    ///       "test_db",
-    ///       Arc::clone(&object_store),
-    ///       DbReaderMode::ManagedCheckpoint,
-    ///       DbReaderOptions::default(),
-    ///     ).await?;
+    ///         "test_db",
+    ///         Arc::clone(&object_store),
+    ///         DbReaderMode::ManagedCheckpoint,
+    ///         DbReaderOptions::default(),
+    ///     )
+    ///     .await?;
     ///     let mut iter = reader.scan("a".."b").await?;
     ///     let kv = iter.next().await?.unwrap();
     ///     assert_eq!(kv.key.as_ref(), b"a");
@@ -2449,8 +1863,8 @@ impl DbReader {
     ///
     /// ## Arguments
     /// - `prefix`: the key prefix to scan
-    /// - `subrange`: the range of key suffixes (relative to `prefix`) to
-    ///   scan; `..` scans all keys with the prefix
+    /// - `subrange`: the range of key suffixes (relative to `prefix`) to scan; `..` scans all keys
+    ///   with the prefix
     ///
     /// ## Returns
     /// - `Result<DbIterator, Error>`: An iterator with the results of the scan
@@ -2473,8 +1887,8 @@ impl DbReader {
     ///
     /// ## Arguments
     /// - `prefix`: the key prefix to scan
-    /// - `subrange`: the range of key suffixes (relative to `prefix`) to
-    ///   scan; `..` scans all keys with the prefix
+    /// - `subrange`: the range of key suffixes (relative to `prefix`) to scan; `..` scans all keys
+    ///   with the prefix
     /// - `options`: the scan options to use
     ///
     /// ## Returns
@@ -2505,9 +1919,14 @@ impl DbReader {
     /// ## Examples
     ///
     /// ```
-    /// use slatedb::{Db, DbReader, DbReaderMode, config::DbReaderOptions, Error};
-    /// use slatedb::object_store::{ObjectStore, memory::InMemory};
-    /// use std::sync::Arc;
+    /// use {
+    ///     slatedb::{
+    ///         config::DbReaderOptions,
+    ///         object_store::{memory::InMemory, ObjectStore},
+    ///         Db, DbReader, DbReaderMode, Error,
+    ///     },
+    ///     std::sync::Arc,
+    /// };
     ///
     /// #[tokio::main]
     /// async fn main() -> Result<(), Error> {
@@ -2519,22 +1938,22 @@ impl DbReader {
     ///         object_store.clone(),
     ///         DbReaderMode::ManagedCheckpoint,
     ///         options,
-    ///     ).await?;
+    ///     )
+    ///     .await?;
     ///     reader.close().await?;
     ///     Ok(())
     /// }
     /// ```
-    ///
     pub async fn close(&self) -> Result<(), crate::Error> {
         // Fixed-checkpoint readers do not have a manifest poller to publish
         // their clean shutdown, so close the shared status explicitly for
         // both reader modes before shutting down any managed task.
         self.inner.status_manager.write_result(Ok(()));
 
-        self.inner.replay_tasks.cancel();
-        let shutdown_result = self.task_executor.shutdown_task(DB_READER_TASK_NAME).await;
-        self.inner.replay_tasks.shutdown().await;
-        shutdown_result.map_err(Into::<crate::Error>::into)?;
+        self.task_executor
+            .shutdown_task(DB_READER_TASK_NAME)
+            .await
+            .map_err(Into::<crate::Error>::into)?;
 
         if let Err(e) = self.inner.table_store.close_cache().await {
             warn!("failed to close block cache [error={:?}]", e);
@@ -2650,52 +2069,97 @@ impl DbCacheManagerOps for DbReader {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        DbReaderMessage, ManifestPoller, ReaderGeneration, ReaderState, ReplayMemtables,
-        RuntimeMissingPolicy, MAX_RUNTIME_REPLAY_TURN_TIME,
+    use crate::wal::slatedb::reader::SlateDbWalReaderOptions;
+    use {
+        super::{
+            DbReaderMessage, ManifestPoller, ReaderGeneration, ReaderState, ReplayMemtables,
+            WalReplayEnd,
+        },
+        crate::{
+            block_cache_policy::BlockCachePolicy,
+            clock::MonotonicClock,
+            config::{
+                CheckpointOptions, CheckpointScope, CloseOptions, FlushOptions, FlushType,
+                MergeOptions, PutOptions, Settings, WriteOptions,
+            },
+            db_cache::{test_utils::TestCache, DbCache},
+            db_reader::{DbReader, DbReaderInner, DbReaderMode, DbReaderOptions},
+            db_state::SstType,
+            db_stats::DbStats,
+            db_status::DbStatusManager,
+            dispatcher::MessageHandler,
+            error::SlateDBError,
+            format::sst::SsTableFormat,
+            iter::IterationOrder,
+            manifest::{
+                store::{ManifestStore, StoredManifest},
+                Manifest, ManifestCore, VersionedManifest,
+            },
+            mem_table::{ImmutableMemtable, WritableKVTable},
+            merge_operator::MergeOperatorType,
+            object_stores::ObjectStores,
+            oracle::DbReaderOracle,
+            paths::PathResolver,
+            proptest_util::{rng::new_test_rng, sample},
+            reader::Reader,
+            tablestore::{TableStore, TableStoreKind},
+            test_utils,
+            types::RowEntry,
+            wal::{
+                slatedb::store::WalTableStore, WalError, WalFileRange, WalIterator,
+                WalReader as WalReaderTrait, WalRows,
+            },
+            CloseReason, Db,
+        },
+        bytes::Bytes,
+        fail_parallel::FailPointRegistry,
+        object_store::{memory::InMemory, path::Path, ObjectStore, ObjectStoreExt},
+        rstest::rstest,
+        slatedb_common::{
+            clock::{DefaultSystemClock, SystemClock},
+            DbRand, MockSystemClock,
+        },
+        std::{
+            collections::{BTreeMap, BTreeSet, VecDeque},
+            sync::{
+                atomic::{AtomicUsize, Ordering},
+                Arc,
+            },
+            time::Duration,
+        },
+        uuid::Uuid,
     };
-    use crate::block_cache_policy::BlockCachePolicy;
-    use crate::clock::MonotonicClock;
-    use crate::config::{
-        CheckpointOptions, CheckpointScope, FlushOptions, FlushType, MergeOptions, PutOptions,
-        Settings, WriteOptions,
-    };
-    use crate::db_cache::test_utils::TestCache;
-    use crate::db_cache::DbCache;
-    use crate::db_reader::{DbReader, DbReaderInner, DbReaderMode, DbReaderOptions};
-    use crate::db_state::SsTableId;
-    use crate::db_stats::DbStats;
-    use crate::db_status::DbStatusManager;
-    use crate::dispatcher::MessageHandler;
-    use crate::format::sst::SsTableFormat;
-    use crate::iter::{IterationOrder, RowEntryIterator};
-    use crate::manifest::store::{ManifestStore, StoredManifest};
-    use crate::manifest::{Manifest, ManifestCore, VersionedManifest};
-    use crate::mem_table::{ImmutableMemtable, WritableKVTable};
-    use crate::merge_operator::MergeOperatorType;
-    use crate::object_stores::ObjectStores;
-    use crate::oracle::DbReaderOracle;
-    use crate::paths::PathResolver;
-    use crate::proptest_util::rng::new_test_rng;
-    use crate::proptest_util::sample;
-    use crate::reader::Reader;
-    use crate::replay_task_scope::ReplayTaskScope;
-    use crate::tablestore::{TableStore, TableStoreKind};
-    use crate::types::RowEntry;
-    use crate::{error::SlateDBError, test_utils, CloseReason, Db};
-    use bytes::Bytes;
-    use fail_parallel::FailPointRegistry;
-    use object_store::memory::InMemory;
-    use object_store::path::Path;
-    use object_store::{ObjectStore, ObjectStoreExt};
-    use rstest::rstest;
-    use slatedb_common::clock::{DefaultSystemClock, SystemClock};
-    use slatedb_common::DbRand;
-    use slatedb_common::MockSystemClock;
-    use std::collections::{BTreeMap, VecDeque};
-    use std::sync::Arc;
-    use std::time::Duration;
-    use uuid::Uuid;
+
+    struct EmptyTestWalIterator;
+
+    #[async_trait::async_trait]
+    impl WalIterator for EmptyTestWalIterator {
+        async fn next(&mut self) -> Result<Option<WalRows>, WalError> {
+            Ok(None)
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingWalReader {
+        iterator_calls: AtomicUsize,
+        last_wal_file_id_calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl WalReaderTrait for CountingWalReader {
+        async fn iterator(
+            &self,
+            _wal_file_id_range: WalFileRange,
+        ) -> Result<Box<dyn WalIterator>, WalError> {
+            self.iterator_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(Box::new(EmptyTestWalIterator))
+        }
+
+        async fn last_wal_file_id(&self, _replay_after_wal_id: u64) -> Result<u64, WalError> {
+            self.last_wal_file_id_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(10)
+        }
+    }
 
     #[test]
     fn legacy_checkpoint_options_convert_to_reader_modes() {
@@ -2730,24 +2194,6 @@ mod tests {
         .expect("reader did not install a new manifest generation");
     }
 
-    async fn finish_manual_manifest_refresh(poller: &mut ManifestPoller) {
-        let receiver = poller
-            .tail_rx
-            .as_ref()
-            .expect("manual poller must retain its completion receiver")
-            .clone();
-        loop {
-            let message = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
-                .await
-                .expect("manifest refresh did not complete")
-                .expect("manifest completion channel closed");
-            poller.handle(message).await.unwrap();
-            if !poller.manifest_refresh_in_flight {
-                break;
-            }
-        }
-    }
-
     #[tokio::test]
     async fn should_get_value_from_db() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -2758,7 +2204,12 @@ mod tests {
         let key = b"test_key";
         let value = b"test_value";
 
-        db.put(key, value).await.unwrap();
+        db.put(key, value)
+            .await
+            .unwrap()
+            .await_durable()
+            .await
+            .unwrap();
         db.flush().await.unwrap();
 
         let reader = DbReader::open(
@@ -2774,6 +2225,32 @@ mod tests {
             reader.get(key).await.unwrap(),
             Some(Bytes::from_static(value))
         );
+    }
+
+    #[tokio::test]
+    async fn db_reader_builder_should_use_custom_wal_reader() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_custom_wal_reader");
+        let db = Db::open(path.clone(), Arc::clone(&object_store))
+            .await
+            .unwrap();
+        db.close().await.unwrap();
+
+        let wal_reader = Arc::new(CountingWalReader::default());
+        let reader = DbReader::builder(path, object_store)
+            .with_reader_mode(DbReaderMode::FollowLatest)
+            .with_wal_reader(wal_reader.clone())
+            .with_options(DbReaderOptions {
+                manifest_poll_interval: Duration::from_secs(60 * 60),
+                ..DbReaderOptions::default()
+            })
+            .build()
+            .await
+            .unwrap();
+
+        assert!(wal_reader.last_wal_file_id_calls.load(Ordering::Relaxed) > 0);
+        assert!(wal_reader.iterator_calls.load(Ordering::Relaxed) > 0);
+        reader.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -2842,7 +2319,9 @@ mod tests {
         let reader = DbReader::open_internal(
             test_provider.manifest_store(),
             test_provider.table_store(),
+            test_provider.wal_store(),
             DbReaderMode::Checkpoint(checkpoint_result.id),
+            None,
             None,
             None,
             DbReaderOptions::default(),
@@ -3050,7 +2529,7 @@ mod tests {
 
         let parent_manifest = Manifest::initial(ManifestCore::new());
         let parent_path = "/tmp/parent_store".to_string();
-        let source_checkpoint_id = uuid::Uuid::new_v4();
+        let source_checkpoint_id = Uuid::new_v4();
 
         let _ = StoredManifest::store_uninitialized_clone(
             Arc::clone(&manifest_store),
@@ -3171,10 +2650,8 @@ mod tests {
             .contains("snapshots are unsupported in FollowLatest mode"));
         assert!(recording_store.write_kinds().is_empty());
 
-        let (tail_tx, tail_rx) = async_channel::unbounded();
-        let mut poller = ManifestPoller::new(Arc::clone(&reader.inner), tail_tx, tail_rx);
+        let mut poller = ManifestPoller::new(Arc::clone(&reader.inner));
         poller.handle(DbReaderMessage::PollManifest).await.unwrap();
-        finish_manual_manifest_refresh(&mut poller).await;
 
         assert!(reader.manifest().id() >= latest_manifest.id);
         assert_eq!(
@@ -3213,7 +2690,9 @@ mod tests {
         let reader = DbReader::open_internal(
             test_provider.manifest_store(),
             test_provider.table_store(),
+            test_provider.wal_store(),
             DbReaderMode::FollowLatest,
+            None,
             None,
             None,
             DbReaderOptions {
@@ -3243,10 +2722,8 @@ mod tests {
             saved_manifests.push((location, bytes));
         }
 
-        let (tail_tx, tail_rx) = async_channel::unbounded();
-        let mut poller = ManifestPoller::new(Arc::clone(&reader.inner), tail_tx, tail_rx);
+        let mut poller = ManifestPoller::new(Arc::clone(&reader.inner));
         poller.handle(DbReaderMessage::PollManifest).await.unwrap();
-        finish_manual_manifest_refresh(&mut poller).await;
 
         assert_eq!(reader.manifest().id(), manifest_id);
         assert_eq!(
@@ -3267,102 +2744,12 @@ mod tests {
         db.close().await.unwrap();
 
         poller.handle(DbReaderMessage::PollManifest).await.unwrap();
-        finish_manual_manifest_refresh(&mut poller).await;
         assert!(reader.manifest().id() > manifest_id);
         assert_eq!(
             reader.get(b"key").await.unwrap(),
             Some(Bytes::from_static(b"updated"))
         );
         reader.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn close_cancels_a_blocked_manifest_get() {
-        let inner = Arc::new(InMemory::new());
-        let writer_store: Arc<dyn ObjectStore> = inner.clone();
-        let gated = Arc::new(test_utils::GatedObjectStore::new(inner));
-        let object_store: Arc<dyn ObjectStore> = gated.clone();
-        let path = Path::from("/tmp/test_reader_close_blocked_manifest_list");
-        let provider = TestProvider::new(path.clone(), writer_store);
-        let db = provider.new_db(Settings::default()).await.unwrap();
-        db.put(b"key", b"value").await.unwrap();
-        db.flush().await.unwrap();
-
-        let reader = DbReader::open(
-            path,
-            object_store,
-            DbReaderMode::FollowLatest,
-            DbReaderOptions {
-                manifest_poll_interval: Duration::from_secs(60),
-                wal_poll_interval: Duration::from_secs(60),
-                checkpoint_lifetime: Duration::ZERO,
-                ..DbReaderOptions::default()
-            },
-        )
-        .await
-        .unwrap();
-
-        db.put(b"key", b"updated").await.unwrap();
-        db.flush().await.unwrap();
-        let (tx, rx) = async_channel::unbounded();
-        let mut poller = ManifestPoller::new(Arc::clone(&reader.inner), tx, rx);
-        gated.get_opts_gate.close();
-        poller.handle(DbReaderMessage::PollManifest).await.unwrap();
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            gated.get_opts_gate.wait_for_arrivals(1),
-        )
-        .await
-        .expect("manifest refresh did not reach the blocked GET");
-
-        tokio::time::timeout(Duration::from_secs(1), reader.close())
-            .await
-            .expect("reader close waited for a blocked manifest GET")
-            .unwrap();
-        poller.cancel_manifest_refresh_task().await;
-    }
-
-    #[tokio::test]
-    async fn close_cancels_a_blocked_checkpoint_manifest_list() {
-        let inner = Arc::new(InMemory::new());
-        let writer_store: Arc<dyn ObjectStore> = inner.clone();
-        let gated = Arc::new(test_utils::GatedObjectStore::new(inner));
-        let reader_store: Arc<dyn ObjectStore> = gated.clone();
-        let path = Path::from("/tmp/test_reader_close_blocked_checkpoint_list");
-        let provider = TestProvider::new(path.clone(), writer_store);
-        let db = provider.new_db(Settings::default()).await.unwrap();
-        db.put(b"key", b"value").await.unwrap();
-        db.flush().await.unwrap();
-
-        let reader = DbReader::open(
-            path,
-            reader_store,
-            DbReaderMode::ManagedCheckpoint,
-            DbReaderOptions {
-                manifest_poll_interval: Duration::from_secs(60),
-                wal_poll_interval: Duration::from_secs(60),
-                ..DbReaderOptions::default()
-            },
-        )
-        .await
-        .unwrap();
-        let (tx, rx) = async_channel::unbounded();
-        let mut poller = ManifestPoller::new(Arc::clone(&reader.inner), tx, rx);
-        gated.list_gate.close();
-        let poll = tokio::spawn(async move { poller.handle(DbReaderMessage::PollManifest).await });
-        tokio::time::timeout(Duration::from_secs(1), gated.list_gate.wait_for_arrivals(1))
-            .await
-            .expect("checkpoint refresh did not reach the blocked LIST");
-
-        tokio::time::timeout(Duration::from_secs(1), reader.close())
-            .await
-            .expect("reader close waited for a blocked manifest LIST")
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(1), poll)
-            .await
-            .expect("cancelled checkpoint poll remained blocked")
-            .unwrap()
-            .unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -3378,7 +2765,6 @@ mod tests {
         let db = test_provider.new_db(db_options).await.unwrap();
         let reader_options = DbReaderOptions {
             manifest_poll_interval: Duration::from_millis(10),
-            wal_poll_interval: Duration::from_millis(10),
             ..DbReaderOptions::default()
         };
         let reader = test_provider
@@ -3421,7 +2807,6 @@ mod tests {
         let _db = test_provider.new_db(Settings::default()).await;
         let reader_options = DbReaderOptions {
             manifest_poll_interval: Duration::from_millis(500),
-            wal_poll_interval: Duration::from_millis(10),
             checkpoint_lifetime: Duration::from_millis(1000),
             ..DbReaderOptions::default()
         };
@@ -3459,12 +2844,10 @@ mod tests {
                 > initial_reader_checkpoint.expire_time.unwrap()
         );
 
-        // Shutdown is a bounded local operation. It must not wait for a remote
-        // manifest write merely to delete the checkpoint; its finite lease is
-        // reclaimed by normal checkpoint GC after expiry.
+        // The checkpoint is removed on shutdown
         reader.close().await.unwrap();
         let updated_manifest = manifest_store.read_latest_manifest().await.unwrap();
-        assert_eq!(1, updated_manifest.manifest.core.checkpoints.len());
+        assert_eq!(0, updated_manifest.manifest.core.checkpoints.len());
     }
 
     // Regression test for https://github.com/slatedb/slatedb/issues/1750.
@@ -3503,6 +2886,8 @@ mod tests {
         let inner = DbReaderInner::new(
             Arc::clone(&manifest_store),
             table_store,
+            test_provider.wal_store(),
+            None,
             DbReaderOptions {
                 manifest_poll_interval: Duration::from_millis(100),
                 checkpoint_lifetime: Duration::from_millis(1000),
@@ -3598,6 +2983,8 @@ mod tests {
         let inner = DbReaderInner::new(
             Arc::clone(&manifest_store),
             table_store,
+            test_provider.wal_store(),
+            None,
             DbReaderOptions {
                 manifest_poll_interval: Duration::from_millis(100),
                 checkpoint_lifetime: Duration::from_millis(1000),
@@ -3652,7 +3039,6 @@ mod tests {
 
         let reader_options = DbReaderOptions {
             manifest_poll_interval: Duration::from_millis(500),
-            wal_poll_interval: Duration::from_millis(10),
             checkpoint_lifetime: Duration::from_millis(1000),
             ..DbReaderOptions::default()
         };
@@ -3663,13 +3049,37 @@ mod tests {
             .unwrap();
         let key = b"test_key";
         let value = b"test_value";
-        db.put(key, value).await.unwrap();
+        db.put(key, value)
+            .await
+            .unwrap()
+            .await_durable()
+            .await
+            .unwrap();
         db.flush().await.unwrap();
 
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(
             reader.get(key).await.unwrap(),
             Some(Bytes::from_static(value))
+        );
+    }
+
+    #[tokio::test]
+    async fn default_durable_write_is_visible_to_reader_opened_immediately() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/default_durable_write_is_visible_to_reader");
+        let test_provider = TestProvider::new(path, Arc::clone(&object_store));
+        let db = test_provider.new_db(Settings::default()).await.unwrap();
+
+        db.put(b"key", b"value").await.unwrap();
+
+        let reader = test_provider
+            .new_db_reader(DbReaderOptions::default(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            reader.get(b"key").await.unwrap(),
+            Some(Bytes::from_static(b"value"))
         );
     }
 
@@ -3690,7 +3100,7 @@ mod tests {
 
         let write_options = WriteOptions {
             await_durable: false,
-            ..WriteOptions::default()
+            ..Default::default()
         };
         db.put_with_options(b"key", b"v1", &PutOptions::default(), &write_options)
             .await
@@ -3777,7 +3187,7 @@ mod tests {
             .unwrap();
         let write_options = WriteOptions {
             await_durable: false,
-            ..WriteOptions::default()
+            ..Default::default()
         };
         db.put_with_options(b"key", b"v1", &PutOptions::default(), &write_options)
             .await
@@ -3889,7 +3299,7 @@ mod tests {
             .unwrap();
         let write_options = WriteOptions {
             await_durable: false,
-            ..WriteOptions::default()
+            ..Default::default()
         };
         db.put_with_options(b"key", b"v1", &PutOptions::default(), &write_options)
             .await
@@ -4049,7 +3459,7 @@ mod tests {
             .unwrap();
         let write_options = WriteOptions {
             await_durable: false,
-            ..WriteOptions::default()
+            ..Default::default()
         };
         db.put_with_options(b"key", b"v1", &PutOptions::default(), &write_options)
             .await
@@ -4153,7 +3563,7 @@ mod tests {
             .unwrap();
         let write_options = WriteOptions {
             await_durable: false,
-            ..WriteOptions::default()
+            ..Default::default()
         };
         db.put_with_options(b"a", b"old", &PutOptions::default(), &write_options)
             .await
@@ -4255,16 +3665,17 @@ mod tests {
         let path = Path::from("/tmp/test_db_reader_replay_order");
         let test_provider = TestProvider::new(path, Arc::clone(&object_store));
         let table_store = test_provider.table_store();
+        let wal_store = test_provider.wal_store();
 
         write_wal_sst(
-            Arc::clone(&table_store),
+            Arc::clone(&wal_store),
             3,
             vec![RowEntry::new_value(b"stale_key", b"stale_value", 3)],
         )
         .await
         .unwrap();
         write_wal_sst(
-            Arc::clone(&table_store),
+            Arc::clone(&wal_store),
             4,
             vec![RowEntry::new_value(b"fresh_key", b"fresh_value", 4)],
         )
@@ -4286,14 +3697,16 @@ mod tests {
 
         let mut core = ManifestCore::new();
         core.next_wal_sst_id = 5;
+        let status_manager = status_manager_for_core(&core);
 
-        let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into_exact(
+        let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
             Arc::clone(&table_store),
+            &native_wal_reader(&wal_store, &status_manager),
             &DbReaderOptions::default(),
             &core,
             &mut into_tables,
             None,
-            false,
+            WalReplayEnd::Manifest,
             None,
             None,
             None,
@@ -4343,11 +3756,12 @@ mod tests {
         let path = Path::from("/tmp/test_db_reader_incremental_replay_publication");
         let test_provider = TestProvider::new(path, Arc::clone(&object_store));
         let table_store = test_provider.table_store();
+        let wal_store = test_provider.wal_store();
         let rows = (1..=3)
             .map(|seq| RowEntry::new_value(format!("key-{seq}").as_bytes(), &[b'x'; 128], seq))
             .collect::<Vec<_>>();
         for (wal_id, row) in rows.iter().cloned().enumerate() {
-            write_wal_sst(Arc::clone(&table_store), wal_id as u64 + 1, vec![row])
+            write_wal_sst(Arc::clone(&wal_store), wal_id as u64 + 1, vec![row])
                 .await
                 .unwrap();
         }
@@ -4359,19 +3773,21 @@ mod tests {
         };
         let mut core = ManifestCore::new();
         core.next_wal_sst_id = 4;
+        let status_manager = status_manager_for_core(&core);
         let mut into_tables = ReplayMemtables::default();
         let mut publications = Vec::new();
         let mut publish = |tables: &ReplayMemtables, wal_id, seq| {
             publications.push((wal_id, seq, tables.len()));
         };
 
-        let result = DbReaderInner::replay_wal_into_exact(
+        let result = DbReaderInner::replay_wal_into(
             Arc::clone(&table_store),
+            &native_wal_reader(&wal_store, &status_manager),
             &options,
             &core,
             &mut into_tables,
             None,
-            false,
+            WalReplayEnd::Manifest,
             None,
             Some(&mut publish),
             None,
@@ -4384,311 +3800,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_known_missing_wal_is_error_and_exact_next_probe_reports_caught_up() {
-        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let path = Path::from("/tmp/test_db_reader_runtime_missing_contract");
-        let table_store = TestProvider::new(path, object_store).table_store();
-        let options = DbReaderOptions::default();
-        let mut core = ManifestCore::new();
-        core.next_wal_sst_id = 2;
-        let mut known_cursor = (0, 0);
-
-        let known_missing = DbReaderInner::replay_runtime_range_into(
-            Arc::clone(&table_store),
-            &options,
-            &core,
-            &mut ReplayMemtables::default(),
-            &mut known_cursor,
-            1..2,
-            RuntimeMissingPolicy::Error,
-            None,
-            None,
-            None,
-            None,
-        )
-        .await;
-        assert!(known_missing.unwrap_err().has_object_store_not_found());
-
-        let mut tail_cursor = (0, 0);
-        let caught_up = DbReaderInner::replay_runtime_range_into(
-            table_store,
-            &options,
-            &core,
-            &mut ReplayMemtables::default(),
-            &mut tail_cursor,
-            1..2,
-            RuntimeMissingPolicy::ExactNextIsCaughtUp(1),
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        assert!(caught_up);
-        assert_eq!(tail_cursor, (0, 0));
-    }
-
-    #[tokio::test]
-    async fn manifest_replay_yields_at_the_sixty_four_wal_boundary() {
-        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let path = Path::from("/tmp/test_db_reader_manifest_turn_limit");
-        let table_store = TestProvider::new(path, object_store).table_store();
-        for wal_id in 1..=65 {
-            write_wal_sst(
-                Arc::clone(&table_store),
-                wal_id,
-                vec![RowEntry::new_value(
-                    format!("key-{wal_id:03}").as_bytes(),
-                    b"value",
-                    wal_id,
-                )],
-            )
-            .await
-            .unwrap();
-        }
-        let mut core = ManifestCore::new();
-        core.next_wal_sst_id = 66;
-        let mut replayed = ReplayMemtables::default();
-        let clock: Arc<dyn SystemClock> = Arc::new(DefaultSystemClock::new());
-        let scope = ReplayTaskScope::new();
-
-        let cursor = DbReaderInner::replay_manifest_range_into(
-            table_store,
-            &DbReaderOptions::default(),
-            &core,
-            &mut replayed,
-            None,
-            None,
-            None,
-            Some(scope.clone()),
-            &clock,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(cursor, (65, 65));
-        assert_eq!(replayed.len(), 2);
-        scope.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn runtime_tail_yields_after_sixty_four_wals_and_continues_without_listing() {
-        let recording = Arc::new(test_utils::RecordingObjectStore::new(Arc::new(
-            InMemory::new(),
-        )));
-        let object_store: Arc<dyn ObjectStore> = recording.clone();
-        let path = Path::from("/tmp/test_db_reader_runtime_turn_limit");
-        let provider = TestProvider::new(path, object_store);
-        let db = provider
-            .new_db(Settings {
-                flush_interval: None,
-                compactor_options: None,
-                garbage_collector_options: None,
-                ..Settings::default()
-            })
-            .await
-            .unwrap();
-        let checkpoint = db
-            .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
-            .await
-            .unwrap();
-        db.close().await.unwrap();
-        let reader = provider
-            .new_db_reader(DbReaderOptions::default(), Some(checkpoint.id), None)
-            .await
-            .unwrap();
-        let table_store = provider.table_store();
-        let initial_wal_id = reader.inner.state.read().last_wal_id;
-        for wal_id in initial_wal_id + 1..=initial_wal_id + 65 {
-            write_wal_sst(
-                Arc::clone(&table_store),
-                wal_id,
-                vec![RowEntry::new_value(
-                    format!("key-{wal_id:03}").as_bytes(),
-                    b"value",
-                    wal_id,
-                )],
-            )
-            .await
-            .unwrap();
-        }
-        recording.clear();
-
-        let first_base = Arc::clone(&reader.inner.state.read());
-        let first = DbReaderInner::replay_runtime_turn(
-            Arc::clone(&reader.inner),
-            first_base,
-            reader.inner.replay_tasks.child(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(first.last_wal_id, initial_wal_id + 64);
-        assert!(first.reached_turn_limit);
-        assert!(!first.caught_up);
-
-        let second_base = Arc::new(ReaderState {
-            generation: Arc::clone(&reader.inner.state.read().generation),
-            imm_memtable: first.imm_memtable,
-            last_wal_id: first.last_wal_id,
-            last_remote_persisted_seq: first.last_committed_seq,
-        });
-        let second = DbReaderInner::replay_runtime_turn(
-            Arc::clone(&reader.inner),
-            second_base,
-            reader.inner.replay_tasks.child(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(second.last_wal_id, initial_wal_id + 65);
-        assert!(second.caught_up);
-        assert!(!second.reached_turn_limit);
-        assert_eq!(recording.list_calls(), 0);
-
-        reader.close().await.unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn runtime_tail_deadline_wins_without_publishing_a_partial_wal() {
-        let inner_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let gated = Arc::new(test_utils::GatedObjectStore::new(inner_store));
-        let object_store: Arc<dyn ObjectStore> = gated.clone();
-        let path = Path::from("/tmp/test_db_reader_runtime_deadline");
-        let provider = TestProvider::new(path, object_store);
-        let db = provider
-            .new_db(Settings {
-                flush_interval: None,
-                compactor_options: None,
-                garbage_collector_options: None,
-                ..Settings::default()
-            })
-            .await
-            .unwrap();
-        let reader = provider
-            .new_db_reader(
-                DbReaderOptions {
-                    // Keep the test-owned replay turn isolated from the background poller.
-                    skip_wal_replay: true,
-                    ..DbReaderOptions::default()
-                },
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-        let base = Arc::clone(&reader.inner.state.read());
-        let base_memtable_count = base.imm_memtable.len();
-        db.put_with_options(
-            b"deadline-key",
-            b"deadline-value",
-            &PutOptions::default(),
-            &WriteOptions {
-                await_durable: false,
-                ..WriteOptions::default()
-            },
-        )
-        .await
-        .unwrap();
-        db.flush_with_options(FlushOptions {
-            flush_type: FlushType::Wal,
-        })
-        .await
-        .unwrap();
-
-        let prior_head_arrivals = gated.head_gate.arrivals();
-        gated.head_gate.close();
-        let blocked = tokio::spawn(DbReaderInner::replay_runtime_turn(
-            Arc::clone(&reader.inner),
-            Arc::clone(&base),
-            reader.inner.replay_tasks.child(),
-        ));
-        gated
-            .head_gate
-            .wait_for_arrivals(prior_head_arrivals + 1)
-            .await;
-        tokio::time::advance(MAX_RUNTIME_REPLAY_TURN_TIME).await;
-        // Make the object read ready at the exact deadline. The deadline branch
-        // is biased and must still win.
-        gated.head_gate.release();
-        let expired = blocked.await.unwrap().unwrap();
-        assert_eq!(expired.last_wal_id, base.last_wal_id);
-        assert_eq!(expired.last_committed_seq, base.last_remote_persisted_seq);
-        assert_eq!(expired.imm_memtable.len(), base_memtable_count);
-        assert!(expired.reached_turn_limit);
-        assert!(!expired.caught_up);
-        assert_eq!(reader.inner.state.read().last_wal_id, base.last_wal_id);
-
-        let completed = DbReaderInner::replay_runtime_turn(
-            Arc::clone(&reader.inner),
-            base,
-            reader.inner.replay_tasks.child(),
-        )
-        .await
-        .unwrap();
-        assert!(completed.last_wal_id > expired.last_wal_id);
-        assert!(completed.caught_up);
-        let mut rows = completed
-            .imm_memtable
-            .front()
-            .expect("completed WAL must be present")
-            .table()
-            .iter();
-        let row = rows.next().await.unwrap().unwrap();
-        assert_eq!(row.key, Bytes::from_static(b"deadline-key"));
-        assert_eq!(
-            row.value,
-            crate::types::ValueDeletable::Value(Bytes::from_static(b"deadline-value"))
-        );
-
-        reader.close().await.unwrap();
-        db.close().await.unwrap();
-    }
-
-    #[test]
-    fn reader_validation_rejects_invalid_wal_replay_settings_in_every_mode() {
-        for mode in [
-            DbReaderMode::Checkpoint(Uuid::nil()),
-            DbReaderMode::ManagedCheckpoint,
-            DbReaderMode::FollowLatest,
-        ] {
-            let options = DbReaderOptions {
-                wal_replay: crate::config::WalReplaySettings {
-                    max_concurrent_objects: 0,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-            assert!(DbReader::validate_options(mode, &options).is_err());
-        }
-    }
-
-    #[test]
-    fn reader_validation_rejects_zero_wal_poll_interval_in_every_mode() {
-        for mode in [
-            DbReaderMode::Checkpoint(Uuid::nil()),
-            DbReaderMode::ManagedCheckpoint,
-            DbReaderMode::FollowLatest,
-        ] {
-            let options = DbReaderOptions {
-                wal_poll_interval: Duration::ZERO,
-                ..DbReaderOptions::default()
-            };
-            assert!(matches!(
-                DbReader::validate_options(mode, &options),
-                Err(SlateDBError::InvalidWalPollInterval(interval)) if interval.is_zero()
-            ));
-        }
-    }
-
-    #[tokio::test]
-    async fn exact_replay_should_fail_closed_on_a_missing_wal() {
+    async fn replay_wal_into_should_treat_missing_wal_sst_as_end_of_iteration() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let path = Path::from("/tmp/test_db_reader_missing_wal");
         let test_provider = TestProvider::new(path, Arc::clone(&object_store));
         let table_store = test_provider.table_store();
+        let wal_store = test_provider.wal_store();
 
         write_wal_sst(
-            Arc::clone(&table_store),
+            Arc::clone(&wal_store),
             1,
             vec![RowEntry::new_value(b"key", b"value", 1)],
         )
@@ -4698,31 +3818,38 @@ mod tests {
         let mut into_tables = ReplayMemtables::default();
         let mut core = ManifestCore::new();
         core.next_wal_sst_id = 3;
+        let status_manager = status_manager_for_core(&core);
 
-        let error = DbReaderInner::replay_wal_into_exact(
+        let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
             Arc::clone(&table_store),
+            &native_wal_reader(&wal_store, &status_manager),
             &DbReaderOptions::default(),
             &core,
             &mut into_tables,
             None,
-            false,
+            WalReplayEnd::Manifest,
             None,
             None,
             None,
         )
         .await
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.has_object_store_not_found());
-        assert!(into_tables.is_empty());
+        // WAL 2 is missing and ends the iteration, but the rows already replayed
+        // from WAL 1 must still be returned.
+        assert_eq!(last_wal_id, 1);
+        assert_eq!(last_committed_seq, 1);
+        assert_eq!(into_tables.len(), 1);
+        assert_eq!(into_tables.front().unwrap().recent_flushed_wal_id(), 1);
     }
 
     #[tokio::test]
-    async fn exact_replay_should_surface_a_later_missing_wal() {
+    async fn replay_wal_into_should_keep_previously_replayed_tables_before_missing_wal_sst() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let path = Path::from("/tmp/test_db_reader_missing_wal_after_replay");
         let test_provider = TestProvider::new(path, Arc::clone(&object_store));
         let table_store = test_provider.table_store();
+        let wal_store = test_provider.wal_store();
 
         let wal_1_row = RowEntry::new_value(b"a", &[b'a'; 8], 1);
         let wal_2_row_1 = RowEntry::new_value(b"b", &[b'b'; 40], 2);
@@ -4733,11 +3860,11 @@ mod tests {
             wal_1_row.estimated_size() + wal_2_row_1.estimated_size(),
         ) as u64;
 
-        write_wal_sst(Arc::clone(&table_store), 1, vec![wal_1_row.clone()])
+        write_wal_sst(Arc::clone(&wal_store), 1, vec![wal_1_row.clone()])
             .await
             .unwrap();
         write_wal_sst(
-            Arc::clone(&table_store),
+            Arc::clone(&wal_store),
             2,
             vec![wal_2_row_1.clone(), wal_2_row_2.clone()],
         )
@@ -4752,22 +3879,25 @@ mod tests {
             max_memtable_bytes,
             ..DbReaderOptions::default()
         };
+        let status_manager = status_manager_for_core(&core);
 
-        let error = DbReaderInner::replay_wal_into_exact(
+        let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
             Arc::clone(&table_store),
+            &native_wal_reader(&wal_store, &status_manager),
             &reader_options,
             &core,
             &mut into_tables,
             None,
-            false,
+            WalReplayEnd::Manifest,
             None,
             None,
             None,
         )
         .await
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.has_object_store_not_found());
+        assert_eq!(last_wal_id, 2);
+        assert_eq!(last_committed_seq, 3);
         assert_eq!(into_tables.len(), 1);
 
         let replayed = into_tables.front().unwrap();
@@ -4787,17 +3917,20 @@ mod tests {
         let path = Path::from("/tmp/test_db_reader_fresh_db_no_writes");
         let test_provider = TestProvider::new(path, Arc::clone(&object_store));
         let table_store = test_provider.table_store();
+        let wal_store = test_provider.wal_store();
 
         let mut into_tables = ReplayMemtables::default();
         let core = ManifestCore::new();
+        let status_manager = status_manager_for_core(&core);
 
-        let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into_exact(
+        let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
             Arc::clone(&table_store),
+            &native_wal_reader(&wal_store, &status_manager),
             &DbReaderOptions::default(),
             &core,
             &mut into_tables,
             None,
-            true,
+            WalReplayEnd::Latest,
             None,
             None,
             None,
@@ -4816,22 +3949,25 @@ mod tests {
         let path = Path::from("/tmp/test_db_reader_fresh_db_one_wal");
         let test_provider = TestProvider::new(path, Arc::clone(&object_store));
         let table_store = test_provider.table_store();
+        let wal_store = test_provider.wal_store();
 
         let wal_row = RowEntry::new_value(b"key", b"value", 1);
-        write_wal_sst(Arc::clone(&table_store), 1, vec![wal_row.clone()])
+        write_wal_sst(Arc::clone(&wal_store), 1, vec![wal_row.clone()])
             .await
             .unwrap();
 
         let mut into_tables = ReplayMemtables::default();
         let core = ManifestCore::new();
+        let status_manager = status_manager_for_core(&core);
 
-        let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into_exact(
+        let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
             Arc::clone(&table_store),
+            &native_wal_reader(&wal_store, &status_manager),
             &DbReaderOptions::default(),
             &core,
             &mut into_tables,
             None,
-            true,
+            WalReplayEnd::Latest,
             None,
             None,
             None,
@@ -4856,8 +3992,9 @@ mod tests {
         let path = Path::from("/tmp/test_db_reader_empty_fence_wal");
         let test_provider = TestProvider::new(path, Arc::clone(&object_store));
         let table_store = test_provider.table_store();
+        let wal_store = test_provider.wal_store();
 
-        write_wal_sst(Arc::clone(&table_store), 6, vec![])
+        write_wal_sst(Arc::clone(&wal_store), 6, vec![])
             .await
             .unwrap();
 
@@ -4873,14 +4010,16 @@ mod tests {
         let mut core = ManifestCore::new();
         core.last_l0_seq = 8;
         core.next_wal_sst_id = 5;
+        let status_manager = status_manager_for_core(&core);
 
-        let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into_exact(
+        let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
             Arc::clone(&table_store),
+            &native_wal_reader(&wal_store, &status_manager),
             &DbReaderOptions::default(),
             &core,
             &mut into_tables,
             None,
-            true,
+            WalReplayEnd::Latest,
             None,
             None,
             None,
@@ -4892,13 +4031,14 @@ mod tests {
         assert_eq!(last_committed_seq, 10);
 
         let head_after_first_replay = Arc::clone(into_tables.head.as_ref().unwrap());
-        let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into_exact(
+        let (last_wal_id, last_committed_seq) = DbReaderInner::replay_wal_into(
             Arc::clone(&table_store),
+            &native_wal_reader(&wal_store, &status_manager),
             &DbReaderOptions::default(),
             &core,
             &mut into_tables,
             Some((last_wal_id, last_committed_seq)),
-            true,
+            WalReplayEnd::Latest,
             None,
             None,
             None,
@@ -4927,14 +4067,15 @@ mod tests {
 
         let reader_options = DbReaderOptions {
             manifest_poll_interval: Duration::from_millis(500),
-            wal_poll_interval: Duration::from_millis(10),
             ..DbReaderOptions::default()
         };
         let metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
         let reader = DbReader::open_internal(
             test_provider.manifest_store(),
             test_provider.table_store(),
+            test_provider.wal_store(),
             DbReaderMode::ManagedCheckpoint,
+            None,
             None,
             None,
             reader_options,
@@ -4954,15 +4095,15 @@ mod tests {
 
         fail_parallel::cfg(
             Arc::clone(&test_provider.fp_registry),
-            "runtime-wal-replay",
+            "probe-wal-ssts",
             "return",
         )
         .unwrap();
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
         let result = reader.get(b"key").await.unwrap_err();
         assert_eq!(
             result.to_string(),
-            "Unavailable error: io error (runtime WAL replay failpoint)"
+            "Unavailable error: wal unavailable (io error)"
         );
         assert_eq!(
             Some(0),
@@ -5012,12 +4153,6 @@ mod tests {
             .new_db_reader(reader_options.clone(), None, None)
             .await
             .unwrap();
-        let (tail_tx, tail_rx) = async_channel::unbounded();
-        let mut skipped_poller = ManifestPoller::new(Arc::clone(&reader.inner), tail_tx, tail_rx);
-        assert!(!skipped_poller.runtime_tailing_enabled());
-        assert_eq!(skipped_poller.tickers().len(), 1);
-        skipped_poller.start_runtime_tail();
-        assert!(!skipped_poller.tail_in_flight);
 
         // Should see the L0 flushed data
         assert_eq!(
@@ -5094,9 +4229,9 @@ mod tests {
 
         // Inject a failpoint on WAL probing before flushing so it is active
         // when the poller fires. With the buggy replay_new_wals=true,
-        // reestablish_checkpoint calls last_seen_wal_id() which probes WAL SSTs
+        // reestablish_checkpoint resolves the last WAL file by probing WAL SSTs
         // and hits this failpoint. With the fix (replay_new_wals=false), the
-        // WAL probing is skipped entirely.
+        // WAL probe is skipped entirely.
         fail_parallel::cfg(
             Arc::clone(&test_provider.fp_registry),
             "probe-wal-ssts",
@@ -5117,7 +4252,7 @@ mod tests {
 
         // Wait for the manifest poller to see the changed L0 state and
         // reestablish the checkpoint. Without the fix, the poller crashes
-        // on the WAL listing failpoint.
+        // on the WAL probing failpoint.
         let timeout = Duration::from_secs(5);
         let start = tokio::time::Instant::now();
         loop {
@@ -5175,6 +4310,204 @@ mod tests {
         );
     }
 
+    /// A manifest records the WAL files written since the last L0 flush in
+    /// `next_wal_sst_id`. Opening a reader must not read them when WAL replay
+    /// is skipped: that range is exactly the expensive one, since it grows
+    /// with everything written between L0 flushes.
+    #[tokio::test]
+    async fn skip_wal_replay_should_not_read_wals_recorded_in_manifest() {
+        let recording_store = Arc::new(test_utils::RecordingObjectStore::new(Arc::new(
+            InMemory::new(),
+        )));
+        let object_store: Arc<dyn ObjectStore> = recording_store.clone();
+        let path = Path::from("/tmp/test_kv_store");
+        let test_provider = TestProvider::new(path.clone(), Arc::clone(&object_store));
+
+        let db = test_provider.new_db(Settings::default()).await.unwrap();
+        let flushed_key = b"flushed_key";
+        let flushed_value = b"flushed_value";
+        db.put(flushed_key, flushed_value).await.unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+
+        // Write data that stays in the WAL, then close without flushing the
+        // memtable. Closing persists the manifest, so `next_wal_sst_id` covers
+        // these WAL files while `replay_after_wal_id` stays at the last L0 flush.
+        // The write must be awaited to durability first: closing without a
+        // memtable flush does not flush the WAL, so an unawaited write would
+        // race the flush interval and might never reach a WAL SST.
+        let wal_only_key = b"wal_only_key";
+        db.put(wal_only_key, b"wal_only_value").await.unwrap();
+        db.close_with_options(CloseOptions::default().with_flush_type(Some(FlushType::Wal)))
+            .await
+            .unwrap();
+
+        let core = test_provider
+            .manifest_store()
+            .read_latest_manifest()
+            .await
+            .unwrap()
+            .manifest
+            .core;
+        assert!(
+            core.replay_after_wal_id + 1 < core.next_wal_sst_id,
+            "test needs a manifest that records live WAL files \
+             [replay_after_wal_id={}, next_wal_sst_id={}]",
+            core.replay_after_wal_id,
+            core.next_wal_sst_id
+        );
+
+        recording_store.clear();
+        let reader = test_provider
+            .new_db_reader(
+                DbReaderOptions {
+                    skip_wal_replay: true,
+                    ..DbReaderOptions::default()
+                },
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let wal_reads = recording_store
+            .get_sst_types(false)
+            .into_iter()
+            .chain(recording_store.get_sst_types(true))
+            .filter(|sst_type| *sst_type == Some(SstType::Wal))
+            .count();
+        assert_eq!(wal_reads, 0, "reader read WAL SSTs despite skip_wal_replay");
+
+        assert_eq!(reader.get(wal_only_key).await.unwrap(), None);
+        assert_eq!(
+            reader.get(flushed_key).await.unwrap(),
+            Some(Bytes::from_static(flushed_value))
+        );
+    }
+
+    /// Regression test for #2003: read-ahead was a fixed 1MiB, so a large WAL took one
+    /// GET per MiB. It now covers a whole WAL SST, so reads for one file stay a small
+    /// constant instead of growing with size.
+    #[tokio::test]
+    async fn replay_reads_a_large_wal_sst_in_a_bounded_number_of_requests() {
+        let recording_store = Arc::new(test_utils::RecordingObjectStore::new(Arc::new(
+            InMemory::new(),
+        )));
+        let object_store: Arc<dyn ObjectStore> = recording_store.clone();
+        let path = Path::from("/tmp/test_kv_store");
+        let test_provider = TestProvider::new(path.clone(), Arc::clone(&object_store));
+        let wal_store = test_provider.wal_store();
+
+        // One 16MiB WAL SST, far over the old 1MiB window. The old window read it in
+        // ~16 data GETs; the fix reads it in one.
+        let value = vec![b'x'; 4096];
+        let entries: Vec<RowEntry> = (0..4096u32)
+            .map(|i| RowEntry::new_value(format!("key-{i:08}").as_bytes(), &value, i as u64 + 1))
+            .collect();
+        write_wal_sst(Arc::clone(&wal_store), 1, entries)
+            .await
+            .unwrap();
+
+        let mut core = ManifestCore::new();
+        core.next_wal_sst_id = 2;
+        let status_manager = status_manager_for_core(&core);
+        let wal_reader = native_wal_reader(&wal_store, &status_manager);
+
+        recording_store.clear();
+        let mut iterator = wal_reader.iterator((1..2).into()).await.unwrap();
+        let mut rows = 0;
+        while let Some(batch) = iterator.next().await.unwrap() {
+            rows += batch.rows.len();
+        }
+        assert_eq!(rows, 4096, "replay should return every WAL row");
+
+        let wal_reads = recording_store
+            .get_sst_types(false)
+            .into_iter()
+            .filter(|sst_type| *sst_type == Some(SstType::Wal))
+            .count();
+        // Footer, index, and one data read. The old 1MiB window needed ~16 data reads
+        // for this file, so the bound is the regression.
+        assert!(
+            wal_reads <= 4,
+            "expected a bounded number of WAL reads for one file, got {wal_reads}"
+        );
+    }
+
+    /// A checkpoint captures the WAL files that were durable when it was taken,
+    /// so a pinned reader replays them by default. `skip_wal_replay` opts out of
+    /// that read, at the cost of not seeing the checkpointed WAL writes.
+    #[rstest]
+    #[case(true, None)]
+    #[case(false, Some(Bytes::from_static(b"wal_only_value")))]
+    #[tokio::test]
+    async fn skip_wal_replay_should_control_checkpoint_wal_reads(
+        #[case] skip_wal_replay: bool,
+        #[case] expected: Option<Bytes>,
+    ) {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_kv_store");
+        let test_provider = TestProvider::new(path.clone(), Arc::clone(&object_store));
+
+        let db = test_provider.new_db(Settings::default()).await.unwrap();
+        db.put(b"flushed_key", b"flushed_value").await.unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+
+        // This write is only durable in the WAL, so the checkpoint references it
+        // through the manifest's `next_wal_sst_id` rather than through L0. The
+        // scope must be `Durable`: `All` would flush the memtable to L0 first,
+        // leaving the checkpoint with no live WAL.
+        let wal_only_key = b"wal_only_key";
+        db.put(wal_only_key, b"wal_only_value").await.unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::Wal,
+        })
+        .await
+        .unwrap();
+        let checkpoint = db
+            .create_checkpoint(CheckpointScope::Durable, &CheckpointOptions::default())
+            .await
+            .unwrap();
+        db.close_with_options(CloseOptions::default().with_flush_type(Some(FlushType::Wal)))
+            .await
+            .unwrap();
+
+        let core = test_provider
+            .manifest_store()
+            .read_manifest(checkpoint.manifest_id)
+            .await
+            .unwrap()
+            .core;
+        assert!(
+            core.replay_after_wal_id + 1 < core.next_wal_sst_id,
+            "test needs a checkpoint whose manifest records live WAL files \
+             [replay_after_wal_id={}, next_wal_sst_id={}]",
+            core.replay_after_wal_id,
+            core.next_wal_sst_id
+        );
+
+        let reader = test_provider
+            .new_db_reader(
+                DbReaderOptions {
+                    skip_wal_replay,
+                    ..DbReaderOptions::default()
+                },
+                Some(checkpoint.id),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(reader.get(wal_only_key).await.unwrap(), expected);
+    }
+
     struct TestProvider {
         object_store: Arc<dyn ObjectStore>,
         path: Path,
@@ -5215,7 +4548,9 @@ mod tests {
             DbReader::open_internal(
                 self.manifest_store(),
                 self.table_store(),
+                self.wal_store(),
                 mode,
+                None,
                 merge_operator,
                 None,
                 options,
@@ -5225,6 +4560,26 @@ mod tests {
             )
             .await
         }
+    }
+
+    fn status_manager_for_core(core: &ManifestCore) -> DbStatusManager {
+        DbStatusManager::new_with_initial_values(
+            core.last_l0_seq,
+            VersionedManifest::from_manifest(1, Manifest::initial(core.clone())),
+            BTreeSet::default(),
+        )
+    }
+
+    fn native_wal_reader(
+        wal_store: &Arc<WalTableStore>,
+        status_manager: &DbStatusManager,
+    ) -> crate::wal::slatedb::reader::SlateDbWalReader {
+        crate::wal::slatedb::reader::SlateDbWalReader::new_with_status_manager(
+            Arc::clone(wal_store),
+            status_manager,
+            Arc::new(DefaultSystemClock::new()),
+            SlateDbWalReaderOptions::default(),
+        )
     }
 
     fn immutable_memtable(
@@ -5239,15 +4594,16 @@ mod tests {
     }
 
     async fn write_wal_sst(
-        table_store: Arc<TableStore>,
+        wal_store: Arc<WalTableStore>,
         wal_id: u64,
         entries: Vec<RowEntry>,
     ) -> Result<(), SlateDBError> {
-        let mut writer = table_store.table_writer(SsTableId::Wal(wal_id));
+        let mut builder = wal_store.table_builder();
         for entry in entries {
-            writer.add(entry).await?;
+            builder.add(entry).await?;
         }
-        writer.close().await?;
+        let encoded_sst = builder.build().await?;
+        wal_store.write_sst(wal_id, &encoded_sst).await?;
         Ok(())
     }
 
@@ -5349,6 +4705,7 @@ mod tests {
         let test_provider = TestProvider::new(path, Arc::clone(&object_store));
         let manifest_store = test_provider.manifest_store();
         let table_store = test_provider.table_store();
+        let wal_store = test_provider.wal_store();
         let mut stored_manifest = StoredManifest::create_new_db(
             Arc::clone(&manifest_store),
             ManifestCore::new(),
@@ -5404,9 +4761,12 @@ mod tests {
             oracle.clone(),
             None,
         );
+        let status_manager = status_manager_for_core(&stored_manifest.manifest().core);
+        let wal_reader = Arc::new(native_wal_reader(&wal_store, &status_manager));
         let inner = DbReaderInner {
             manifest_store,
             table_store,
+            wal_reader,
             options: DbReaderOptions {
                 skip_wal_replay: true,
                 ..DbReaderOptions::default()
@@ -5417,10 +4777,9 @@ mod tests {
             oracle,
             reader,
             db_stats,
-            status_manager: DbStatusManager::new(0),
+            status_manager,
             segment_extractor: None,
             rand: test_provider.rand.clone(),
-            replay_tasks: ReplayTaskScope::new(),
             recorder,
         };
 
@@ -5470,6 +4829,8 @@ mod tests {
     ) -> DbReaderInner {
         let manifest_store = test_provider.manifest_store();
         let table_store = test_provider.table_store();
+        let wal_store = test_provider.wal_store();
+        let status_manager = status_manager_for_core(current_core);
 
         let prior_state = ReaderState {
             generation: ReaderGeneration::new(
@@ -5500,9 +4861,11 @@ mod tests {
             oracle.clone(),
             None,
         );
+        let wal_reader = Arc::new(native_wal_reader(&wal_store, &status_manager));
         DbReaderInner {
             manifest_store,
             table_store,
+            wal_reader,
             options: DbReaderOptions::default(),
             mode: DbReaderMode::ManagedCheckpoint,
             state: parking_lot::RwLock::new(Arc::new(prior_state)),
@@ -5510,10 +4873,9 @@ mod tests {
             oracle,
             reader,
             db_stats,
-            status_manager: DbStatusManager::new(0),
+            status_manager,
             segment_extractor: None,
             rand: test_provider.rand.clone(),
-            replay_tasks: ReplayTaskScope::new(),
             recorder,
         }
     }
@@ -5546,9 +4908,11 @@ mod tests {
         // RFC-0024: per-segment compactions, drains, and segment-set changes
         // are invisible to the root-tree diff. Verify the segments comparison
         // fires on each of those shapes.
-        use crate::db_state::{SortedRun, SsTableHandle, SsTableId, SsTableInfo, SsTableView};
-        use crate::format::sst::SST_FORMAT_VERSION_LATEST;
-        use crate::manifest::{LsmTreeState, Segment};
+        use crate::{
+            db_state::{SortedRun, SsTableHandle, SsTableId, SsTableInfo, SsTableView},
+            format::sst::SST_FORMAT_VERSION_LATEST,
+            manifest::{LsmTreeState, Segment},
+        };
 
         fn view(seq: u64) -> SsTableView {
             SsTableView::identity(SsTableHandle::new(
@@ -5615,10 +4979,7 @@ mod tests {
                 last_compacted_l0_sst_view_id: None,
                 last_compacted_l0_sst_id: None,
                 l0: VecDeque::from(vec![view(1)]),
-                compacted: vec![SortedRun {
-                    id: 0,
-                    sst_views: vec![view(4)],
-                }],
+                compacted: vec![SortedRun::new(0, [view(4)])],
             },
         )];
         assert!(
@@ -5747,9 +5108,7 @@ mod tests {
 
     #[tokio::test]
     async fn should_record_incremental_wal_replay_metrics() {
-        use slatedb_common::metrics::{
-            lookup_metric, lookup_metric_with_labels, DefaultMetricsRecorder,
-        };
+        use slatedb_common::metrics::{lookup_metric, DefaultMetricsRecorder};
 
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let path = Path::from("/tmp/test_db_reader_wal_replay_metrics");
@@ -5769,7 +5128,7 @@ mod tests {
             &PutOptions::default(),
             &WriteOptions {
                 await_durable: false,
-                ..WriteOptions::default()
+                ..Default::default()
             },
         )
         .await
@@ -5804,42 +5163,6 @@ mod tests {
             Some(1),
             lookup_metric(&metrics_recorder, crate::db_stats::READER_REPLAY_MEMTABLES)
         );
-        let list_metric = crate::db_stats::READER_WAL_REPLAY_OBJECT_STORE_CALLS;
-        assert!(lookup_metric_with_labels(
-            &metrics_recorder,
-            list_metric,
-            &[
-                (
-                    crate::db_stats::REPLAY_SOURCE_LABEL,
-                    crate::db_stats::REPLAY_SOURCE_READER_OPEN,
-                ),
-                (
-                    crate::db_stats::REPLAY_OPERATION_LABEL,
-                    crate::db_stats::REPLAY_OPERATION_LIST,
-                ),
-            ],
-        )
-        .is_some_and(|value| value > 0));
-        for source in [
-            crate::db_stats::REPLAY_SOURCE_RUNTIME_MANIFEST,
-            crate::db_stats::REPLAY_SOURCE_RUNTIME_TAIL,
-        ] {
-            assert_eq!(
-                lookup_metric_with_labels(
-                    &metrics_recorder,
-                    list_metric,
-                    &[
-                        (crate::db_stats::REPLAY_SOURCE_LABEL, source),
-                        (
-                            crate::db_stats::REPLAY_OPERATION_LABEL,
-                            crate::db_stats::REPLAY_OPERATION_LIST,
-                        ),
-                    ],
-                ),
-                Some(0),
-                "runtime replay source unexpectedly performed LIST: {source}",
-            );
-        }
         assert_eq!(
             Some(1),
             lookup_metric(
@@ -5884,12 +5207,6 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let (tail_tx, tail_rx) = async_channel::unbounded();
-        let mut pinned_poller = ManifestPoller::new(Arc::clone(&reader.inner), tail_tx, tail_rx);
-        assert!(!pinned_poller.runtime_tailing_enabled());
-        assert_eq!(pinned_poller.tickers().len(), 1);
-        pinned_poller.start_runtime_tail();
-        assert!(!pinned_poller.tail_in_flight);
 
         assert_eq!(
             Some(0),
@@ -5966,6 +5283,16 @@ mod tests {
             ))
         }
 
+        fn wal_store(&self) -> Arc<WalTableStore> {
+            Arc::new(WalTableStore::new_with_fp_registry(
+                Arc::clone(&self.object_store),
+                SsTableFormat::default(),
+                PathResolver::from_root(self.path.clone()),
+                Arc::clone(&self.fp_registry),
+                TableStoreKind::Reader,
+            ))
+        }
+
         fn manifest_store(&self) -> Arc<ManifestStore> {
             Arc::new(ManifestStore::new(
                 &self.path,
@@ -5983,8 +5310,7 @@ mod tests {
         let mut test_provider = TestProvider::new(path.clone(), Arc::clone(&object_store));
         test_provider.system_clock = clock.clone();
 
-        let merge_operator: crate::merge_operator::MergeOperatorType =
-            Arc::new(crate::test_utils::StringConcatMergeOperator);
+        let merge_operator: MergeOperatorType = Arc::new(test_utils::StringConcatMergeOperator);
 
         let db = Db::builder(path.clone(), Arc::clone(&object_store))
             .with_settings(Settings {

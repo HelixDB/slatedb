@@ -1902,7 +1902,7 @@ mod tests {
                 // For every active transaction, verify the smoking-gun invariant:
                 // rw_conflict <=> exists culprit in recent_committed_txns that satisfies rules
                 let inner = txn_manager.inner.read();
-                for (_id, txn) in inner.active_txns.iter() {
+                for txn in inner.active_txns.values() {
                     // Only meaningful for SSI; read-only transactions can also have reads, so include them.
                     let rw_conflict = inner.has_read_write_conflict(
                         &txn.read_keys,

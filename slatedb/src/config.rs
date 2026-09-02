@@ -281,6 +281,20 @@ pub enum DurabilityLevel {
     Memory,
 }
 
+/// Options for tracing a read operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TracingOptions {
+    pub trace_id: String,
+}
+
+impl TracingOptions {
+    pub fn new(trace_id: impl Into<String>) -> Self {
+        Self {
+            trace_id: trace_id.into(),
+        }
+    }
+}
+
 /// Configuration for client read operations. `ReadOptions` is supplied for each
 /// read call and controls the behavior of the read.
 #[derive(Clone, Debug)]
@@ -298,6 +312,8 @@ pub struct ReadOptions {
     /// Optional context forwarded to custom filter policies; ignored by
     /// built-in filters. See [`FilterContext`].
     pub filter_context: Option<FilterContext>,
+    /// Optional caller-provided tracing settings.
+    pub tracing_options: Option<TracingOptions>,
 }
 
 impl Default for ReadOptions {
@@ -307,6 +323,7 @@ impl Default for ReadOptions {
             dirty: false,
             cache_blocks: true,
             filter_context: None,
+            tracing_options: None,
         }
     }
 }
@@ -340,6 +357,13 @@ impl ReadOptions {
             ..self
         }
     }
+
+    pub fn with_tracing_options(self, tracing_options: Option<TracingOptions>) -> Self {
+        Self {
+            tracing_options,
+            ..self
+        }
+    }
 }
 #[derive(Clone, Debug)]
 pub struct ScanOptions {
@@ -350,9 +374,10 @@ pub struct ScanOptions {
     /// Whether to include dirty data in the scan. "dirty" means that the data is not considered
     /// as "committed" yet, whose seq number is greater than the last committed seq number.
     pub dirty: bool,
-    /// The number of bytes to read ahead. The value is rounded up to the nearest
-    /// block size when fetching from object storage. The default is 1, which
-    /// rounds up to one block.
+    /// The target number of bytes to fetch in a single request while iterating over SSTs.
+    /// Each fetch will read the minimum number of blocks such that the resulting read is at least
+    /// this size or reaches the end of the file. The default is 1, which results in each fetch
+    /// reading one block.
     pub read_ahead_bytes: usize,
     /// Whether or not fetched data blocks should be cached. SST indexes,
     /// filters, and stats are cached independently of this setting.
@@ -368,6 +393,8 @@ pub struct ScanOptions {
     /// Only consulted for `scan_prefix` today. Plain range scans do not
     /// evaluate SST filters, so this field has no effect on `scan`.
     pub filter_context: Option<FilterContext>,
+    /// Optional caller-provided tracing settings.
+    pub tracing_options: Option<TracingOptions>,
 }
 
 impl Default for ScanOptions {
@@ -381,6 +408,7 @@ impl Default for ScanOptions {
             max_fetch_tasks: 1,
             order: IterationOrder::Ascending,
             filter_context: None,
+            tracing_options: None,
         }
     }
 }
@@ -432,10 +460,17 @@ impl ScanOptions {
             ..self
         }
     }
+
+    pub fn with_tracing_options(self, tracing_options: Option<TracingOptions>) -> Self {
+        Self {
+            tracing_options,
+            ..self
+        }
+    }
 }
 
 /// Enum representing the type of flush to perform.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum FlushType {
     /// Freeze the active memtable [crate::mem_table::KVTable] and write
     /// all immutable memtable entries (including the formerly active
@@ -461,12 +496,44 @@ impl Default for FlushOptions {
     }
 }
 
+/// Options controlling how a database is closed.
+#[derive(Clone, Debug)]
+pub struct CloseOptions {
+    /// The type of flush to perform before closing.
+    ///
+    /// When `None`, no final flush is triggered. Memtables already being
+    /// flushed continue through the existing shutdown pipeline, and writes
+    /// that are not durable may be lost. When set to `Some` flushes the
+    /// database in accordance with the specified [`FlushType`]
+    /// Defaults to `Some(FlushType::MemTable)`.
+    pub flush_type: Option<FlushType>,
+}
+
+impl Default for CloseOptions {
+    fn default() -> Self {
+        Self {
+            flush_type: Some(FlushType::MemTable),
+        }
+    }
+}
+
+impl CloseOptions {
+    /// Configure the type of flush to perform before closing.
+    pub fn with_flush_type(mut self, flush_type: Option<FlushType>) -> Self {
+        self.flush_type = flush_type;
+        self
+    }
+}
+
 /// Configuration for client write operations. `WriteOptions` is supplied for each
 /// write call and controls the behavior of the write.
 #[derive(Clone, Debug)]
 pub struct WriteOptions {
-    /// Whether `put` calls should block until the write has been durably committed
-    /// to the DB.
+    /// Whether the write call waits for the returned handle to become durable before returning.
+    ///
+    /// Defaults to `true` for compatibility with the fork's v0.15 write contract. Callers that
+    /// want v0.16's non-blocking write behavior can set this to `false` and await the returned
+    /// [`crate::WriteHandle`] when durability is required.
     pub await_durable: bool,
     #[cfg(dst)]
     /// Force the current timestamp for DST operations. See #719 for details.
@@ -479,7 +546,6 @@ pub struct WriteOptions {
 }
 
 impl Default for WriteOptions {
-    /// Create a new `WriteOptions`` with `await_durable` set to `true`.
     fn default() -> Self {
         Self {
             await_durable: true,
@@ -503,25 +569,29 @@ pub struct PutOptions {
 }
 
 impl PutOptions {
-    pub(crate) fn expire_ts_from(&self, default: Option<u64>, now: i64) -> Option<i64> {
+    pub(crate) fn expire_ts_from(
+        &self,
+        default_ttl_millis: Option<u64>,
+        now_millis: i64,
+    ) -> Option<i64> {
         match self.ttl {
-            Ttl::Default => match default {
+            Ttl::Default => match default_ttl_millis {
                 None => None,
-                Some(default_ttl) => Self::checked_expire_ts(now, default_ttl),
+                Some(default_ttl_millis) => Self::checked_expire_ts(now_millis, default_ttl_millis),
             },
             Ttl::NoExpiry => None,
-            Ttl::ExpireAfter(ttl) => Self::checked_expire_ts(now, ttl),
-            Ttl::ExpireAt(ts) => Some(ts),
+            Ttl::ExpireAfterMillis(ttl_millis) => Self::checked_expire_ts(now_millis, ttl_millis),
+            Ttl::ExpireAtMillis(timestamp_millis) => Some(timestamp_millis),
         }
     }
 
-    fn checked_expire_ts(now: i64, ttl: u64) -> Option<i64> {
+    fn checked_expire_ts(now_millis: i64, ttl_millis: u64) -> Option<i64> {
         // for overflow, we will just assume no TTL
-        if ttl > i64::MAX as u64 {
+        if ttl_millis > i64::MAX as u64 {
             return None;
         };
-        let expire_ts = now + (ttl as i64);
-        if expire_ts < now {
+        let expire_ts = now_millis + (ttl_millis as i64);
+        if expire_ts < now_millis {
             return None;
         };
 
@@ -541,25 +611,29 @@ pub struct MergeOptions {
 
 impl MergeOptions {
     // TODO(agavra): deduplicate this with PutOptions::expire_ts_from
-    pub(crate) fn expire_ts_from(&self, default: Option<u64>, now: i64) -> Option<i64> {
+    pub(crate) fn expire_ts_from(
+        &self,
+        default_ttl_millis: Option<u64>,
+        now_millis: i64,
+    ) -> Option<i64> {
         match self.ttl {
-            Ttl::Default => match default {
+            Ttl::Default => match default_ttl_millis {
                 None => None,
-                Some(default_ttl) => Self::checked_expire_ts(now, default_ttl),
+                Some(default_ttl_millis) => Self::checked_expire_ts(now_millis, default_ttl_millis),
             },
             Ttl::NoExpiry => None,
-            Ttl::ExpireAfter(ttl) => Self::checked_expire_ts(now, ttl),
-            Ttl::ExpireAt(ts) => Some(ts),
+            Ttl::ExpireAfterMillis(ttl_millis) => Self::checked_expire_ts(now_millis, ttl_millis),
+            Ttl::ExpireAtMillis(timestamp_millis) => Some(timestamp_millis),
         }
     }
 
-    fn checked_expire_ts(now: i64, ttl: u64) -> Option<i64> {
+    fn checked_expire_ts(now_millis: i64, ttl_millis: u64) -> Option<i64> {
         // for overflow, we will just assume no TTL
-        if ttl > i64::MAX as u64 {
+        if ttl_millis > i64::MAX as u64 {
             return None;
         };
-        let expire_ts = now + (ttl as i64);
-        if expire_ts < now {
+        let expire_ts = now_millis + (ttl_millis as i64);
+        if expire_ts < now_millis {
             return None;
         };
 
@@ -567,14 +641,25 @@ impl MergeOptions {
     }
 }
 
+/// Time-to-live policy applied to an inserted value or merge operand.
+///
+/// TTL durations are expressed in milliseconds. Absolute expiration timestamps are
+/// expressed as milliseconds since the Unix epoch.
+///
+/// Expiration is applied during compaction and is therefore best effort; an expired
+/// value may remain visible until compaction processes it.
 #[non_exhaustive]
 #[derive(Clone, Default, PartialEq, Debug)]
 pub enum Ttl {
+    /// Use [`Settings::default_ttl_millis`].
     #[default]
     Default,
+    /// Store the value without an expiration.
     NoExpiry,
-    ExpireAfter(u64),
-    ExpireAt(i64),
+    /// Expire the value after the specified number of milliseconds.
+    ExpireAfterMillis(u64),
+    /// Expire the value at the specified Unix timestamp in milliseconds.
+    ExpireAtMillis(i64),
 }
 
 /// Defines the scope targeted by a given checkpoint. If set to All, then the checkpoint will
@@ -780,11 +865,12 @@ pub struct Settings {
     #[serde(default)]
     pub metric_level: MetricLevel,
 
-    /// The default time-to-live (TTL) for insertions (note that re-inserting a key
-    /// with any value will update the TTL to use the default_ttl)
+    /// The default time-to-live (TTL), in milliseconds, for insertions (note that
+    /// re-inserting a key with any value will update the TTL to use
+    /// `default_ttl_millis`).
     ///
     /// Default: no TTL (insertions will remain until deleted)
-    pub default_ttl: Option<u64>,
+    pub default_ttl_millis: Option<u64>,
 
     /// Maximum logical-discriminator payload retained by one transaction.
     #[serde(default = "default_max_transaction_conflict_metadata_bytes")]
@@ -844,7 +930,7 @@ impl std::fmt::Debug for Settings {
             )
             .field("garbage_collector_options", &self.garbage_collector_options)
             .field("metric_level", &self.metric_level)
-            .field("default_ttl", &self.default_ttl)
+            .field("default_ttl_millis", &self.default_ttl_millis)
             .field(
                 "max_transaction_conflict_metadata_bytes",
                 &self.max_transaction_conflict_metadata_bytes,
@@ -1065,7 +1151,7 @@ impl Settings {
 }
 
 impl Provider for Settings {
-    fn metadata(&self) -> figment::Metadata {
+    fn metadata(&self) -> Metadata {
         Metadata::named("SlateDb configuration options")
     }
 
@@ -1097,7 +1183,7 @@ impl Default for Settings {
             object_store_cache_options: ObjectStoreCacheOptions::default(),
             garbage_collector_options: Some(GarbageCollectorOptions::default()),
             metric_level: MetricLevel::default(),
-            default_ttl: None,
+            default_ttl_millis: None,
             max_transaction_conflict_metadata_bytes:
                 DEFAULT_MAX_TRANSACTION_CONFLICT_METADATA_BYTES,
             max_retained_conflict_metadata_bytes: DEFAULT_MAX_RETAINED_CONFLICT_METADATA_BYTES,
@@ -1146,6 +1232,7 @@ impl WalReplaySettings {
                 "wal_replay.max_inflight_bytes must fit in a 32-bit semaphore permit count".into(),
             ));
         }
+        self.encoded_byte_limit()?;
         Ok(())
     }
 
@@ -1230,12 +1317,11 @@ pub struct DbReaderOptions {
     /// local filesystem, mirroring the behaviour of `Db`.
     pub object_store_cache_options: ObjectStoreCacheOptions,
 
-    /// When true, skip WAL replay entirely. The reader will only see data that has been
-    /// compacted into L0 or lower levels. This is useful for read-heavy workloads that
-    /// don't need to see the most recent uncommitted writes and want to minimize the
+    /// When true, skip WAL replay entirely, in every reader mode. The reader reads no WAL
+    /// when it opens or when it refreshes its state, so it only sees data that has been
+    /// flushed to L0 or lower levels. This is useful for read-heavy workloads that
+    /// don't need to see the most recent writes and want to minimize the
     /// cost of opening many readers.
-    ///
-    /// WAL replay is also skipped in [`crate::DbReaderMode::Checkpoint`] mode.
     ///
     /// When combined with a reader mode that polls manifests, the reader will still see newly
     /// compacted data as manifests are updated.
@@ -1444,9 +1530,10 @@ pub struct CompactionWorkerOptions {
     /// compaction. Higher values can improve throughput but use more resources.
     pub max_fetch_tasks: usize,
 
-    /// Number of bytes to fetch in a single read-ahead request while iterating
-    /// over input SSTs during compaction. The value is rounded up to the nearest
-    /// block size when fetching from object storage. The default is 2MiB.
+    /// The target number of bytes to fetch in a single request while iterating over
+    /// input SSTs during compaction. Each fetch will read the minimum number of blocks
+    /// such that the resulting read is at least this size or reaches the end of the file.
+    /// The default is 2MiB.
     ///
     /// This pairs with [`CompactionWorkerOptions::max_fetch_tasks`]:
     /// `bytes_to_fetch` is the size of each read-ahead request while
@@ -1702,7 +1789,7 @@ impl GarbageCollectorOptions {
 
 /// Default options for the garbage collector for a directory.
 ///
-/// By default, the garbage collector will run every minute and deletes files
+/// By default, the garbage collector will run every 10 minutes and deletes files
 /// that are at least 5 minutes old.
 impl Default for GarbageCollectorDirectoryOptions {
     fn default() -> Self {
@@ -2109,6 +2196,12 @@ object_store_cache_options:
     }
 
     #[test]
+    fn test_default_tracing_options_are_none() {
+        assert!(ReadOptions::default().tracing_options.is_none());
+        assert!(ScanOptions::default().tracing_options.is_none());
+    }
+
+    #[test]
     fn test_scan_options_with_max_fetch_tasks() {
         let options = ScanOptions::default().with_max_fetch_tasks(4);
         assert_eq!(options.max_fetch_tasks, 4);
@@ -2118,6 +2211,32 @@ object_store_cache_options:
         assert!(!options.dirty);
         assert_eq!(options.read_ahead_bytes, 1);
         assert!(!options.cache_blocks);
+    }
+
+    #[test]
+    fn test_read_options_with_tracing_options() {
+        let options =
+            ReadOptions::default().with_tracing_options(Some(TracingOptions::new("read-trace")));
+        assert_eq!(
+            options
+                .tracing_options
+                .as_ref()
+                .map(|tracing_options| tracing_options.trace_id.as_str()),
+            Some("read-trace")
+        );
+    }
+
+    #[test]
+    fn test_scan_options_with_tracing_options() {
+        let options =
+            ScanOptions::default().with_tracing_options(Some(TracingOptions::new("scan-trace")));
+        assert_eq!(
+            options
+                .tracing_options
+                .as_ref()
+                .map(|tracing_options| tracing_options.trace_id.as_str()),
+            Some("scan-trace")
+        );
     }
 
     #[test]
@@ -2140,7 +2259,7 @@ object_store_cache_options:
     fn should_return_exact_timestamp_for_put_expire_at() {
         // given
         let opts = PutOptions {
-            ttl: Ttl::ExpireAt(12345),
+            ttl: Ttl::ExpireAtMillis(12345),
         };
 
         // when
@@ -2154,7 +2273,7 @@ object_store_cache_options:
     fn should_ignore_default_ttl_for_put_expire_at() {
         // given
         let opts = PutOptions {
-            ttl: Ttl::ExpireAt(12345),
+            ttl: Ttl::ExpireAtMillis(12345),
         };
 
         // when
@@ -2168,7 +2287,7 @@ object_store_cache_options:
     fn should_allow_past_timestamp_for_put_expire_at() {
         // given
         let opts = PutOptions {
-            ttl: Ttl::ExpireAt(50),
+            ttl: Ttl::ExpireAtMillis(50),
         };
 
         // when
@@ -2182,7 +2301,7 @@ object_store_cache_options:
     fn should_return_exact_timestamp_for_merge_expire_at() {
         // given
         let opts = MergeOptions {
-            ttl: Ttl::ExpireAt(12345),
+            ttl: Ttl::ExpireAtMillis(12345),
         };
 
         // when
@@ -2194,9 +2313,9 @@ object_store_cache_options:
 
     #[test]
     fn should_return_deterministic_expire_ts_for_expire_at() {
-        // given: same ExpireAt value used at different times
+        // given: same ExpireAtMillis value used at different times
         let opts = PutOptions {
-            ttl: Ttl::ExpireAt(99999),
+            ttl: Ttl::ExpireAtMillis(99999),
         };
 
         // when

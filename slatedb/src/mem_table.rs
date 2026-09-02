@@ -212,6 +212,8 @@ impl RowEntryIterator for MemTableIterator {
             let front = self.borrow_item().clone();
             if front.is_some_and(|record| record.key < next_key) {
                 self.next_sync();
+                // Keep in-memory seeking cooperative.
+                tokio::task::coop::consume_budget().await;
             } else {
                 return Ok(());
             }
@@ -527,13 +529,12 @@ impl KVTable {
         // because the monotonicity is enforced when generating the clock tick
         // (see [crate::utils::MonotonicClock::now])
         if let Some(create_ts) = row.create_ts {
-            self.last_tick
-                .fetch_max(create_ts, atomic::Ordering::SeqCst);
+            self.last_tick.fetch_max(create_ts, SeqCst);
         }
         // update the last seq number if it is greater than the current last seq
-        self.last_seq.fetch_max(row.seq, atomic::Ordering::SeqCst);
+        self.last_seq.fetch_max(row.seq, SeqCst);
         // update the first seq number if it is smaller than the current first seq
-        self.first_seq.fetch_min(row.seq, atomic::Ordering::SeqCst);
+        self.first_seq.fetch_min(row.seq, SeqCst);
 
         let row_size = row.estimated_size();
         self.map.compare_insert(internal_key, row, |previous_row| {
@@ -848,11 +849,9 @@ mod tests {
         let sample_table = sample::table(runner.rng(), 500, 10);
 
         let kv_table = WritableKVTable::new();
-        let mut seq = 1;
-        for (key, value) in &sample_table {
+        for (seq, (key, value)) in (1..).zip(&sample_table) {
             let row_entry = RowEntry::new_value(key, value, seq);
             kv_table.put(row_entry);
-            seq += 1;
         }
 
         runner

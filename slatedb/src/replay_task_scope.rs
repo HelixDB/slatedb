@@ -15,6 +15,7 @@ pub(crate) struct ReplayTaskScope {
     tasks: TaskTracker,
 }
 
+#[allow(dead_code)]
 impl ReplayTaskScope {
     pub(crate) fn new() -> Self {
         Self {

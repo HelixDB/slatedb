@@ -1,35 +1,34 @@
 use crate::dispatcher::MessageHandlerExecutor;
 use crate::error::SlateDBError;
 use crate::manifest::store::{FenceableManifest, StoredManifest};
-use crate::tablestore::TableStore;
 use crate::utils::WatchableOnceCellReader;
-use crate::wal::writer_init::{WalWriterInit, WalWriterInitOptions};
-use crate::wal::{WalWriter, WriterInit};
+use crate::wal::slatedb::store::WalTableStore;
+use crate::wal::slatedb::writer_init::{SlateDbWalWriterInit, SlateDbWalWriterInitOptions};
+use crate::wal::{WalIterator, WalWriter, WriterInit};
 use crate::Settings;
 use fail_parallel::{fail_point_send, FailPointTx};
-use log::error;
 use slatedb_common::metrics::MetricsRecorderHelper;
 use slatedb_common::SystemClock;
 use std::num::NonZeroU64;
-use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
 pub(crate) struct WriterFencer {
     closed_result_reader: WatchableOnceCellReader<Result<(), SlateDBError>>,
     recorder: MetricsRecorderHelper,
-    wal_writer_init_options: WalWriterInitOptions,
-    table_store: Arc<TableStore>,
+    wal_writer_init_options: SlateDbWalWriterInitOptions,
+    wal_store: Arc<WalTableStore>,
     manifest_update_timeout: Duration,
     system_clock: Arc<dyn SystemClock>,
     task_executor: Arc<MessageHandlerExecutor>,
+    wal_writer_init: Option<Box<dyn WriterInit>>,
     #[cfg_attr(not(test), allow(dead_code))]
     fp_tx: FailPointTx,
 }
 
 pub(crate) struct WriterFenceResult {
     pub(crate) manifest: FenceableManifest,
-    pub(crate) replay_range: Range<u64>,
+    pub(crate) replay_iterator: Box<dyn WalIterator>,
     pub(crate) wal_writer: Box<dyn WalWriter>,
 }
 
@@ -37,18 +36,20 @@ impl WriterFencer {
     pub(crate) fn new(
         closed_result_reader: WatchableOnceCellReader<Result<(), SlateDBError>>,
         recorder: MetricsRecorderHelper,
-        table_store: Arc<TableStore>,
+        wal_store: Arc<WalTableStore>,
         settings: &Settings,
         system_clock: Arc<dyn SystemClock>,
         task_executor: Arc<MessageHandlerExecutor>,
+        wal_writer_init: Option<Box<dyn WriterInit>>,
     ) -> Self {
         Self::new_with_fp_handle(
             closed_result_reader,
             recorder,
-            table_store,
+            wal_store,
             settings,
             system_clock,
             task_executor,
+            wal_writer_init,
             FailPointTx::dummy(),
         )
     }
@@ -56,20 +57,22 @@ impl WriterFencer {
     fn new_with_fp_handle(
         closed_result_reader: WatchableOnceCellReader<Result<(), SlateDBError>>,
         recorder: MetricsRecorderHelper,
-        table_store: Arc<TableStore>,
+        wal_store: Arc<WalTableStore>,
         settings: &Settings,
         system_clock: Arc<dyn SystemClock>,
         task_executor: Arc<MessageHandlerExecutor>,
+        wal_writer_init: Option<Box<dyn WriterInit>>,
         fp_tx: FailPointTx,
     ) -> Self {
         Self {
             closed_result_reader,
             recorder,
-            table_store,
+            wal_store,
             wal_writer_init_options: settings.into(),
             manifest_update_timeout: settings.manifest_update_timeout,
             system_clock,
             task_executor,
+            wal_writer_init,
             fp_tx,
         }
     }
@@ -79,25 +82,29 @@ impl WriterFencer {
     }
 
     /// Fences all writers with an older epoch than the provided `stored_manifest` by (1) writing
-    /// a new `FenceableManifest` with a bumped epoch, and (2) writing an empty WAL file that acts
-    /// as a barrier. Any parallel old writers will fail with `SlateDBError::Fenced` when trying
-    /// to "re-write" this file. Returns a `WriterFence` with the `FenceableManifest` and range
-    /// that must be replayed to recover up to the current epoch
+    /// a new `FenceableManifest` with a bumped epoch, and (2) delegating WAL fencing and recovery
+    /// to the configured [`WriterInit`]. Returns the fenced manifest, the initialized WAL writer,
+    /// and the iterator that must be replayed to recover up to the current epoch.
     pub(crate) async fn fence(
-        self,
+        mut self,
         stored_manifest: StoredManifest,
         writer_epoch: Option<NonZeroU64>,
     ) -> Result<WriterFenceResult, SlateDBError> {
-        let wal_writer_init = WalWriterInit::load(
-            self.closed_result_reader.clone(),
-            self.recorder.clone(),
-            self.table_store.clone(),
-            self.wal_writer_init_options,
-            stored_manifest.manifest(),
-            self.task_executor.clone(),
-            self.fp_tx.clone(),
-        )
-        .await?;
+        let wal_writer_init = match self.wal_writer_init.take() {
+            Some(wal_writer_init) => wal_writer_init,
+            None => Box::new(
+                SlateDbWalWriterInit::load(
+                    self.closed_result_reader.clone(),
+                    self.recorder.clone(),
+                    self.wal_store.clone(),
+                    self.wal_writer_init_options,
+                    stored_manifest.manifest(),
+                    self.task_executor.clone(),
+                    self.fp_tx.clone(),
+                )
+                .await?,
+            ),
+        };
 
         let manifest = match writer_epoch {
             Some(writer_epoch) => {
@@ -128,17 +135,10 @@ impl WriterFencer {
         manifest.refresh().await?;
         fail_point_send!(self.fp_tx, "FinalRefreshManifest");
 
-        let replay_range = match result.replay_range.try_into() {
-            Ok(replay_range) => replay_range,
-            Err(_) => {
-                error!("replay range must use inclusive lower bound and exclusive upper bound");
-                return Err(SlateDBError::InvalidDBState);
-            }
-        };
         Ok(WriterFenceResult {
             manifest,
             wal_writer: result.wal_writer,
-            replay_range,
+            replay_iterator: result.replay_iterator,
         })
     }
 }
@@ -159,8 +159,10 @@ mod tests {
     use crate::manifest::ManifestCore;
     use crate::memtable_flusher::MANIFEST_REFRESH_COUNT;
     use crate::object_stores::ObjectStores;
+    use crate::paths::PathResolver;
     use crate::tablestore::{TableStore, TableStoreKind};
     use crate::utils::WatchableOnceCell;
+    use crate::wal::slatedb::store::WalTableStore;
     use crate::{CloseReason, Db, ErrorKind, Settings};
     use bytes::Bytes;
     use fail_parallel::fail_point_channel;
@@ -194,6 +196,7 @@ mod tests {
             let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
             let settings = test_db_options();
             let system_clock: Arc<dyn SystemClock> = Arc::new(DefaultSystemClock::new());
+            let fp_registry = Arc::new(FailPointRegistry::new());
             let manifest_store =
                 Arc::new(ManifestStore::new(&Path::from(path), object_store.clone()));
             let table_store = Arc::new(TableStore::new(
@@ -204,6 +207,13 @@ mod tests {
                 TableStoreKind::Main,
                 BlockCachePolicy::default(),
             ));
+            let wal_store = Arc::new(WalTableStore::new_with_fp_registry(
+                Arc::clone(&object_store),
+                SsTableFormat::default(),
+                PathResolver::from_root(path),
+                Arc::clone(&fp_registry),
+                TableStoreKind::Main,
+            ));
             let stored_manifest = StoredManifest::create_new_db(
                 manifest_store.clone(),
                 ManifestCore::new(),
@@ -211,7 +221,6 @@ mod tests {
             )
             .await
             .unwrap();
-            let fp_registry = Arc::new(FailPointRegistry::new());
             let (fp_tx, event_rx) = fail_point_channel(fp_registry.clone());
             let cell = Arc::new(WatchableOnceCell::new());
             let recorder = MetricsRecorderHelper::new(
@@ -225,10 +234,11 @@ mod tests {
             let fencer = WriterFencer::new_with_fp_handle(
                 cell.reader(),
                 recorder,
-                table_store.clone(),
+                wal_store,
                 &settings,
                 system_clock.clone(),
                 task_executor.clone(),
+                None,
                 fp_tx,
             );
             Self {
@@ -307,6 +317,7 @@ mod tests {
                 &MetricsRecorderHelper::noop(),
                 Arc::new(DefaultSystemClock::new()),
                 None,
+                None,
             );
             gc.run_gc_once().await;
             // verify all regular (size > 0) wals up to wal_id are deleted (the wal
@@ -330,7 +341,10 @@ mod tests {
         async fn put(&mut self, db: &Db, v: u32, expect_fenced: bool) {
             let k = Bytes::from(format!("k{}", v));
             let v = Bytes::from(format!("v{}", v));
-            let result = db.put(k.as_ref(), v.as_ref()).await;
+            let result = match db.put(k.as_ref(), v.as_ref()).await {
+                Ok(handle) => handle.await_durable().await,
+                Err(error) => Err(error),
+            };
             if expect_fenced {
                 assert_eq!(
                     result.unwrap_err().kind(),
@@ -601,14 +615,26 @@ mod tests {
         // unpause WriterFencer
         fail_parallel::cfg(h.fp_registry.clone(), case.event, "off").unwrap();
         // verify it returns successfully
-        let result = jh.await.unwrap().unwrap();
+        let mut result = jh.await.unwrap().unwrap();
         // The fencer's stale empty_wal_id was retried above the fenced writer's possibly
         // advanced replay_after_wal_id.
-        assert_eq!(result.replay_range.start, replay_after_wal_id + 1);
+        let first_replayed_wal = result
+            .replay_iterator
+            .next()
+            .await
+            .unwrap()
+            .expect("expected the replay iterator to contain the fencing WAL");
+        assert_eq!(
+            first_replayed_wal.last_consumed_wal_file_id,
+            replay_after_wal_id + 1
+        );
 
         // verify that fenced db is fenced (new write fails)
         use crate::error::{CloseReason, ErrorKind};
-        let err = db.put(b"k4", b"v4").await.unwrap_err();
+        let err = match db.put(b"k4", b"v4").await {
+            Ok(handle) => handle.await_durable().await.unwrap_err(),
+            Err(error) => error,
+        };
         assert!(
             matches!(err.kind(), ErrorKind::Closed(CloseReason::Fenced)),
             "expected Fenced, got {err}"

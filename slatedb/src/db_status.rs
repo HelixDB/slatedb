@@ -1,11 +1,14 @@
 use std::collections::BTreeSet;
+use std::fmt;
+use std::sync::Arc;
 
 use bytes::Bytes;
+use futures::future::BoxFuture;
 use tokio::sync::watch;
 
 use crate::error::SlateDBError;
 use crate::manifest::VersionedManifest;
-use crate::utils::WatchableOnceCell;
+use crate::utils::{WatchableOnceCell, WatchableOnceCellReader};
 use crate::CloseReason;
 
 /// A segment (RFC-0024), identified by the key prefix it owns; the segment
@@ -64,17 +67,27 @@ impl DbStatus {
     }
 }
 
-pub(crate) trait ClosedResultWriter: std::fmt::Debug + Send + Sync + 'static {
+pub(crate) trait ClosedResultWriter: fmt::Debug + Send + Sync + 'static {
     fn write_result(&self, result: Result<(), SlateDBError>);
-    fn result_reader(&self) -> crate::utils::WatchableOnceCellReader<Result<(), SlateDBError>>;
+    fn result_reader(&self) -> WatchableOnceCellReader<Result<(), SlateDBError>>;
 }
 
 /// Manages database lifecycle status, including the close result and
 /// status subscriptions.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct DbStatusManager {
     cell: WatchableOnceCell<Result<(), SlateDBError>>,
     tx: watch::Sender<DbStatus>,
+    durability_waiter: DurabilityWaiter,
+}
+
+impl fmt::Debug for DbStatusManager {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DbStatusManager")
+            .field("cell", &self.cell)
+            .field("tx", &self.tx)
+            .finish_non_exhaustive()
+    }
 }
 
 impl DbStatusManager {
@@ -103,9 +116,13 @@ impl DbStatusManager {
             memtable_segments: initial_memtable_segments,
             close_reason: None,
         });
+        let cell = WatchableOnceCell::new();
+        let durability_waiter = new_durability_waiter(tx.subscribe(), cell.reader());
+
         Self {
-            cell: WatchableOnceCell::new(),
+            cell,
             tx,
+            durability_waiter,
         }
     }
 
@@ -214,6 +231,11 @@ impl DbStatusManager {
         self.tx.subscribe()
     }
 
+    /// Returns the shared [`DurabilityWaiter`] for this database.
+    pub(crate) fn durability_waiter(&self) -> DurabilityWaiter {
+        Arc::clone(&self.durability_waiter)
+    }
+
     pub(crate) fn status(&self) -> DbStatus {
         self.tx.borrow().clone()
     }
@@ -224,7 +246,7 @@ impl ClosedResultWriter for WatchableOnceCell<Result<(), SlateDBError>> {
         self.write(result);
     }
 
-    fn result_reader(&self) -> crate::utils::WatchableOnceCellReader<Result<(), SlateDBError>> {
+    fn result_reader(&self) -> WatchableOnceCellReader<Result<(), SlateDBError>> {
         self.reader()
     }
 }
@@ -240,9 +262,48 @@ impl ClosedResultWriter for DbStatusManager {
         }
     }
 
-    fn result_reader(&self) -> crate::utils::WatchableOnceCellReader<Result<(), SlateDBError>> {
+    fn result_reader(&self) -> WatchableOnceCellReader<Result<(), SlateDBError>> {
         self.cell.reader()
     }
+}
+
+/// Shared callback used by [`crate::WriteHandle`]s to wait for a sequence
+/// number to become durable.
+pub(crate) type DurabilityWaiter =
+    Arc<dyn Fn(u64) -> BoxFuture<'static, Result<(), crate::Error>> + Send + Sync + 'static>;
+
+/// Creates a [`DurabilityWaiter`] backed by database status and close-result
+/// readers.
+///
+/// The waiter captures only readers, so cloning it into a write handle does not
+/// keep the database's status sender alive after the database is dropped.
+fn new_durability_waiter(
+    status_rx: watch::Receiver<DbStatus>,
+    close_result: WatchableOnceCellReader<Result<(), SlateDBError>>,
+) -> DurabilityWaiter {
+    Arc::new(move |seq| -> BoxFuture<'static, Result<(), crate::Error>> {
+        let mut status_rx = status_rx.clone();
+        let close_result = close_result.clone();
+
+        Box::pin(async move {
+            let wait_result = status_rx
+                .wait_for(|status| status.durable_seq >= seq || status.close_reason.is_some())
+                .await;
+
+            match wait_result {
+                Ok(status) if status.durable_seq >= seq => Ok(()),
+                // The write was not durable before the database closed. Use the
+                // recorded close result to preserve fencing and panic errors.
+                Ok(_) | Err(_) => match close_result
+                    .read()
+                    .expect("database closed without recording a close result")
+                {
+                    Ok(()) => Err(SlateDBError::Closed.into()),
+                    Err(error) => Err(error.into()),
+                },
+            }
+        })
+    })
 }
 
 #[cfg(test)]

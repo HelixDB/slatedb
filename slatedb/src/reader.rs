@@ -853,11 +853,10 @@ impl Reader {
     ) -> Result<DbIterator, SlateDBError> {
         self.db_stats.scan_requests.increment(1);
         let max_seq = self.prepare_max_seq(ctx.max_seq, options.durability_filter, options.dirty);
-        let read_ahead_blocks = self.table_store.bytes_to_blocks(options.read_ahead_bytes);
 
         let sst_iter_options = SstIteratorOptions {
             max_fetch_tasks: options.max_fetch_tasks,
-            blocks_to_fetch: read_ahead_blocks,
+            target_bytes_to_fetch: options.read_ahead_bytes,
             cache_blocks: options.cache_blocks,
             cache_metadata: true,
             eager_spawn: true,
@@ -915,12 +914,11 @@ impl Reader {
     ) -> Result<DbRecencyIterator, SlateDBError> {
         self.db_stats.scan_requests.increment(1);
         let max_seq = self.prepare_max_seq(None, options.durability_filter, options.dirty);
-        let read_ahead_blocks = self.table_store.bytes_to_blocks(options.read_ahead_bytes);
 
         let range = BytesRange::from_prefix(prefix.as_ref());
         let sst_iter_options = SstIteratorOptions {
             max_fetch_tasks: options.max_fetch_tasks,
-            blocks_to_fetch: read_ahead_blocks,
+            target_bytes_to_fetch: options.read_ahead_bytes,
             cache_blocks: options.cache_blocks,
             cache_metadata: true,
             // Recency scans are designed for early-stop. Eager spawning would
@@ -1147,17 +1145,11 @@ mod tests {
             }
             let sst_handle = self.build_sst(entries).await?;
 
-            // Find or create the sorted run
-            let tree = Arc::make_mut(&mut self.core.tree);
-            if let Some(sr) = tree.compacted.iter_mut().find(|sr| sr.id == sr_id) {
-                sr.sst_views.push(SsTableView::identity(sst_handle));
-            } else {
-                let new_sr = SortedRun {
-                    id: sr_id,
-                    sst_views: vec![SsTableView::identity(sst_handle)],
-                };
-                tree.compacted.push(new_sr);
-            }
+            // The fixture groups all entries for a run into one SST before
+            // calling this helper, so each run is constructed exactly once.
+            Arc::make_mut(&mut self.core.tree)
+                .compacted
+                .push(SortedRun::new(sr_id, [SsTableView::identity(sst_handle)]));
             Ok(())
         }
 
@@ -1841,7 +1833,7 @@ mod tests {
         let write_batch = populate_db_state(&mut test_db_state, test_case.entries).await?;
 
         // Create Reader with test clock
-        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let recorder = MetricsRecorderHelper::noop();
         let db_stats = DbStats::new(&recorder);
         let test_clock = Arc::new(MockSystemClock::new());
         let mono_clock = Arc::new(MonotonicClock::new(test_clock as Arc<dyn SystemClock>, 0));
@@ -2271,7 +2263,7 @@ mod tests {
         let write_batch = populate_db_state(&mut test_db_state, test_case.entries).await?;
 
         // Create Reader with test clock
-        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let recorder = MetricsRecorderHelper::noop();
         let db_stats = DbStats::new(&recorder);
         let test_clock = Arc::new(MockSystemClock::new());
         let mono_clock = Arc::new(MonotonicClock::new(test_clock as Arc<dyn SystemClock>, 0));
@@ -2550,7 +2542,7 @@ mod tests {
         let mut test_db_state = TestDbState::new().await;
         let write_batch = populate_db_state(&mut test_db_state, entries).await?;
 
-        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let recorder = MetricsRecorderHelper::noop();
         let db_stats = DbStats::new(&recorder);
         let reader = build_reader(&test_db_state, db_stats, false).await;
 
@@ -2597,7 +2589,7 @@ mod tests {
         let mut test_db_state = TestDbState::new().await;
         let write_batch = populate_db_state(&mut test_db_state, entries).await?;
 
-        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let recorder = MetricsRecorderHelper::noop();
         let db_stats = DbStats::new(&recorder);
         let reader = build_reader(&test_db_state, db_stats, false).await;
 
@@ -2663,7 +2655,7 @@ mod tests {
         let mut test_db_state = TestDbState::new().await;
         let write_batch = populate_db_state(&mut test_db_state, entries).await?;
 
-        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let recorder = MetricsRecorderHelper::noop();
         let db_stats = DbStats::new(&recorder);
         let reader = build_reader(&test_db_state, db_stats, true).await;
 
@@ -2703,7 +2695,7 @@ mod tests {
         let mut test_db_state = TestDbState::new().await;
         let write_batch = populate_db_state(&mut test_db_state, entries).await?;
 
-        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let recorder = MetricsRecorderHelper::noop();
         let db_stats = DbStats::new(&recorder);
         let reader = build_reader(&test_db_state, db_stats, true).await;
 

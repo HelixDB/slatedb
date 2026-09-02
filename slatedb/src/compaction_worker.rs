@@ -616,7 +616,13 @@ impl CompactionWorkerHandler {
             let heartbeat_ms = self.clock.now().timestamp_millis() as u64;
             let updated = existing
                 .with_status(CompactionStatus::Compacted)
-                .with_output_ssts(sorted_run.sst_views.iter().map(|v| v.sst.clone()).collect())
+                .with_output_ssts(
+                    sorted_run
+                        .sst_views()
+                        .iter()
+                        .map(|v| v.sst.clone())
+                        .collect(),
+                )
                 .with_worker(Some(WorkerSpec::new(self.worker_id.clone(), heartbeat_ms)))
                 .with_ctx(None);
             dirty.value.insert(updated);
@@ -1114,10 +1120,7 @@ mod tests {
                 ..SsTableInfo::default()
             },
         );
-        let sorted_run = SortedRun {
-            id: 0,
-            sst_views: vec![SsTableView::identity(output_handle.clone())],
-        };
+        let sorted_run = SortedRun::new(0, [SsTableView::identity(output_handle.clone())]);
 
         fx.handler
             .handle_finished(id, Ok(sorted_run))
@@ -1373,13 +1376,13 @@ mod tests {
         let (tx, rx) = async_channel::unbounded::<WorkerMessage>();
         let executor: Arc<dyn CompactionExecutor + Send + Sync> = Arc::new(
             TokioCompactionExecutor::new(TokioCompactionExecutorOptions {
-                handle: tokio::runtime::Handle::current(),
+                handle: Handle::current(),
                 options: options.clone(),
                 worker_tx: tx,
                 table_store: table_store.clone(),
                 rand: Arc::new(DbRand::new(100u64)),
                 stats: {
-                    let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+                    let recorder = MetricsRecorderHelper::noop();
                     Arc::new(CompactionStats::new(&recorder))
                 },
                 worker_stats: WorkerStats::noop(),
@@ -1425,7 +1428,7 @@ mod tests {
                 COMPACTION_WORKER_TASK_NAME.to_string(),
                 Box::new(handler),
                 rx,
-                &tokio::runtime::Handle::current(),
+                &Handle::current(),
             )
             .unwrap();
         let worker = CompactionWorker::new(task_executor);

@@ -315,9 +315,7 @@ impl DbIterator {
         match entry_opt {
             Some(entry) => {
                 if entry.value.is_tombstone() {
-                    return Err(crate::Error::from(
-                        crate::error::SlateDBError::UnexpectedTombstone,
-                    ));
+                    return Err(crate::Error::from(SlateDBError::UnexpectedTombstone));
                 }
                 Ok(Some(KeyValue::from(entry)))
             }
@@ -331,7 +329,10 @@ impl DbIterator {
             Err(error)
         } else {
             let result = loop {
-                match self.iter.next().await {
+                let next = self.iter.next().await;
+                // Keep cached iteration cooperative.
+                tokio::task::coop::consume_budget().await;
+                match next {
                     Ok(Some(entry)) => match entry.value {
                         ValueDeletable::Tombstone => continue,
                         _ => break Ok(Some(entry)),
@@ -470,7 +471,10 @@ impl DbRecencyIterator {
                 self.current_initialized = true;
             }
 
-            match iter.next().await {
+            let next = iter.next().await;
+            // Keep cached iteration cooperative.
+            tokio::task::coop::consume_budget().await;
+            match next {
                 Ok(Some(entry)) => return Ok(Some(entry)),
                 Ok(None) => {
                     self.iters.pop_front();

@@ -526,8 +526,8 @@ impl Compaction {
         let mut sst_views = self.get_l0_sst_views(db_state);
         sst_views.extend(
             self.get_sorted_runs(db_state)
-                .into_iter()
-                .flat_map(|sr| sr.sst_views),
+                .iter()
+                .flat_map(|sr| sr.sst_views().iter().cloned()),
         );
         sst_views.sort_by(|left, right| {
             left.compacted_effective_range()
@@ -542,10 +542,7 @@ impl Compaction {
                     .intersect(pair[1].compacted_effective_range())
                     .is_none()
             }))
-        .then_some(SortedRun {
-            id: destination,
-            sst_views,
-        })
+        .then_some(SortedRun::new(destination, sst_views))
     }
 
     /// The stable id (ULID) used to track this compaction across messages and attempts.
@@ -681,9 +678,9 @@ impl CompactionsCore {
         self
     }
 
-    /// Returns an iterator over all recent compactions. Recent compactions include all
-    /// active (submitted or running) compactions as well as the most recently finished
-    /// compaction (failed or completed).
+    /// Returns all compactions retained in this state. Persisted state contains all active
+    /// compactions and the most recently finished one. Process-local state may also retain
+    /// older terminal entries until its next successful write.
     pub(crate) fn recent_compactions(&self) -> impl Iterator<Item = &Compaction> {
         self.recent_compactions.values()
     }
@@ -804,8 +801,8 @@ impl Compactions {
         let latest_finished = self
             .core
             .recent_compactions
-            .iter()
-            .filter_map(|(_, c)| {
+            .values()
+            .filter_map(|c| {
                 if c.status().finished() {
                     Some(c.id())
                 } else {
@@ -824,7 +821,8 @@ impl Compactions {
 ///
 /// This is the in-memory view that a single compactor task uses to:
 /// - keep a fresh `DirtyManifest` (view of `CoreDbState`),
-/// - track in-flight compactions by id (ULID).
+/// - track in-flight compactions by id (ULID), and
+/// - retain terminal tombstones until their `.compactions` write succeeds.
 pub struct CompactorState {
     manifest: DirtyObject<Manifest>,
     compactions: DirtyObject<Compactions>,
@@ -921,11 +919,11 @@ impl CompactorState {
         // For compactions not in local state (Vacant), accept new submissions,
         // worker-completed results, and retained terminal entries. On a write
         // conflict, the retry path reloads and merges the persisted `.compactions`
-        // object before writing again. At that point, local state may already have
-        // committed or pruned an entry while persisted state still contains an older
-        // Compacted/Completed/Failed view. Insert those entries, let the commit path
-        // resolve stale Compacted entries via `validate_compaction`, and let the compactions
-        // write path resolve stale terminal entries via `retain_active_and_last_finished`.
+        // object before writing again. Process-local terminal entries are deliberately
+        // retained until that write succeeds, so an older remote state for the same id
+        // is treated as a stale transition rather than resurrected as active work.
+        // Insert genuinely absent entries and let the commit path resolve stale
+        // Compacted entries via `validate_compaction`.
         //
         // Scheduled/Running are different: they carry no finished output and require prior
         // coordinator ownership, so seeing them absent from local state remains anomalous.
@@ -963,11 +961,10 @@ impl CompactorState {
             }
         }
 
-        let mut merged_compactions = Compactions {
+        let merged_compactions = Compactions {
             compactor_epoch: self.compactions.value.compactor_epoch,
             core: CompactionsCore::new().with_compactions(merged),
         };
-        merged_compactions.retain_active_and_last_finished();
         remote_compactions.value = merged_compactions;
         self.set_compactions(remote_compactions);
     }
@@ -1053,7 +1050,13 @@ impl CompactorState {
         Ok(())
     }
 
-    /// Mutates a compaction in place if it exists, then trims retained state.
+    /// Mutates a compaction in place if it exists.
+    ///
+    /// Terminal entries remain in process-local state until the next successful
+    /// `.compactions` write. They act as tombstones during conflict retries so
+    /// an older persisted `Submitted` or `Compacted` record cannot be resurrected.
+    /// The persisted value is still trimmed by
+    /// [`crate::compactor_state_protocols::CompactorStateWriter`].
     pub(crate) fn update_compaction<F>(&mut self, compaction_id: &Ulid, f: F)
     where
         F: FnOnce(&mut Compaction),
@@ -1067,7 +1070,6 @@ impl CompactorState {
         {
             f(compaction);
         }
-        self.compactions.value.retain_active_and_last_finished();
     }
 
     /// Applies the effects of a finished compaction to the in-memory manifest.
@@ -1310,10 +1312,8 @@ mod tests {
         let sr_last = bounded_sst_view(3, b"z", b"z");
         let mut db_state = ManifestCore::new();
         Arc::make_mut(&mut db_state.tree).l0 = VecDeque::from([l0.clone()]);
-        Arc::make_mut(&mut db_state.tree).compacted = vec![SortedRun {
-            id: 1,
-            sst_views: vec![sr_first.clone(), sr_last.clone()],
-        }];
+        Arc::make_mut(&mut db_state.tree).compacted =
+            vec![SortedRun::new(1, [sr_first.clone(), sr_last.clone()])];
         let compaction = Compaction::new(
             Ulid::new(),
             CompactionSpec::new(vec![SstView(l0.id), SourceId::SortedRun(1)], 2),
@@ -1326,7 +1326,7 @@ mod tests {
         assert_eq!(output.id, 2);
         assert_eq!(
             output
-                .sst_views
+                .sst_views()
                 .iter()
                 .map(|view| view.id)
                 .collect::<Vec<_>>(),
@@ -1340,10 +1340,7 @@ mod tests {
         let sr_view = bounded_sst_view(2, b"m", b"z");
         let mut db_state = ManifestCore::new();
         Arc::make_mut(&mut db_state.tree).l0 = VecDeque::from([l0.clone()]);
-        Arc::make_mut(&mut db_state.tree).compacted = vec![SortedRun {
-            id: 1,
-            sst_views: vec![sr_view],
-        }];
+        Arc::make_mut(&mut db_state.tree).compacted = vec![SortedRun::new(1, [sr_view])];
         let compaction = Compaction::new(
             Ulid::new(),
             CompactionSpec::new(vec![SstView(l0.id), SourceId::SortedRun(1)], 2),
@@ -1664,11 +1661,7 @@ mod tests {
             .expect("failed to add compaction");
 
         // when:
-        let compacted_ssts = before_compaction.tree.l0.iter().cloned().collect();
-        let sr = SortedRun {
-            id: 0,
-            sst_views: compacted_ssts,
-        };
+        let sr = SortedRun::new(0, before_compaction.tree.l0.iter().cloned());
         state.finish_compaction(compaction_id, sr.clone());
 
         // then:
@@ -1679,14 +1672,14 @@ mod tests {
         assert_eq!(state.db_state().tree.l0.len(), 0);
         assert_eq!(state.db_state().tree.compacted.len(), 1);
         assert_eq!(state.db_state().tree.compacted.first().unwrap().id, sr.id);
-        let expected_ids: Vec<SsTableId> = sr.sst_views.iter().map(|h| h.sst.id).collect();
+        let expected_ids: Vec<SsTableId> = sr.sst_views().iter().map(|h| h.sst.id).collect();
         let found_ids: Vec<SsTableId> = state
             .db_state()
             .tree
             .compacted
             .first()
             .unwrap()
-            .sst_views
+            .sst_views()
             .iter()
             .map(|h| h.sst.id)
             .collect();
@@ -1728,10 +1721,7 @@ mod tests {
             .add_compaction(Compaction::new(compaction_id, spec))
             .expect("failed to add compaction");
 
-        let sr = SortedRun {
-            id: 0,
-            sst_views: before_compaction.tree.l0.iter().cloned().collect(),
-        };
+        let sr = SortedRun::new(0, before_compaction.tree.l0.iter().cloned());
         state.finish_compaction(compaction_id, sr);
 
         let external_dbs = &state.manifest().value.external_dbs;
@@ -1762,11 +1752,7 @@ mod tests {
             .expect("failed to add compaction");
 
         // when:
-        let compacted_ssts = before_compaction.tree.l0.iter().cloned().collect();
-        let sr = SortedRun {
-            id: 0,
-            sst_views: compacted_ssts,
-        };
+        let sr = SortedRun::new(0, before_compaction.tree.l0.iter().cloned());
         state.finish_compaction(compaction_id, sr);
 
         // then:
@@ -1851,10 +1837,7 @@ mod tests {
             .expect("failed to add compaction");
         state.finish_compaction(
             compaction_id,
-            SortedRun {
-                id: 0,
-                sst_views: vec![original_l0s.back().unwrap().clone()],
-            },
+            SortedRun::new(0, [original_l0s.back().unwrap().clone()]),
         );
         // open a new db and write another l0
         let db = build_db(os.clone(), rt.handle());
@@ -1918,10 +1901,7 @@ mod tests {
             .expect("failed to add compaction");
         state.finish_compaction(
             compaction_id,
-            SortedRun {
-                id: 0,
-                sst_views: original_l0s.clone().into(),
-            },
+            SortedRun::new(0, original_l0s.iter().cloned()),
         );
         assert_eq!(state.db_state().tree.l0.len(), 0);
         // open a new db and write another l0
@@ -2140,7 +2120,7 @@ mod tests {
         let original_l0s = &state.db_state().clone().tree.l0;
         let original_srs = &state.db_state().clone().tree.compacted;
         // L0: from 4th onward (index > 2)
-        let l0_sources = original_l0s.iter().skip(3).map(|h| SourceId::SstView(h.id));
+        let l0_sources = original_l0s.iter().skip(3).map(|h| SstView(h.id));
 
         // SRs: first 3 (index < 3)
         let sr_sources = original_srs
@@ -2212,7 +2192,7 @@ mod tests {
     fn sorted_run_to_description(sr: &SortedRun) -> SortedRunDescription {
         SortedRunDescription {
             id: sr.id,
-            ssts: sr.sst_views.iter().map(|h| h.sst.id).collect(),
+            ssts: sr.sst_views().iter().map(|h| h.sst.id).collect(),
         }
     }
 
@@ -2232,7 +2212,7 @@ mod tests {
     }
 
     fn build_l0_compaction(ssts: &VecDeque<SsTableView>, dst: u32) -> CompactionSpec {
-        let sources = ssts.iter().map(|h| SourceId::SstView(h.id)).collect();
+        let sources = ssts.iter().map(|h| SstView(h.id)).collect();
         CompactionSpec::new(sources, dst)
     }
 
@@ -2250,14 +2230,8 @@ mod tests {
         // Add a named segment with two compacted SRs (ids 5 and 3, list-position
         // ordered newest-first as per ManifestCore conventions).
         let prefix = Bytes::from_static(b"hour=12/");
-        let sr5 = SortedRun {
-            id: 5,
-            sst_views: Vec::new(),
-        };
-        let sr3 = SortedRun {
-            id: 3,
-            sst_views: Vec::new(),
-        };
+        let sr5 = SortedRun::new(5, []);
+        let sr3 = SortedRun::new(3, []);
         let segment = Segment {
             prefix: prefix.clone(),
             tree: Arc::new(LsmTreeState {
@@ -2283,10 +2257,7 @@ mod tests {
             .expect("failed to add compaction");
 
         // Finish the compaction with a fresh output SR.
-        let output = SortedRun {
-            id: 7,
-            sst_views: Vec::new(),
-        };
+        let output = SortedRun::new(7, []);
         state.finish_compaction(compaction_id, output);
 
         // The segment's compacted list now holds only the new SR(7).
@@ -2317,10 +2288,7 @@ mod tests {
                 last_compacted_l0_sst_view_id: None,
                 last_compacted_l0_sst_id: None,
                 l0: VecDeque::new(),
-                compacted: vec![SortedRun {
-                    id: 7,
-                    sst_views: Vec::new(),
-                }],
+                compacted: vec![SortedRun::new(7, [])],
             }),
         }];
 
@@ -2333,10 +2301,7 @@ mod tests {
         // Segment dropped after submission, before finish.
         state.manifest.value.core.segments = Vec::new();
 
-        let output = SortedRun {
-            id: 7,
-            sst_views: Vec::new(),
-        };
+        let output = SortedRun::new(7, []);
         state.finish_compaction(compaction_id, output);
 
         let compaction = state
@@ -2358,10 +2323,7 @@ mod tests {
 
         // Seed real sources so the source-isolation check passes for both
         // submissions. Root tree gets SR(99); segment "seg/" gets SR(100).
-        Arc::make_mut(&mut state.manifest.value.core.tree).compacted = vec![SortedRun {
-            id: 99,
-            sst_views: Vec::new(),
-        }];
+        Arc::make_mut(&mut state.manifest.value.core.tree).compacted = vec![SortedRun::new(99, [])];
         let prefix = Bytes::from_static(b"seg/");
         state.manifest.value.core.segments = vec![Segment {
             prefix: prefix.clone(),
@@ -2369,10 +2331,7 @@ mod tests {
                 last_compacted_l0_sst_view_id: None,
                 last_compacted_l0_sst_id: None,
                 l0: VecDeque::new(),
-                compacted: vec![SortedRun {
-                    id: 100,
-                    sst_views: Vec::new(),
-                }],
+                compacted: vec![SortedRun::new(100, [])],
             }),
         }];
 
@@ -2401,10 +2360,7 @@ mod tests {
 
         // Seed SR(7) in the root tree so the source-isolation check passes
         // for the first submission; the spec rewrites that SR (destination=7).
-        Arc::make_mut(&mut state.manifest.value.core.tree).compacted = vec![SortedRun {
-            id: 7,
-            sst_views: Vec::new(),
-        }];
+        Arc::make_mut(&mut state.manifest.value.core.tree).compacted = vec![SortedRun::new(7, [])];
 
         let first_id = rand.rng().gen_ulid(system_clock.as_ref());
         let first = CompactionSpec::new(vec![SourceId::SortedRun(7)], 7);
@@ -2442,13 +2398,13 @@ mod tests {
         }];
 
         let first_id = rand.rng().gen_ulid(system_clock.as_ref());
-        let first = CompactionSpec::drain_segment(prefix.clone(), vec![SourceId::SstView(l0_a.id)]);
+        let first = CompactionSpec::drain_segment(prefix.clone(), vec![SstView(l0_a.id)]);
         state
             .add_compaction(Compaction::new(first_id, first))
             .expect("first drain must register");
 
         let second_id = rand.rng().gen_ulid(system_clock.as_ref());
-        let second = CompactionSpec::drain_segment(prefix, vec![SourceId::SstView(l0_b.id)]);
+        let second = CompactionSpec::drain_segment(prefix, vec![SstView(l0_b.id)]);
         let err = state
             .add_compaction(Compaction::new(second_id, second))
             .expect_err("second drain on same segment must be rejected");
@@ -2488,13 +2444,13 @@ mod tests {
         ];
 
         let first_id = rand.rng().gen_ulid(system_clock.as_ref());
-        let first = CompactionSpec::drain_segment(prefix_a, vec![SourceId::SstView(l0_a.id)]);
+        let first = CompactionSpec::drain_segment(prefix_a, vec![SstView(l0_a.id)]);
         state
             .add_compaction(Compaction::new(first_id, first))
             .expect("first drain must register");
 
         let second_id = rand.rng().gen_ulid(system_clock.as_ref());
-        let second = CompactionSpec::drain_segment(prefix_b, vec![SourceId::SstView(l0_b.id)]);
+        let second = CompactionSpec::drain_segment(prefix_b, vec![SstView(l0_b.id)]);
         state
             .add_compaction(Compaction::new(second_id, second))
             .expect("drain on a different segment must register");
@@ -2520,7 +2476,7 @@ mod tests {
         }];
 
         let compaction_id = rand.rng().gen_ulid(system_clock.as_ref());
-        let spec = CompactionSpec::drain_segment(prefix, vec![SourceId::SstView(l0.id)]);
+        let spec = CompactionSpec::drain_segment(prefix, vec![SstView(l0.id)]);
         state
             .add_compaction(Compaction::new(compaction_id, spec))
             .expect("drain submission must register");
@@ -2559,10 +2515,7 @@ mod tests {
         // Two L0s (newest first) and one SR in the segment.
         let l0_newer = drain_test_view(2);
         let l0_older = drain_test_view(1);
-        let sr = SortedRun {
-            id: 5,
-            sst_views: Vec::new(),
-        };
+        let sr = SortedRun::new(5, []);
         let prefix = Bytes::from_static(b"hour=10/");
         state.manifest.value.core.segments = vec![Segment {
             prefix: prefix.clone(),
@@ -2578,8 +2531,8 @@ mod tests {
         let spec = CompactionSpec::drain_segment(
             prefix.clone(),
             vec![
-                SourceId::SstView(l0_newer.id),
-                SourceId::SstView(l0_older.id),
+                SstView(l0_newer.id),
+                SstView(l0_older.id),
                 SourceId::SortedRun(sr.id),
             ],
         );
@@ -2626,8 +2579,7 @@ mod tests {
         }];
 
         let compaction_id = rand.rng().gen_ulid(system_clock.as_ref());
-        let spec =
-            CompactionSpec::drain_segment(prefix.clone(), vec![SourceId::SstView(l0_observed.id)]);
+        let spec = CompactionSpec::drain_segment(prefix.clone(), vec![SstView(l0_observed.id)]);
         state
             .add_compaction(Compaction::new(compaction_id, spec))
             .expect("drain compaction must register");

@@ -94,8 +94,8 @@ impl Settings {
     /// Examples:
     ///
     /// - `set("flush_interval", "\"250ms\"")`
-    /// - `set("default_ttl", "42")`
-    /// - `set("default_ttl", "null")`
+    /// - `set("default_ttl_millis", "42")`
+    /// - `set("default_ttl_millis", "null")`
     /// - `set("compactor_options.max_sst_size", "33554432")`
     /// - `set("object_store_cache_options.root_folder", "\"/tmp/slatedb-cache\"")`
     pub fn set(&self, key: String, value_json: String) -> Result<(), Error> {
@@ -169,6 +169,7 @@ fn apply_dotted_json_path(root: &mut Value, key: &str, value: Value) -> Result<(
 }
 
 #[cfg(test)]
+#[allow(clippy::result_large_err)]
 mod tests {
     use serde_json::json;
     use std::sync::Arc;
@@ -271,13 +272,13 @@ mod tests {
         let settings = Arc::new(Settings::new(slatedb::Settings::default()));
 
         settings
-            .set("default_ttl".to_owned(), "100".to_owned())
+            .set("default_ttl_millis".to_owned(), "100".to_owned())
             .unwrap();
         settings
-            .set("default_ttl".to_owned(), "null".to_owned())
+            .set("default_ttl_millis".to_owned(), "null".to_owned())
             .unwrap();
 
-        assert_eq!(settings.inner().default_ttl, None);
+        assert_eq!(settings.inner().default_ttl_millis, None);
     }
 
     #[test]
@@ -315,13 +316,13 @@ mod tests {
         let settings = Arc::new(Settings::new(slatedb::Settings::default()));
 
         settings
-            .set("default_ttl".to_owned(), "42".to_owned())
+            .set("default_ttl_millis".to_owned(), "42".to_owned())
             .unwrap();
 
         let encoded = settings.to_json_string().unwrap();
         let decoded = Settings::from_json_string(encoded).unwrap();
 
-        assert_eq!(decoded.inner().default_ttl, Some(42));
+        assert_eq!(decoded.inner().default_ttl_millis, Some(42));
     }
 
     #[test]
@@ -367,7 +368,7 @@ flush_interval = "1s"
     #[test]
     fn settings_from_env_with_default_uses_default_snapshot() {
         figment::Jail::expect_with(|jail| {
-            jail.set_env("FFI_SETTINGS_DEFAULT_TTL", "42");
+            jail.set_env("FFI_SETTINGS_DEFAULT_TTL_MILLIS", "42");
 
             let defaults = Arc::new(Settings::new(slatedb::Settings::default()));
             defaults
@@ -382,7 +383,7 @@ flush_interval = "1s"
                 settings.inner().flush_interval,
                 Some(Duration::from_millis(250))
             );
-            assert_eq!(settings.inner().default_ttl, Some(42));
+            assert_eq!(settings.inner().default_ttl_millis, Some(42));
 
             Ok(())
         });

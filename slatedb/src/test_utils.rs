@@ -368,11 +368,11 @@ where
 pub(crate) async fn seed_database(
     db: &Db,
     table: &BTreeMap<Bytes, Bytes>,
-    await_durable: bool,
+    wait_for_durability: bool,
 ) -> Result<(), crate::Error> {
     let put_options = PutOptions::default();
     let write_options = WriteOptions {
-        await_durable,
+        await_durable: wait_for_durability,
         ..Default::default()
     };
 
@@ -461,10 +461,7 @@ pub(crate) async fn build_sorted_runs(
             let ssts = write_ssts(table_store, entries, max_sst_size).await;
             sr_ssts.extend(ssts.into_iter().map(SsTableView::identity));
         }
-        sorted_runs.push(SortedRun {
-            id: sr_id as u32,
-            sst_views: sr_ssts,
-        });
+        sorted_runs.push(SortedRun::new(sr_id as u32, sr_ssts));
     }
 
     sorted_runs
@@ -571,6 +568,8 @@ pub(crate) struct FlakyObjectStore {
     // get_range: truncate response body to this many bytes on first N attempts (0 = no truncation)
     truncate_get_range_bytes: AtomicUsize,
     truncate_get_range_count: AtomicUsize,
+    // Get: return NotFound on the next N GETs
+    fail_first_get_not_found: AtomicUsize,
 }
 
 impl FlakyObjectStore {
@@ -596,7 +595,12 @@ impl FlakyObjectStore {
             get_range_attempts: AtomicUsize::new(0),
             truncate_get_range_bytes: AtomicUsize::new(0),
             truncate_get_range_count: AtomicUsize::new(0),
+            fail_first_get_not_found: AtomicUsize::new(0),
         }
+    }
+
+    pub(crate) fn with_get_not_found_failures(&self, n: usize) {
+        self.fail_first_get_not_found.store(n, Ordering::SeqCst);
     }
 
     pub(crate) fn with_put_precondition_always(self) -> Self {
@@ -723,7 +727,26 @@ impl ObjectStore for FlakyObjectStore {
         &self,
         location: &Path,
         options: GetOptions,
-    ) -> object_store::Result<object_store::GetResult> {
+    ) -> object_store::Result<GetResult> {
+        if self
+            .fail_first_get_not_found
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                if v > 0 {
+                    Some(v - 1)
+                } else {
+                    None
+                }
+            })
+            .is_ok()
+        {
+            return Err(object_store::Error::NotFound {
+                path: location.to_string(),
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "injected not-found (deleted between LIST and GET)",
+                )),
+            });
+        }
         if options.head {
             self.head_attempts.fetch_add(1, Ordering::SeqCst);
             if self
@@ -786,9 +809,9 @@ impl ObjectStore for FlakyObjectStore {
                 let extensions = result.extensions.clone();
                 let body = result.bytes().await?;
                 let truncated = body.slice(..truncate_bytes.min(body.len()));
-                return Ok(object_store::GetResult {
+                return Ok(GetResult {
                     payload: object_store::GetResultPayload::Stream(
-                        futures::stream::once(async { Ok(truncated) }).boxed(),
+                        stream::once(async { Ok(truncated) }).boxed(),
                     ),
                     meta,
                     range,
@@ -866,7 +889,7 @@ impl ObjectStore for FlakyObjectStore {
     async fn put_multipart_opts(
         &self,
         location: &Path,
-        opts: object_store::PutMultipartOptions,
+        opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
         self.put_multipart_attempts.fetch_add(1, Ordering::SeqCst);
         self.inner.put_multipart_opts(location, opts).await
@@ -1150,7 +1173,7 @@ impl ObjectStore for GatedObjectStore {
         &self,
         location: &Path,
         options: GetOptions,
-    ) -> object_store::Result<object_store::GetResult> {
+    ) -> object_store::Result<GetResult> {
         if options.head {
             self.head_gate.wait().await?;
         } else {
@@ -1172,7 +1195,7 @@ impl ObjectStore for GatedObjectStore {
     async fn put_multipart_opts(
         &self,
         location: &Path,
-        opts: object_store::PutMultipartOptions,
+        opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
         self.put_multipart_opts_gate.wait().await?;
         self.inner.put_multipart_opts(location, opts).await
@@ -1246,7 +1269,7 @@ impl ObjectStore for GatedObjectStore {
         &self,
         from: &Path,
         to: &Path,
-        options: object_store::RenameOptions,
+        options: RenameOptions,
     ) -> object_store::Result<()> {
         self.rename_gate.wait().await?;
         self.inner.rename_opts(from, to, options).await
@@ -1417,6 +1440,35 @@ impl crate::prefix_extractor::PrefixExtractor for FixedThreeBytePrefixExtractor 
     }
 }
 
+/// Test extractor that segments on the leading `data` / `idx` path
+/// component, modelling a store that keeps bulky records in one segment and
+/// a smaller index over them in another. Tenants live in the *next*
+/// component (`data/{tenant}/…`), so a tenant's rows are split across both
+/// segments rather than forming one contiguous key range.
+// Only the union tests in `clone.rs` use this, and those need `wal_disable`.
+#[cfg(feature = "wal_disable")]
+#[derive(Debug)]
+pub(crate) struct DataIdxPrefixExtractor;
+
+#[cfg(feature = "wal_disable")]
+impl crate::prefix_extractor::PrefixExtractor for DataIdxPrefixExtractor {
+    fn name(&self) -> &str {
+        "data-idx"
+    }
+    fn prefix_len(&self, target: &crate::prefix_extractor::PrefixTarget) -> Option<usize> {
+        let key: &[u8] = match target {
+            crate::prefix_extractor::PrefixTarget::Point(b)
+            | crate::prefix_extractor::PrefixTarget::Prefix(b) => b.as_ref(),
+        };
+        for kind in [b"data".as_slice(), b"idx".as_slice()] {
+            if key == kind || key.starts_with(&[kind, b"/".as_slice()].concat()) {
+                return Some(kind.len());
+            }
+        }
+        None
+    }
+}
+
 /// Test extractor that deliberately violates the
 /// [`crate::prefix_extractor::PrefixExtractor`] `Point` invariant by
 /// returning different prefix lengths for keys that share a common
@@ -1574,6 +1626,7 @@ mod tests {
 pub(crate) enum RecordedCall {
     Get {
         head: bool,
+        #[allow(dead_code)]
         range_bytes: Option<u64>,
         kind: Option<TableStoreKind>,
         sst_type: Option<SstType>,
@@ -1647,6 +1700,7 @@ impl RecordingObjectStore {
             .collect()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn get_range_sizes(&self) -> Vec<u64> {
         self.calls
             .lock()
@@ -1661,6 +1715,7 @@ impl RecordingObjectStore {
             .collect()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn list_calls(&self) -> usize {
         self.list_calls.load(Ordering::SeqCst)
     }
@@ -1703,7 +1758,7 @@ impl ObjectStore for RecordingObjectStore {
         &self,
         location: &Path,
         options: GetOptions,
-    ) -> object_store::Result<object_store::GetResult> {
+    ) -> object_store::Result<GetResult> {
         let tag = ObjectStoreCallTag::from_extensions(&options.extensions);
         self.calls.lock().push(RecordedCall::Get {
             head: options.head,
@@ -1735,7 +1790,7 @@ impl ObjectStore for RecordingObjectStore {
     async fn put_multipart_opts(
         &self,
         location: &Path,
-        opts: object_store::PutMultipartOptions,
+        opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
         let tag = ObjectStoreCallTag::from_extensions(&opts.extensions);
         self.calls.lock().push(RecordedCall::PutMultipart {

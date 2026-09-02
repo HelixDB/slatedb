@@ -48,6 +48,11 @@ impl DisjointMergeBatchEntry {
 /// configurable isolation levels. This is the main interface for transactional
 /// operations in SlateDB.
 ///
+/// Committing a non-empty transaction returns a [`WriteHandle`] without
+/// waiting for durability. Call [`WriteHandle::await_durable`] on that handle
+/// to wait for that commit, or call [`crate::Db::flush`] to flush all pending
+/// writes.
+///
 /// # Examples
 ///
 /// Basic transaction usage:
@@ -260,7 +265,7 @@ impl DbTransaction {
 
         let db_state = self.db_inner.state.read().view();
 
-        let mut key_to_idx = std::collections::HashMap::<Bytes, usize>::with_capacity(keys.len());
+        let mut key_to_idx = HashMap::<Bytes, usize>::with_capacity(keys.len());
         let mut unique_keys = Vec::<Bytes>::with_capacity(keys.len());
         let mut output_positions = Vec::<Vec<usize>>::with_capacity(keys.len());
 
@@ -1101,10 +1106,14 @@ impl DbTransaction {
 
     /// Commit the transaction by applying all buffered operations to the database.
     ///
-    /// This method finalizes the transaction by writing all pending puts, deletes, and other
-    /// operations from the write batch to persistent storage. The actual conflict detection
-    /// (including read-write and write-write conflicts) is deferred to the task that processes
-    /// the WriteBatch, which ensures the atomicity of transactions.
+    /// This method finalizes the transaction by writing all pending puts,
+    /// deletes, and other operations from the write batch to the in-memory WAL
+    /// and MemTable. The actual conflict detection (including read-write and
+    /// write-write conflicts) is deferred to the task that processes the
+    /// WriteBatch, which ensures the atomicity of transactions.
+    ///
+    /// The default write options wait for a successful commit to become
+    /// durable in object storage.
     ///
     /// If the transaction's write batch is empty, this operation is a no-op and returns `Ok(())`
     /// immediately without any database interaction. Since it's impossible to have read-write
@@ -1125,7 +1134,12 @@ impl DbTransaction {
     /// Commit the transaction with custom write options.
     ///
     /// This method behaves the same as [`DbTransaction::commit`], but allows callers
-    /// to specify custom [`WriteOptions`], such as `await_durable`.
+    /// to specify custom [`WriteOptions`].
+    ///
+    /// Durability behavior is controlled by [`WriteOptions::await_durable`].
+    /// When it is `false`, call [`WriteHandle::await_durable`] on the returned
+    /// handle when the result is `Some`, or call [`crate::Db::flush`] to flush
+    /// all pending writes.
     ///
     /// ## Arguments
     /// - `options`: the write options to use for the commit
@@ -1411,6 +1425,7 @@ mod tests {
     use crate::merge_operator::{MergeOperator, MergeOperatorError};
     use crate::object_store::memory::InMemory;
     use rstest::rstest;
+    use std::mem::size_of;
     use std::sync::Arc;
 
     struct CounterMergeOperator;
@@ -2068,14 +2083,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn test_txn_commit_await_durable_false() {
+    async fn test_txn_commit_returns_before_durable() {
         use crate::config::{DurabilityLevel::*, ReadOptions, WriteOptions};
         use fail_parallel::FailPointRegistry;
 
         // Setup database with failpoints to pause durable writes
         let fp_registry = Arc::new(FailPointRegistry::new());
         let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let db = crate::Db::builder("/tmp/test_txn_commit_await_durable_false", object_store)
+        let db = crate::Db::builder("/tmp/test_txn_commit_returns_before_durable", object_store)
             .with_fp_registry(fp_registry.clone())
             .build()
             .await
@@ -2088,7 +2103,7 @@ mod tests {
         let txn = db.begin(IsolationLevel::Snapshot).await.unwrap();
         txn.put(b"k", b"v").unwrap();
 
-        // Commit without waiting for durability
+        // Commits return without waiting for durability.
         txn.commit_with_options(&WriteOptions {
             await_durable: false,
             ..Default::default()
@@ -3223,7 +3238,7 @@ mod tests {
         let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let clock = Arc::new(MockSystemClock::new());
         let settings = crate::config::Settings {
-            default_ttl: Some(10),
+            default_ttl_millis: Some(10),
             ..Default::default()
         };
         let db = crate::Db::builder("disjoint_no_default_ttl", object_store)
@@ -3272,8 +3287,8 @@ mod tests {
         let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let metrics = Arc::new(DefaultMetricsRecorder::new());
         let settings = crate::config::Settings {
-            max_transaction_conflict_metadata_bytes: core::mem::size_of::<u128>(),
-            max_retained_conflict_metadata_bytes: 2 * core::mem::size_of::<u128>(),
+            max_transaction_conflict_metadata_bytes: size_of::<u128>(),
+            max_retained_conflict_metadata_bytes: 2 * size_of::<u128>(),
             ..Default::default()
         };
         let db = crate::Db::builder("disjoint_metadata_limits", object_store)
@@ -3294,7 +3309,7 @@ mod tests {
             txn.commit().await.unwrap();
             assert_eq!(
                 lookup_metric(&metrics, crate::db_stats::CONFLICT_METADATA_RETAINED_BYTES),
-                Some(((ordinal + 1) * core::mem::size_of::<u128>()) as i64)
+                Some(((ordinal + 1) * size_of::<u128>()) as i64)
             );
             assert_eq!(
                 lookup_metric(&metrics, crate::db_stats::CONFLICT_METADATA_RETAINED_TOKENS),
@@ -3732,7 +3747,7 @@ mod tests {
             b"counter",
             1u64.to_le_bytes(),
             &MergeOptions {
-                ttl: crate::config::Ttl::ExpireAfter(3600),
+                ttl: crate::config::Ttl::ExpireAfterMillis(3600),
             },
         )
         .unwrap();
@@ -3740,7 +3755,7 @@ mod tests {
             b"counter",
             2u64.to_le_bytes(),
             &MergeOptions {
-                ttl: crate::config::Ttl::ExpireAfter(7200),
+                ttl: crate::config::Ttl::ExpireAfterMillis(7200),
             },
         )
         .unwrap();
@@ -3781,7 +3796,7 @@ mod tests {
             object_store_cache_options: crate::config::ObjectStoreCacheOptions::default(),
             garbage_collector_options: None,
             metric_level: MetricLevel::default(),
-            default_ttl: None,
+            default_ttl_millis: None,
             max_transaction_conflict_metadata_bytes:
                 crate::config::DEFAULT_MAX_TRANSACTION_CONFLICT_METADATA_BYTES,
             max_retained_conflict_metadata_bytes:
@@ -3824,7 +3839,7 @@ mod tests {
         clock.set(200);
         let txn = db.begin(IsolationLevel::Snapshot).await.unwrap();
         let put_opts = PutOptions {
-            ttl: crate::config::Ttl::ExpireAfter(1000),
+            ttl: crate::config::Ttl::ExpireAfterMillis(1000),
         };
         txn.put_with_options(b"key2", b"value2", &put_opts).unwrap();
         let handle = txn

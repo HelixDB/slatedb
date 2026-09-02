@@ -53,13 +53,13 @@ fn concat_merge_operator() -> Arc<dyn MergeOperator + Send + Sync> {
 
 fn put_options() -> PutOptions {
     PutOptions {
-        ttl: Ttl::ExpireAfter(3_600),
+        ttl: Ttl::ExpireAfterMillis(3_600_000),
     }
 }
 
 fn merge_options() -> MergeOptions {
     MergeOptions {
-        ttl: Ttl::ExpireAfter(3_600),
+        ttl: Ttl::ExpireAfterMillis(3_600_000),
     }
 }
 
@@ -76,7 +76,7 @@ fn key(index: usize) -> Bytes {
 
 fn value(index: usize) -> Bytes {
     let mut value = vec![0; VALUE_SIZE];
-    value[..std::mem::size_of::<usize>()].copy_from_slice(&index.to_le_bytes());
+    value[..size_of::<usize>()].copy_from_slice(&index.to_le_bytes());
     Bytes::from(value)
 }
 

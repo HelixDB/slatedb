@@ -4,16 +4,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::db_state::SsTableId;
+use self::stats::WalBufferStats;
 use crate::dispatcher::{MessageHandler, MessageHandlerExecutor, MessageTickerDef};
 use crate::error::SlateDBError;
-use crate::tablestore::TableStore;
 use crate::types::RowEntry;
 use crate::utils::SafeSender;
-use crate::utils::{format_bytes_si, WatchableOnceCell, WatchableOnceCellReader};
+use crate::utils::{format_bytes_si, WatchableOnceCellReader};
 use crate::wal;
 use crate::wal::{FlushResultFuture, WalError, WalEvent, WalStatus, WalWriter};
-use crate::wal_buffer_stats::WalBufferStats;
 use async_trait::async_trait;
 use futures::{stream::BoxStream, FutureExt, StreamExt};
 use log::{error, trace, warn};
@@ -21,9 +19,11 @@ use slatedb_common::metrics::MetricsRecorderHelper;
 use tokio::{runtime::Handle, sync::oneshot};
 use tracing::instrument;
 
+use super::store::WalTableStore;
+
 pub(crate) const WAL_BUFFER_TASK_NAME: &str = "wal_writer";
 
-/// [`WalBufferManager`] buffers write operations in memory before flushing them to persistent storage.
+/// [`SlateDbWalWriter`] buffers write operations in memory before flushing them to persistent storage.
 /// The flush operation only targets Remote storage right now, later we can add an option to flush to local
 /// storage.
 ///
@@ -33,8 +33,10 @@ pub(crate) const WAL_BUFFER_TASK_NAME: &str = "wal_writer";
 ///
 /// - `max_wal_size`: Flushes when `max_wal_size` bytes is exceeded
 /// - `max_flush_interval`: Flushes after `max_flush_interval` elapses, if set
+/// - `max_wal_flushes_before_l0_flush`: Requests a memtable flush when this many WAL files have
+///   been flushed since the latest memtable replay point
 ///
-/// For strict durability requirements on synchronous writes, use [`WalBufferManager::flush()`] to explicitly
+/// For strict durability requirements on synchronous writes, use [`SlateDbWalWriter::flush()`] to explicitly
 /// trigger a flush operation and await the result. This will flush ALL the in memory WALs (including the
 /// current WAL) to remote storage.
 ///
@@ -46,11 +48,12 @@ pub(crate) const WAL_BUFFER_TASK_NAME: &str = "wal_writer";
 ///   guaranteed to be written atomically to the same WAL file.
 /// - Fatal errors during flush operations are stored internally and propagated to all subsequent
 ///   operations. The manager becomes unusable after encountering a fatal error.
-pub(crate) struct WalBufferManager {
-    inner: Arc<parking_lot::RwLock<WalBufferManagerInner>>,
+pub(crate) struct SlateDbWalWriter {
+    inner: Arc<parking_lot::RwLock<SlateDbWalWriterInner>>,
     stats: Arc<WalBufferStats>,
-    table_store: Arc<TableStore>,
+    table_store: Arc<WalTableStore>,
     max_wal_bytes_size: usize,
+    max_wal_flushes_before_l0_flush: u64,
     max_replay_block_bytes: usize,
     /// The largest flush_epoch for which a size-triggered flush request has been
     /// sent. Compared against `flush_epoch` in the inner struct to avoid sending
@@ -60,7 +63,7 @@ pub(crate) struct WalBufferManager {
     task_executor: Arc<MessageHandlerExecutor>,
 }
 
-struct WalBufferManagerInner {
+struct SlateDbWalWriterInner {
     current_wal: WalBuffer,
     /// When the current WAL is ready to be flushed, it'll be moved to the `immutable_wals`.
     /// The flusher will try flush all the immutable wals to remote storage.
@@ -93,8 +96,6 @@ struct WalBufferManagerInner {
 struct WalBuffer {
     /// queue for the entries
     entries: VecDeque<RowEntry>,
-    /// watcher to await durability
-    durable: WatchableOnceCell<Result<(), SlateDBError>>,
     /// the sequence number of the most recent addition to this WAL buffer
     last_seq: u64,
     /// size of the entries that has been added to the WAL buffer in bytes
@@ -107,13 +108,14 @@ struct WalBufferIterator {
     entries: std::vec::IntoIter<RowEntry>,
 }
 
-impl WalBufferManager {
+impl SlateDbWalWriter {
     pub(crate) async fn start_new(
         closed_result_reader: WatchableOnceCellReader<Result<(), SlateDBError>>,
         recorder: &MetricsRecorderHelper,
         last_flushed_wal_id: u64,
-        table_store: Arc<TableStore>,
+        table_store: Arc<WalTableStore>,
         max_wal_bytes_size: usize,
+        max_wal_flushes_before_l0_flush: u64,
         max_replay_metadata_bytes: usize,
         max_replay_block_bytes: usize,
         max_flush_interval: Option<Duration>,
@@ -122,7 +124,7 @@ impl WalBufferManager {
         let current_wal = WalBuffer::new();
         let immutable_wals = VecDeque::new();
         let (flush_tx, flush_rx) = SafeSender::unbounded_channel(closed_result_reader);
-        let inner = WalBufferManagerInner {
+        let inner = SlateDbWalWriterInner {
             current_wal,
             immutable_wals,
             flush_epoch: 1,
@@ -154,26 +156,24 @@ impl WalBufferManager {
             stats,
             table_store,
             max_wal_bytes_size,
+            max_wal_flushes_before_l0_flush,
             max_replay_block_bytes,
             last_flush_requested_epoch: AtomicU64::new(0),
             task_executor,
         })
     }
 
-    //TODO: do we still need durable watchers here?
     /// Check if we need to flush the wal with considering max_wal_size. the checking over `max_wal_size`
     /// is not very strict, we have to ensure a write batch into a single WAL file.
     ///
     /// It's the caller's duty to call `maybe_trigger_flush` after calling `append`.
-    fn maybe_trigger_flush(
-        &self,
-    ) -> Result<WatchableOnceCellReader<Result<(), SlateDBError>>, WalError> {
-        let (durable_watcher, need_flush, flush_epoch) = {
+    fn maybe_trigger_flush(&self) -> Result<(), WalError> {
+        let (need_flush, flush_epoch) = {
             let inner = self.inner.read();
             // checks the size of the current wal
             let (need_flush, flush_epoch) =
                 inner.needs_flush(&self.table_store, self.max_wal_bytes_size);
-            (inner.current_wal.durable_watcher(), need_flush, flush_epoch)
+            (need_flush, flush_epoch)
         };
         if need_flush {
             // Only send a flush request if one hasn't already been sent for this epoch.
@@ -193,7 +193,7 @@ impl WalBufferManager {
         self.stats
             .estimated_bytes
             .set(status.estimated_bytes as i64);
-        Ok(durable_watcher)
+        Ok(())
     }
 
     /// Send a flush request to the background flush worker.
@@ -209,7 +209,7 @@ impl WalBufferManager {
 }
 
 #[async_trait]
-impl WalWriter for WalBufferManager {
+impl WalWriter for SlateDbWalWriter {
     fn status(&self) -> Result<WalStatus, WalStatus> {
         self.inner.read().status(&self.table_store)
     }
@@ -240,8 +240,16 @@ impl WalWriter for WalBufferManager {
         Ok(())
     }
 
+    fn should_flush_memtable(&self, replay_after_wal_id: u64) -> bool {
+        let last_flushed_wal_id = self.inner.read().last_flushed_wal_id;
+        let Some(wal_id_gap) = last_flushed_wal_id.checked_sub(replay_after_wal_id) else {
+            return false;
+        };
+        wal_id_gap >= self.max_wal_flushes_before_l0_flush
+    }
+
     fn observer(&self) -> Box<dyn wal::WalObserver> {
-        Box::new(WalObserver {
+        Box::new(SlateDbWalObserver {
             inner: self.inner.clone(),
             table_store: self.table_store.clone(),
         })
@@ -268,12 +276,12 @@ impl WalWriter for WalBufferManager {
         };
         self.inner
             .write()
-            .drain_on_close(WalError::Closed, &self.table_store);
+            .mark_closed(WalError::Closed, &self.table_store);
         Ok(())
     }
 }
 
-impl WalBufferManagerInner {
+impl SlateDbWalWriterInner {
     fn check_exited(&self) -> Result<(), WalError> {
         match self.flush_task_exited_reason.as_ref() {
             Some(err) => Err(err.clone()),
@@ -299,10 +307,10 @@ impl WalBufferManagerInner {
         Ok(())
     }
 
-    fn needs_flush(&self, table_store: &TableStore, max_wal_bytes_size: usize) -> (bool, u64) {
+    fn needs_flush(&self, table_store: &WalTableStore, max_wal_bytes_size: usize) -> (bool, u64) {
         // check the size of the current wal
         let current_wal_size =
-            table_store.estimate_encoded_size_wal(self.current_wal.len(), self.current_wal.size());
+            table_store.estimate_encoded_size(self.current_wal.len(), self.current_wal.size());
         trace!(
             "checking flush trigger [current_wal_size={}, max_wal_bytes_size={}]",
             format_bytes_si(current_wal_size as u64),
@@ -323,18 +331,18 @@ impl WalBufferManagerInner {
     }
 
     /// Returns the total size of all unflushed WALs in bytes.
-    fn estimated_bytes(&self, table_store: &TableStore) -> usize {
+    fn estimated_bytes(&self, table_store: &WalTableStore) -> usize {
         let current_wal_size =
-            table_store.estimate_encoded_size_wal(self.current_wal.len(), self.current_wal.size());
+            table_store.estimate_encoded_size(self.current_wal.len(), self.current_wal.size());
         let imm_wal_size = self
             .immutable_wals
             .iter()
-            .map(|(_, wal)| table_store.estimate_encoded_size_wal(wal.len(), wal.size()))
+            .map(|(_, wal)| table_store.estimate_encoded_size(wal.len(), wal.size()))
             .sum::<usize>();
         current_wal_size + imm_wal_size
     }
 
-    fn status(&self, table_store: &TableStore) -> Result<WalStatus, WalStatus> {
+    fn status(&self, table_store: &WalTableStore) -> Result<WalStatus, WalStatus> {
         let status = self.compute_status(table_store);
         if status.closed_reason.is_none() {
             Ok(status)
@@ -343,7 +351,7 @@ impl WalBufferManagerInner {
         }
     }
 
-    fn compute_status(&self, table_store: &TableStore) -> WalStatus {
+    fn compute_status(&self, table_store: &WalTableStore) -> WalStatus {
         let flushing_wal_entries_count = self
             .immutable_wals
             .iter()
@@ -359,17 +367,11 @@ impl WalBufferManagerInner {
         }
     }
 
-    fn drain_on_close(
-        &mut self,
-        reason: WalError,
-        table_store: &TableStore,
-    ) -> (WalStatus, Vec<(u64, Arc<WalBuffer>)>) {
+    fn mark_closed(&mut self, reason: WalError, table_store: &WalTableStore) -> WalStatus {
         self.flush_task_exited_reason = Some(reason);
         self.freeze_current_wal();
-        let unflushed_wals = self.flushing_wals();
         self.immutable_wals.clear();
-        let status = self.compute_status(table_store);
-        (status, unflushed_wals)
+        self.compute_status(table_store)
     }
 
     fn freeze_current_wal(&mut self) {
@@ -401,7 +403,7 @@ impl WalBufferManagerInner {
         self.last_flushed_wal_id = flushed_wal_id;
         if let Some(seq) = flushed_wal.last_seq() {
             if let Some(last_flushed_seq) = self.last_flushed_seq {
-                assert!(seq >= last_flushed_seq);
+                assert!(seq > last_flushed_seq);
             }
             self.last_flushed_seq = Some(seq);
         }
@@ -413,7 +415,6 @@ impl WalBuffer {
     fn new() -> Self {
         Self {
             entries: VecDeque::new(),
-            durable: WatchableOnceCell::new(),
             last_seq: 0,
             entries_size: 0,
         }
@@ -428,22 +429,6 @@ impl WalBuffer {
     /// Returns an iterator to iterate over the entries.
     fn iter(&self) -> WalBufferIterator {
         WalBufferIterator::new(self)
-    }
-
-    /// Returns a watcher that can be used to await durability.
-    fn durable_watcher(&self) -> WatchableOnceCellReader<Result<(), SlateDBError>> {
-        self.durable.reader()
-    }
-
-    /// Awaits until the WAL is durable (flushed to storage).
-    #[cfg(test)]
-    async fn await_durable(&self) -> Result<(), SlateDBError> {
-        self.durable.reader().await_value().await
-    }
-
-    /// Notifies that the WAL has been made durable (or failed).
-    fn notify_durable(&self, result: Result<(), SlateDBError>) {
-        self.durable.write(result);
     }
 
     /// Returns true if the buffer is empty.
@@ -508,8 +493,8 @@ struct WalFlushHandler {
     max_flush_interval: Option<Duration>,
     max_replay_metadata_bytes: usize,
     max_replay_block_bytes: usize,
-    inner: Arc<parking_lot::RwLock<WalBufferManagerInner>>,
-    table_store: Arc<TableStore>,
+    inner: Arc<parking_lot::RwLock<SlateDbWalWriterInner>>,
+    table_store: Arc<WalTableStore>,
     stats: Arc<WalBufferStats>,
     listener: Option<wal::WalStatusListener>,
 }
@@ -540,18 +525,11 @@ impl WalFlushHandler {
                 inner.compute_status(&self.table_store)
             };
 
-            // we notify the listener first since that updates the oracle, and then notify
-            // the table waiters. blocked writes wait on the table, so we have to update the oracle
-            // first to preserve read-your-writes. This does mean that there is a small window
-            // after notifying flushed before the wal memory is actually released.
-            // TODO: once we change writes to block on the durable seq num from the oracle we
-            //       can simplify this and fully drop the wal before notifying listeners
-            self.notify_listener(wal::WalEvent::WalFlushed(status));
-            wal.notify_durable(result.clone());
             if Arc::strong_count(&wal) > 1 {
                 warn!("outstanding references to wal id {} after flushing", wal_id);
             }
             drop(wal);
+            self.notify_listener(WalEvent::WalFlushed(status));
         }
 
         Ok(())
@@ -560,7 +538,7 @@ impl WalFlushHandler {
     async fn do_flush_one_wal(&self, wal_id: u64, wal: Arc<WalBuffer>) -> Result<(), SlateDBError> {
         self.stats.flushes.increment(1);
 
-        let mut sst_builder = self.table_store.wal_table_builder();
+        let mut sst_builder = self.table_store.table_builder();
         let mut iter = wal.iter();
         while let Some(entry) = iter.next() {
             sst_builder.add(entry).await?;
@@ -573,14 +551,12 @@ impl WalFlushHandler {
             self.max_replay_block_bytes,
         )?;
         let written_bytes = encoded_sst.remaining_len() as u64;
-        self.table_store
-            .write_sst(&SsTableId::Wal(wal_id), &encoded_sst)
-            .await?;
+        self.table_store.write_sst(wal_id, &encoded_sst).await?;
         self.stats.flush_bytes.increment(written_bytes);
         Ok(())
     }
 
-    fn notify_listener(&self, event: wal::WalEvent) {
+    fn notify_listener(&self, event: WalEvent) {
         if let Some(l) = self.listener.as_ref() {
             (*l)(event);
         }
@@ -630,10 +606,10 @@ impl MessageHandler<WalFlushWork> for WalFlushHandler {
             .map(WalError::from)
             .unwrap_or(WalError::Closed);
 
-        let (final_status, unflushed) = self
+        let final_status = self
             .inner
             .write()
-            .drain_on_close(error.clone(), &self.table_store);
+            .mark_closed(error.clone(), &self.table_store);
         self.notify_listener(WalEvent::WalClosed(final_status.clone()));
 
         // drain remaining messages
@@ -649,25 +625,18 @@ impl MessageHandler<WalFlushWork> for WalFlushHandler {
                 }
             }
         }
-
-        // notify all the flushing wals to be finished with fatal error or shutdown
-        // error. we need ensure all the wal tables finally get notified. freeze current
-        // WAL to notify writers in the subsequent flushing_wals loop.
-        for (_, wal) in unflushed {
-            wal.notify_durable(Err(result.clone().err().unwrap_or(SlateDBError::Closed)));
-        }
         Ok(())
     }
 }
 
 /// Interface for getting information about the current state of the Wal
 #[derive(Clone)]
-struct WalObserver {
-    inner: Arc<parking_lot::RwLock<WalBufferManagerInner>>,
-    table_store: Arc<TableStore>,
+struct SlateDbWalObserver {
+    inner: Arc<parking_lot::RwLock<SlateDbWalWriterInner>>,
+    table_store: Arc<WalTableStore>,
 }
 
-impl wal::WalObserver for WalObserver {
+impl wal::WalObserver for SlateDbWalObserver {
     /// Gets information about the Wal buffer's current state
     fn status(&self) -> Result<WalStatus, WalStatus> {
         self.inner.read().status(self.table_store.as_ref())
@@ -717,16 +686,12 @@ pub mod stats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block_cache_policy::BlockCachePolicy;
     use crate::db_status::{ClosedResultWriter, DbStatusManager};
     use crate::format::sst::SsTableFormat;
-    use crate::iter::RowEntryIterator;
-    use crate::manifest::SsTableView;
-    use crate::object_stores::ObjectStores;
+    use crate::object_store_tag::TableStoreKind;
     use crate::oracle::DbOracle;
-    use crate::sst_iter::{SstIterator, SstIteratorOptions};
-    use crate::tablestore::{TableStore, TableStoreKind};
     use crate::types::{RowEntry, ValueDeletable};
+    use crate::wal::slatedb::sst_iterator::{WalSstIterator, WalSstIteratorOptions};
     use bytes::Bytes;
     use object_store::{memory::InMemory, path::Path, ObjectStore};
     use slatedb_common::clock::DefaultSystemClock;
@@ -792,52 +757,6 @@ mod tests {
         assert_eq!(buffer.len(), 4);
         assert_eq!(buffer.size(), size1 + size2 + size3 + size4);
         assert_eq!(buffer.last_seq(), Some(40));
-    }
-
-    #[tokio::test]
-    async fn test_notify_durable_success() {
-        let mut buffer = WalBuffer::new();
-        buffer.append(make_entry("key", "value", 1, None));
-
-        buffer.notify_durable(Ok(()));
-
-        let result = buffer.await_durable().await;
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_notify_durable_error() {
-        let mut buffer = WalBuffer::new();
-        buffer.append(make_entry("key", "value", 1, None));
-
-        buffer.notify_durable(Err(SlateDBError::Closed));
-
-        let result = buffer.await_durable().await;
-        assert!(matches!(result, Err(SlateDBError::Closed)));
-    }
-
-    #[tokio::test]
-    async fn test_durable_watcher_returns_reader() {
-        let mut buffer = WalBuffer::new();
-        buffer.append(make_entry("key", "value", 1, None));
-
-        let mut reader = buffer.durable_watcher();
-        buffer.notify_durable(Ok(()));
-
-        let result = reader.await_value().await;
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_notify_durable_only_sets_once() {
-        let mut buffer = WalBuffer::new();
-        buffer.append(make_entry("key", "value", 1, None));
-
-        buffer.notify_durable(Ok(()));
-        buffer.notify_durable(Err(SlateDBError::Closed));
-
-        let result = buffer.await_durable().await;
-        assert!(result.is_ok());
     }
 
     #[test]
@@ -908,8 +827,8 @@ mod tests {
     }
 
     async fn setup_wal_buffer() -> (
-        WalBufferManager,
-        Arc<TableStore>,
+        SlateDbWalWriter,
+        Arc<WalTableStore>,
         Arc<DbStatusManager>,
         Arc<DefaultMetricsRecorder>,
     ) {
@@ -919,8 +838,8 @@ mod tests {
     async fn setup_wal_buffer_with_flush_interval(
         flush_interval: Duration,
     ) -> (
-        WalBufferManager,
-        Arc<TableStore>,
+        SlateDbWalWriter,
+        Arc<WalTableStore>,
         Arc<DbStatusManager>,
         Arc<DefaultMetricsRecorder>,
     ) {
@@ -931,8 +850,8 @@ mod tests {
         flush_interval: Duration,
         listener: wal::WalStatusListener,
     ) -> (
-        WalBufferManager,
-        Arc<TableStore>,
+        SlateDbWalWriter,
+        Arc<WalTableStore>,
         Arc<DbStatusManager>,
         Arc<DefaultMetricsRecorder>,
     ) {
@@ -951,8 +870,8 @@ mod tests {
         max_replay_metadata_bytes: usize,
         max_replay_block_bytes: usize,
     ) -> (
-        WalBufferManager,
-        Arc<TableStore>,
+        SlateDbWalWriter,
+        Arc<WalTableStore>,
         Arc<DbStatusManager>,
         Arc<DefaultMetricsRecorder>,
     ) {
@@ -975,19 +894,17 @@ mod tests {
         max_replay_metadata_bytes: usize,
         max_replay_block_bytes: usize,
     ) -> (
-        WalBufferManager,
-        Arc<TableStore>,
+        SlateDbWalWriter,
+        Arc<WalTableStore>,
         Arc<DbStatusManager>,
         Arc<DefaultMetricsRecorder>,
     ) {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let table_store = Arc::new(TableStore::new(
-            ObjectStores::new(object_store, None),
+        let table_store = Arc::new(WalTableStore::new(
+            object_store,
             format,
             Path::from("/root"),
-            None,
             TableStoreKind::Main,
-            BlockCachePolicy::default(),
         ));
         let system_clock = Arc::new(DefaultSystemClock::new());
         let status_manager = Arc::new(DbStatusManager::new(0));
@@ -998,12 +915,13 @@ mod tests {
             status_manager.clone(),
             system_clock.clone(),
         ));
-        let wal_buffer = WalBufferManager::start_new(
+        let wal_buffer = SlateDbWalWriter::start_new(
             status_manager.result_reader(),
             &helper,
             0, // recent_flushed_wal_id
             table_store.clone(),
             max_wal_bytes_size,
+            4096, // max_wal_flushes_before_l0_flush
             max_replay_metadata_bytes,
             max_replay_block_bytes,
             Some(flush_interval), // max_flush_interval
@@ -1015,7 +933,7 @@ mod tests {
         observer
             .subscribe(Arc::new(move |status| {
                 (*listener)(status.clone());
-                let wal::WalEvent::WalFlushed(status) = status else {
+                let WalEvent::WalFlushed(status) = status else {
                     return;
                 };
                 oracle.advance_durable_seq(status.last_flushed_seq.unwrap_or(0))
@@ -1025,6 +943,19 @@ mod tests {
             .monitor_on(&Handle::current())
             .expect("failed to monitor executor");
         (wal_buffer, table_store, status_manager, recorder)
+    }
+
+    #[tokio::test]
+    async fn test_should_flush_memtable_at_max_wal_gap() {
+        let (wal_buffer, _, _, _) = setup_wal_buffer().await;
+        let max_wal_gap = wal_buffer.max_wal_flushes_before_l0_flush;
+        let last_flushed_wal_id = max_wal_gap + 10;
+        wal_buffer.inner.write().last_flushed_wal_id = last_flushed_wal_id;
+
+        assert!(!wal_buffer.should_flush_memtable(last_flushed_wal_id - max_wal_gap + 1));
+        assert!(wal_buffer.should_flush_memtable(last_flushed_wal_id - max_wal_gap));
+        assert!(wal_buffer.should_flush_memtable(last_flushed_wal_id - max_wal_gap - 1));
+        assert!(!wal_buffer.should_flush_memtable(last_flushed_wal_id + 1));
     }
 
     #[tokio::test]
@@ -1048,19 +979,11 @@ mod tests {
         wal_buffer.flush().await.unwrap().await.unwrap();
 
         // Verify entries were written to storage
-        let sst_iter_options = SstIteratorOptions {
-            eager_spawn: true,
-            ..SstIteratorOptions::default()
-        };
-        let mut iter = SstIterator::new_owned_initialized(
-            ..,
-            SsTableView::identity(table_store.open_sst(&SsTableId::Wal(1)).await.unwrap()),
-            table_store.clone(),
-            sst_iter_options,
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let table = table_store.open_sst(1).await.unwrap();
+        let mut iter =
+            WalSstIterator::new(table, table_store.clone(), WalSstIteratorOptions::default())
+                .await
+                .unwrap();
 
         let read_entry1 = iter.next().await.unwrap().unwrap();
         assert_eq!(read_entry1.key, entry1.key);
@@ -1236,8 +1159,8 @@ mod tests {
         );
     }
 
-    fn recording_listener() -> (wal::WalStatusListener, Arc<Mutex<Vec<wal::WalEvent>>>) {
-        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    fn recording_listener() -> (wal::WalStatusListener, Arc<Mutex<Vec<WalEvent>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
         let recorder = events.clone();
         let listener = Arc::new(move |event| {
             recorder.lock().unwrap().push(event);
@@ -1263,7 +1186,7 @@ mod tests {
         let mut flushed: Vec<_> = recorded
             .iter()
             .filter_map(|e| {
-                let wal::WalEvent::WalFlushed(status) = e else {
+                let WalEvent::WalFlushed(status) = e else {
                     return None;
                 };
                 Some(status)

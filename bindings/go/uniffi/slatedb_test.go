@@ -137,12 +137,15 @@ func openTestReader(t *testing.T, store *slatedb.ObjectStore, configure func(*te
 	return handle
 }
 
-func openTestWalReader(t *testing.T, store *slatedb.ObjectStore) *slatedb.WalReader {
+func openTestSlateDbWalReader(t *testing.T, store *slatedb.ObjectStore) *slatedb.SlateDbWalReader {
 	t.Helper()
 
-	reader := slatedb.NewWalReader(testDBPath, store)
+	reader, err := slatedb.NewSlateDbWalReader(testDBPath, store)
+	if err != nil {
+		t.Fatalf("NewSlateDbWalReader(): %v", err)
+	}
 	if reader == nil {
-		t.Fatal("NewWalReader(): got nil reader")
+		t.Fatal("NewSlateDbWalReader(): got nil reader")
 	}
 
 	t.Cleanup(reader.Destroy)
@@ -156,6 +159,22 @@ func bytesPtr(b []byte) *[]byte {
 
 func uint64Ptr(v uint64) *uint64 {
 	return &v
+}
+
+func trackWriteHandle(t *testing.T, handle *slatedb.WriteHandle) *slatedb.WriteHandle {
+	t.Helper()
+	if handle == nil {
+		t.Fatal("got nil write handle")
+	}
+	t.Cleanup(handle.Destroy)
+	return handle
+}
+
+func awaitDurable(t *testing.T, handle *slatedb.WriteHandle) {
+	t.Helper()
+	if err := handle.AwaitDurable(); err != nil {
+		t.Fatalf("WriteHandle.AwaitDurable(): %v", err)
+	}
 }
 
 func drainIterator(t *testing.T, iter *slatedb.DbIterator) []slatedb.KeyValue {
@@ -174,20 +193,25 @@ func drainIterator(t *testing.T, iter *slatedb.DbIterator) []slatedb.KeyValue {
 	}
 }
 
-func drainWalIterator(t *testing.T, iter *slatedb.WalFileIterator) []slatedb.RowEntry {
+func readWalBatchesThrough(
+	t *testing.T,
+	iter *slatedb.SlateDbWalIterator,
+	endWalFileID uint64,
+) []slatedb.WalRows {
 	t.Helper()
 
-	var rows []slatedb.RowEntry
-	for {
-		row, err := iter.Next()
+	var batches []slatedb.WalRows
+	for len(batches) == 0 || batches[len(batches)-1].LastConsumedWalFileId < endWalFileID {
+		batch, err := iter.Next()
 		if err != nil {
 			t.Fatalf("wal iterator Next(): %v", err)
 		}
-		if row == nil {
-			return rows
+		if batch == nil {
+			t.Fatal("live WAL iterator ended unexpectedly")
 		}
-		rows = append(rows, *row)
+		batches = append(batches, *batch)
 	}
+	return batches
 }
 
 func requireRows(t *testing.T, got []slatedb.KeyValue, wantKeys []string, wantValues []string) {
@@ -451,6 +475,32 @@ func seedWalFiles(t *testing.T, store *slatedb.ObjectStore) {
 	if err := handle.db.FlushWithOptions(slatedb.FlushOptions{FlushType: slatedb.FlushTypeWal}); err != nil {
 		t.Fatalf("FlushWithOptions(Wal) for merge row: %v", err)
 	}
+	if err := handle.db.Shutdown(); err != nil {
+		t.Fatalf("Shutdown() after seeding WAL files: %v", err)
+	}
+	handle.open = false
+}
+
+func appendWalValue(t *testing.T, store *slatedb.ObjectStore, key, value string) {
+	t.Helper()
+
+	handle := openTestDB(t, store, func(t *testing.T, builder *slatedb.DbBuilder) {
+		t.Helper()
+		if err := builder.WithMergeOperator(concatMergeOperator{}); err != nil {
+			t.Fatalf("WithMergeOperator(): %v", err)
+		}
+	})
+
+	if _, err := handle.db.Put([]byte(key), []byte(value)); err != nil {
+		t.Fatalf("Put(%s): %v", key, err)
+	}
+	if err := handle.db.FlushWithOptions(slatedb.FlushOptions{FlushType: slatedb.FlushTypeWal}); err != nil {
+		t.Fatalf("FlushWithOptions(Wal) for %s: %v", key, err)
+	}
+	if err := handle.db.Shutdown(); err != nil {
+		t.Fatalf("Shutdown() after appending %s: %v", key, err)
+	}
+	handle.open = false
 }
 
 func TestDbLifecycleAndStatus(t *testing.T) {
@@ -501,6 +551,38 @@ func TestDbLifecycleAndStatus(t *testing.T) {
 
 	if _, err := handle.db.Put([]byte("after-shutdown"), []byte("value")); !errors.Is(err, slatedb.ErrErrorClosed) {
 		t.Fatalf("Put() after Shutdown(): got %v, want closed error", err)
+	}
+}
+
+func TestDbShutdownWithOptions(t *testing.T) {
+	wal := slatedb.FlushTypeWal
+	tests := []struct {
+		name      string
+		flushType *slatedb.FlushType
+	}{
+		{name: "wal", flushType: &wal},
+		{name: "none", flushType: nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newMemoryStore(t)
+			handle := openTestDB(t, store, nil)
+
+			if _, err := handle.db.Put([]byte("shutdown-options"), []byte("value")); err != nil {
+				t.Fatalf("Put(): %v", err)
+			}
+
+			if err := handle.db.ShutdownWithOptions(slatedb.CloseOptions{FlushType: tt.flushType}); err != nil {
+				t.Fatalf("ShutdownWithOptions(): %v", err)
+			}
+			handle.open = false
+
+			status := handle.db.Status()
+			if status.CloseReason == nil || *status.CloseReason != slatedb.CloseReasonClean {
+				t.Fatalf("Status() after ShutdownWithOptions(): got close reason %v, want %v", status.CloseReason, slatedb.CloseReasonClean)
+			}
+		})
 	}
 }
 
@@ -597,16 +679,17 @@ func TestDbCrudAndMetadata(t *testing.T) {
 	}
 
 	putOptions := slatedb.PutOptions{Ttl: slatedb.TtlDefault{}}
-	writeOptions := slatedb.WriteOptions{AwaitDurable: true}
+	writeOptions := slatedb.WriteOptions{AwaitDurable: true, Seqnum: 0}
 
 	firstWrite, err := handle.db.Put([]byte("alpha"), []byte("one"))
 	if err != nil {
 		t.Fatalf("Put(alpha): %v", err)
 	}
-	if firstWrite.Seqnum == 0 {
+	firstWrite = trackWriteHandle(t, firstWrite)
+	if firstWrite.Seqnum() == 0 {
 		t.Fatalf("Put(alpha): Seqnum = 0")
 	}
-	if firstWrite.CreateTs == 0 {
+	if firstWrite.CreateTs() == 0 {
 		t.Fatalf("Put(alpha): CreateTs = 0")
 	}
 
@@ -639,11 +722,11 @@ func TestDbCrudAndMetadata(t *testing.T) {
 	if !bytes.Equal(metadata.Value, []byte("one")) {
 		t.Fatalf("GetKeyValue(alpha): value = %q, want %q", metadata.Value, "one")
 	}
-	if metadata.Seq != firstWrite.Seqnum {
-		t.Fatalf("GetKeyValue(alpha): seq = %d, want %d", metadata.Seq, firstWrite.Seqnum)
+	if metadata.Seq != firstWrite.Seqnum() {
+		t.Fatalf("GetKeyValue(alpha): seq = %d, want %d", metadata.Seq, firstWrite.Seqnum())
 	}
-	if metadata.CreateTs != firstWrite.CreateTs {
-		t.Fatalf("GetKeyValue(alpha): create ts = %d, want %d", metadata.CreateTs, firstWrite.CreateTs)
+	if metadata.CreateTs != firstWrite.CreateTs() {
+		t.Fatalf("GetKeyValue(alpha): create ts = %d, want %d", metadata.CreateTs, firstWrite.CreateTs())
 	}
 
 	metadata, err = handle.db.GetKeyValueWithOptions([]byte("alpha"), readOptions)
@@ -658,10 +741,12 @@ func TestDbCrudAndMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PutWithOptions(beta): %v", err)
 	}
-	if secondWrite.Seqnum <= firstWrite.Seqnum {
-		t.Fatalf("PutWithOptions(beta): seq = %d, want > %d", secondWrite.Seqnum, firstWrite.Seqnum)
+	secondWrite = trackWriteHandle(t, secondWrite)
+	awaitDurable(t, secondWrite)
+	if secondWrite.Seqnum() <= firstWrite.Seqnum() {
+		t.Fatalf("PutWithOptions(beta): seq = %d, want > %d", secondWrite.Seqnum(), firstWrite.Seqnum())
 	}
-	if secondWrite.CreateTs == 0 {
+	if secondWrite.CreateTs() == 0 {
 		t.Fatalf("PutWithOptions(beta): CreateTs = 0")
 	}
 
@@ -696,8 +781,9 @@ func TestDbCrudAndMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Delete(alpha): %v", err)
 	}
-	if deleteWrite.Seqnum <= secondWrite.Seqnum {
-		t.Fatalf("Delete(alpha): seq = %d, want > %d", deleteWrite.Seqnum, secondWrite.Seqnum)
+	deleteWrite = trackWriteHandle(t, deleteWrite)
+	if deleteWrite.Seqnum() <= secondWrite.Seqnum() {
+		t.Fatalf("Delete(alpha): seq = %d, want > %d", deleteWrite.Seqnum(), secondWrite.Seqnum())
 	}
 
 	value, err = handle.db.Get([]byte("alpha"))
@@ -712,8 +798,9 @@ func TestDbCrudAndMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DeleteWithOptions(beta): %v", err)
 	}
-	if deleteWrite.Seqnum <= secondWrite.Seqnum {
-		t.Fatalf("DeleteWithOptions(beta): seq = %d, want > %d", deleteWrite.Seqnum, secondWrite.Seqnum)
+	deleteWrite = trackWriteHandle(t, deleteWrite)
+	if deleteWrite.Seqnum() <= secondWrite.Seqnum() {
+		t.Fatalf("DeleteWithOptions(beta): seq = %d, want > %d", deleteWrite.Seqnum(), secondWrite.Seqnum())
 	}
 
 	value, err = handle.db.Get([]byte("beta"))
@@ -846,7 +933,8 @@ func TestDbBatchWriteAndConsumption(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Write(): %v", err)
 	}
-	if batchWrite.Seqnum == 0 {
+	batchWrite = trackWriteHandle(t, batchWrite)
+	if batchWrite.Seqnum() == 0 {
 		t.Fatalf("Write(): Seqnum = 0")
 	}
 
@@ -877,9 +965,12 @@ func TestDbBatchWriteAndConsumption(t *testing.T) {
 		t.Fatalf("WriteBatch.PutWithOptions(): %v", err)
 	}
 
-	if _, err := handle.db.WriteWithOptions(secondBatch, slatedb.WriteOptions{AwaitDurable: true}); err != nil {
+	secondBatchWrite, err := handle.db.WriteWithOptions(secondBatch, slatedb.WriteOptions{AwaitDurable: true, Seqnum: 0})
+	if err != nil {
 		t.Fatalf("WriteWithOptions(): %v", err)
 	}
+	secondBatchWrite = trackWriteHandle(t, secondBatchWrite)
+	awaitDurable(t, secondBatchWrite)
 
 	value, err = handle.db.Get([]byte("batch-put-2"))
 	if err != nil {
@@ -937,14 +1028,17 @@ func TestDbMerge(t *testing.T) {
 		t.Fatalf("Get(merge) after Merge(): got %v, want %q", value, "base:one")
 	}
 
-	if _, err := handle.db.MergeWithOptions(
+	mergeWrite, err := handle.db.MergeWithOptions(
 		[]byte("merge"),
 		[]byte(":two"),
 		slatedb.MergeOptions{Ttl: slatedb.TtlDefault{}},
-		slatedb.WriteOptions{AwaitDurable: true},
-	); err != nil {
+		slatedb.WriteOptions{AwaitDurable: true, Seqnum: 0},
+	)
+	if err != nil {
 		t.Fatalf("MergeWithOptions(): %v", err)
 	}
+	mergeWrite = trackWriteHandle(t, mergeWrite)
+	awaitDurable(t, mergeWrite)
 
 	value, err = handle.db.Get([]byte("merge"))
 	if err != nil {
@@ -1024,11 +1118,15 @@ func TestDbTransactions(t *testing.T) {
 		t.Fatalf("db.Get(txn-key) before commit: got %q, want nil", *liveValue)
 	}
 
-	commitHandle, err := tx.Commit()
+	optionalCommitHandle, err := tx.Commit()
 	if err != nil {
 		t.Fatalf("tx.Commit(): %v", err)
 	}
-	if commitHandle == nil || commitHandle.Seqnum == 0 {
+	if optionalCommitHandle == nil {
+		t.Fatal("tx.Commit(): got nil write handle")
+	}
+	commitHandle := trackWriteHandle(t, *optionalCommitHandle)
+	if commitHandle.Seqnum() == 0 {
 		t.Fatalf("tx.Commit(): got %v, want non-nil write handle", commitHandle)
 	}
 
@@ -1124,18 +1222,22 @@ func TestDbInvalidInputsAndErrorMapping(t *testing.T) {
 			t.Fatalf("secondary Put(): %v", err)
 		}
 
-		_, err := primary.db.Put([]byte("stale"), []byte("value"))
+		write, err := primary.db.Put([]byte("stale"), []byte("value"))
+		if err == nil {
+			write = trackWriteHandle(t, write)
+			err = write.AwaitDurable()
+		}
 		if !errors.Is(err, slatedb.ErrErrorClosed) {
-			t.Fatalf("primary Put() after fencing: got %v, want closed error", err)
+			t.Fatalf("primary write durability after fencing: got %v, want closed error", err)
 		}
 		primary.open = false
 
 		var closedErr *slatedb.ErrorClosed
 		if !errors.As(err, &closedErr) {
-			t.Fatalf("primary Put() after fencing: expected *ErrorClosed, got %T", err)
+			t.Fatalf("primary write durability after fencing: expected *ErrorClosed, got %T", err)
 		}
 		if closedErr.Reason != slatedb.CloseReasonFenced {
-			t.Fatalf("primary Put() after fencing: got close reason %v, want %v", closedErr.Reason, slatedb.CloseReasonFenced)
+			t.Fatalf("primary write durability after fencing: got close reason %v, want %v", closedErr.Reason, slatedb.CloseReasonFenced)
 		}
 	})
 }
@@ -1354,6 +1456,7 @@ func TestDbReaderRefreshBehavior(t *testing.T) {
 		t.Helper()
 		if err := builder.WithOptions(slatedb.ReaderOptions{
 			ManifestPollIntervalMs: 100,
+			WalPollIntervalMs:      100,
 			CheckpointLifetimeMs:   1000,
 			MaxMemtableBytes:       64 * 1024 * 1024,
 			SkipWalReplay:          false,
@@ -1386,6 +1489,7 @@ func TestDbReaderWalReplayBehavior(t *testing.T) {
 			t.Helper()
 			if err := builder.WithOptions(slatedb.ReaderOptions{
 				ManifestPollIntervalMs: 100,
+				WalPollIntervalMs:      100,
 				CheckpointLifetimeMs:   1000,
 				MaxMemtableBytes:       64 * 1024 * 1024,
 				SkipWalReplay:          false,
@@ -1432,6 +1536,7 @@ func TestDbReaderWalReplayBehavior(t *testing.T) {
 			t.Helper()
 			if err := builder.WithOptions(slatedb.ReaderOptions{
 				ManifestPollIntervalMs: 100,
+				WalPollIntervalMs:      100,
 				CheckpointLifetimeMs:   1000,
 				MaxMemtableBytes:       64 * 1024 * 1024,
 				SkipWalReplay:          true,
@@ -1464,6 +1569,7 @@ func TestDbReaderWalReplayBehavior(t *testing.T) {
 			t.Helper()
 			if err := builder.WithOptions(slatedb.ReaderOptions{
 				ManifestPollIntervalMs: 100,
+				WalPollIntervalMs:      100,
 				CheckpointLifetimeMs:   1000,
 				MaxMemtableBytes:       64 * 1024 * 1024,
 				SkipWalReplay:          true,
@@ -1778,8 +1884,9 @@ func TestAdminQueries(t *testing.T) {
 	if latestManifest.LastL0Seq < 3 {
 		t.Fatalf("ReadManifest(nil): LastL0Seq = %d, want at least 3", latestManifest.LastL0Seq)
 	}
-	if latestManifest.WalObjectStoreUri == nil {
-		t.Fatal("ReadManifest(nil): WalObjectStoreUri = nil, want value for configured WAL store")
+	// ManifestV2 is now written universally and never persists wal_object_store_uri
+	if latestManifest.WalObjectStoreUri != nil {
+		t.Fatalf("ReadManifest(nil): WalObjectStoreUri = %v, want nil (dropped by ManifestV2)", *latestManifest.WalObjectStoreUri)
 	}
 
 	firstManifest, err := admin.ReadManifest(uint64Ptr(manifests[0].Id))
@@ -2656,207 +2763,166 @@ func TestAdminDeleteMultipleCheckpoints(t *testing.T) {
 	})
 }
 
-func TestWalReaderEmptyStore(t *testing.T) {
+func flattenWalRows(batches []slatedb.WalRows) []slatedb.RowEntry {
+	var rows []slatedb.RowEntry
+	for _, batch := range batches {
+		rows = append(rows, batch.Rows...)
+	}
+	return rows
+}
+
+func TestWalReaderReportsNoNewFilesAfterCursor(t *testing.T) {
 	store := newMemoryStore(t)
-	reader := openTestWalReader(t, store)
+	seedWalFiles(t, store)
+	reader := openTestSlateDbWalReader(t, store)
 
-	files, err := reader.List(nil, nil)
+	cursor, err := reader.LastWalFileId(0)
 	if err != nil {
-		t.Fatalf("WalReader.List(nil, nil): %v", err)
+		t.Fatalf("LastWalFileId(0): %v", err)
 	}
-	for _, file := range files {
-		defer file.Destroy()
+	tail, err := reader.LastWalFileId(cursor)
+	if err != nil {
+		t.Fatalf("LastWalFileId(cursor): %v", err)
 	}
-
-	if len(files) != 0 {
-		t.Fatalf("WalReader.List(nil, nil): got %d files, want 0", len(files))
+	if tail != cursor {
+		t.Fatalf("LastWalFileId(cursor): got %d, want %d", tail, cursor)
 	}
 }
 
-func TestWalReaderListingAndNavigation(t *testing.T) {
+func TestWalReaderStreamsNewWalsThroughOneIterator(t *testing.T) {
 	store := newMemoryStore(t)
 	seedWalFiles(t, store)
+	reader := openTestSlateDbWalReader(t, store)
 
-	reader := openTestWalReader(t, store)
-
-	files, err := reader.List(nil, nil)
+	firstTail, err := reader.LastWalFileId(0)
 	if err != nil {
-		t.Fatalf("WalReader.List(nil, nil): %v", err)
+		t.Fatalf("LastWalFileId(0): %v", err)
+	}
+	iter, err := reader.Iterator(1)
+	if err != nil {
+		t.Fatalf("SlateDbWalReader.Iterator(1): %v", err)
+	}
+	t.Cleanup(iter.Destroy)
+	firstBatches := readWalBatchesThrough(t, iter, firstTail)
+	if len(firstBatches) == 0 {
+		t.Fatal("initial WAL stream returned no batches")
 	}
 
-	if len(files) < 3 {
-		t.Fatalf("WalReader.List(nil, nil): got %d files, want at least 3", len(files))
-	}
-
-	ids := make([]uint64, len(files))
-	for i, file := range files {
-		ids[i] = file.Id()
-		if i > 0 && ids[i] <= ids[i-1] {
-			t.Fatalf("WalReader.List(nil, nil): ids not ascending: %v", ids)
+	var previous uint64
+	foundEmptyFence := false
+	for i, batch := range firstBatches {
+		foundEmptyFence = foundEmptyFence || len(batch.Rows) == 0
+		if i > 0 && batch.LastConsumedWalFileId <= previous {
+			t.Fatalf("WAL cursors did not increase: previous=%d current=%d", previous, batch.LastConsumedWalFileId)
 		}
+		previous = batch.LastConsumedWalFileId
+	}
+	if !foundEmptyFence {
+		t.Fatal("initial WAL stream did not return the empty fence WAL batch")
+	}
+	if previous != firstTail {
+		t.Fatalf("initial WAL stream ended at %d, want %d", previous, firstTail)
+	}
+	if tail, err := reader.LastWalFileId(firstTail); err != nil || tail != firstTail {
+		t.Fatalf("LastWalFileId(firstTail): got tail=%d err=%v, want %d", tail, err, firstTail)
 	}
 
-	startID := ids[1]
-	endID := ids[2]
-	bounded, err := reader.List(&startID, &endID)
+	appendWalValue(t, store, "next", "3")
+	secondTail, err := reader.LastWalFileId(firstTail)
 	if err != nil {
-		t.Fatalf("WalReader.List(start, end): %v", err)
+		t.Fatalf("LastWalFileId(firstTail) after append: %v", err)
 	}
-	for _, file := range bounded {
-		defer file.Destroy()
+	if secondTail <= firstTail {
+		t.Fatalf("second tail did not advance: first=%d second=%d", firstTail, secondTail)
 	}
-
-	if len(bounded) != 1 || bounded[0].Id() != ids[1] {
-		t.Fatalf("WalReader.List(start, end): got ids [%d], want [%d]", len(bounded), ids[1])
+	secondBatches := readWalBatchesThrough(t, iter, secondTail)
+	if len(secondBatches) == 0 {
+		t.Fatal("continued WAL stream returned no batches")
 	}
-
-	pastHighID := ids[len(ids)-1] + 1000
-	empty, err := reader.List(&pastHighID, nil)
-	if err != nil {
-		t.Fatalf("WalReader.List(pastHigh, nil): %v", err)
+	if got := secondBatches[len(secondBatches)-1].LastConsumedWalFileId; got != secondTail {
+		t.Fatalf("continued WAL stream ended at %d, want %d", got, secondTail)
 	}
-
-	if len(empty) != 0 {
-		t.Fatalf("WalReader.List(pastHigh, nil): got %d files, want 0", len(empty))
+	secondRows := flattenWalRows(secondBatches)
+	if len(secondRows) != 1 || string(secondRows[0].Key) != "next" {
+		t.Fatalf("continued WAL stream returned rows=%v, want one next row", secondRows)
 	}
-
-	first := reader.Get(ids[0])
-	defer first.Destroy()
-	if first.Id() != ids[0] {
-		t.Fatalf("WalReader.Get(first): got id %d, want %d", first.Id(), ids[0])
-	}
-	if first.NextId() != ids[1] {
-		t.Fatalf("WalFile.NextId(): got %d, want %d", first.NextId(), ids[1])
-	}
-
-	next := first.NextFile()
-	defer next.Destroy()
-	if next.Id() != ids[1] {
-		t.Fatalf("WalFile.NextFile().Id(): got %d, want %d", next.Id(), ids[1])
+	if tail, err := reader.LastWalFileId(secondTail); err != nil || tail != secondTail {
+		t.Fatalf("LastWalFileId(secondTail): got tail=%d err=%v, want %d", tail, err, secondTail)
 	}
 }
 
-func TestWalReaderMetadataAndRows(t *testing.T) {
+func TestWalReaderDecodesValueTombstoneAndMergeRows(t *testing.T) {
 	store := newMemoryStore(t)
 	seedWalFiles(t, store)
+	reader := openTestSlateDbWalReader(t, store)
 
-	reader := openTestWalReader(t, store)
-
-	files, err := reader.List(nil, nil)
+	tail, err := reader.LastWalFileId(0)
 	if err != nil {
-		t.Fatalf("WalReader.List(nil, nil): %v", err)
+		t.Fatalf("LastWalFileId(0): %v", err)
 	}
-	for _, file := range files {
-		defer file.Destroy()
+	iter, err := reader.Iterator(1)
+	if err != nil {
+		t.Fatalf("SlateDbWalReader.Iterator(1): %v", err)
 	}
-
-	if len(files) < 3 {
-		t.Fatalf("WalReader.List(nil, nil): got %d files, want at least 3", len(files))
+	t.Cleanup(iter.Destroy)
+	batches := readWalBatchesThrough(t, iter, tail)
+	if got := batches[len(batches)-1].LastConsumedWalFileId; got != tail {
+		t.Fatalf("WAL stream ended at %d, want %d", got, tail)
 	}
-
-	var allRows []slatedb.RowEntry
-	nonEmptyFiles := 0
-
-	for i, file := range files {
-		metadata, err := file.Metadata()
-		if err != nil {
-			t.Fatalf("WalFile.Metadata() for file %d: %v", i, err)
-		}
-		if metadata.Id != file.Id() {
-			t.Fatalf("WalFile.Metadata() for file %d: Id = %d, want %d", i, metadata.Id, file.Id())
-		}
-		if metadata.Metadata.Location == "" {
-			t.Fatalf("WalFile.Metadata() for file %d: Location is empty", i)
-		}
-
-		iter, err := file.Iterator()
-		if err != nil {
-			t.Fatalf("WalFile.Iterator() for file %d: %v", i, err)
-		}
-		t.Cleanup(iter.Destroy)
-
-		rows := drainWalIterator(t, iter)
-		if metadata.Metadata.Size == 0 {
-			if len(rows) != 0 {
-				t.Fatalf("zero-byte WAL file %d returned %d rows, want 0", i, len(rows))
-			}
-			continue
-		}
-		nonEmptyFiles++
-
-		for j, row := range rows {
-			if row.Seq == 0 {
-				t.Fatalf("row %d in file %d: Seq = 0", j, i)
-			}
-		}
-		allRows = append(allRows, rows...)
+	rows := flattenWalRows(batches)
+	if len(rows) != 4 {
+		t.Fatalf("unexpected total WAL row count: got %d, want 4", len(rows))
 	}
 
-	if nonEmptyFiles == 0 {
-		t.Fatal("no non-empty WAL files found")
+	if rows[0].Kind != slatedb.RowEntryKindValue || string(rows[0].Key) != "a" {
+		t.Fatalf("row 0: got kind=%v key=%q, want value/a", rows[0].Kind, rows[0].Key)
 	}
-
-	if len(allRows) != 4 {
-		t.Fatalf("unexpected total WAL row count: got %d, want 4", len(allRows))
+	if rows[0].Value == nil || !bytes.Equal(*rows[0].Value, []byte("1")) {
+		t.Fatalf("row 0: got value %v, want %q", rows[0].Value, "1")
 	}
-
-	if allRows[0].Kind != slatedb.RowEntryKindValue || string(allRows[0].Key) != "a" {
-		t.Fatalf("row 0: got kind=%v key=%q, want value/a", allRows[0].Kind, allRows[0].Key)
+	if rows[1].Kind != slatedb.RowEntryKindValue || string(rows[1].Key) != "b" {
+		t.Fatalf("row 1: got kind=%v key=%q, want value/b", rows[1].Kind, rows[1].Key)
 	}
-	if allRows[0].Value == nil || !bytes.Equal(*allRows[0].Value, []byte("1")) {
-		t.Fatalf("row 0: got value %v, want %q", allRows[0].Value, "1")
+	if rows[1].Value == nil || !bytes.Equal(*rows[1].Value, []byte("2")) {
+		t.Fatalf("row 1: got value %v, want %q", rows[1].Value, "2")
 	}
-
-	if allRows[1].Kind != slatedb.RowEntryKindValue || string(allRows[1].Key) != "b" {
-		t.Fatalf("row 1: got kind=%v key=%q, want value/b", allRows[1].Kind, allRows[1].Key)
+	if rows[2].Kind != slatedb.RowEntryKindTombstone || string(rows[2].Key) != "a" {
+		t.Fatalf("row 2: got kind=%v key=%q, want tombstone/a", rows[2].Kind, rows[2].Key)
 	}
-	if allRows[1].Value == nil || !bytes.Equal(*allRows[1].Value, []byte("2")) {
-		t.Fatalf("row 1: got value %v, want %q", allRows[1].Value, "2")
+	if rows[2].Value != nil {
+		t.Fatalf("row 2: got value %q, want nil", *rows[2].Value)
 	}
-
-	if allRows[2].Kind != slatedb.RowEntryKindTombstone || string(allRows[2].Key) != "a" {
-		t.Fatalf("row 2: got kind=%v key=%q, want tombstone/a", allRows[2].Kind, allRows[2].Key)
+	if rows[3].Kind != slatedb.RowEntryKindMerge || string(rows[3].Key) != "m" {
+		t.Fatalf("row 3: got kind=%v key=%q, want merge/m", rows[3].Kind, rows[3].Key)
 	}
-	if allRows[2].Value != nil {
-		t.Fatalf("row 2: got value %q, want nil", *allRows[2].Value)
-	}
-
-	if allRows[3].Kind != slatedb.RowEntryKindMerge || string(allRows[3].Key) != "m" {
-		t.Fatalf("row 3: got kind=%v key=%q, want merge/m", allRows[3].Kind, allRows[3].Key)
-	}
-	if allRows[3].Value == nil || !bytes.Equal(*allRows[3].Value, []byte("x")) {
-		t.Fatalf("row 3: got value %v, want %q", allRows[3].Value, "x")
+	if rows[3].Value == nil || !bytes.Equal(*rows[3].Value, []byte("x")) {
+		t.Fatalf("row 3: got value %v, want %q", rows[3].Value, "x")
 	}
 }
 
-func TestWalReaderMissingFile(t *testing.T) {
+func TestWalReaderCanStartAtTheNextWal(t *testing.T) {
 	store := newMemoryStore(t)
 	seedWalFiles(t, store)
+	reader := openTestSlateDbWalReader(t, store)
 
-	reader := openTestWalReader(t, store)
-
-	files, err := reader.List(nil, nil)
+	tail, err := reader.LastWalFileId(0)
 	if err != nil {
-		t.Fatalf("WalReader.List(nil, nil): %v", err)
+		t.Fatalf("LastWalFileId(0): %v", err)
 	}
-	for _, file := range files {
-		defer file.Destroy()
+	iter, err := reader.Iterator(tail + 1)
+	if err != nil {
+		t.Fatalf("Iterator(next WAL): %v", err)
 	}
+	t.Cleanup(iter.Destroy)
 
-	if len(files) == 0 {
-		t.Fatal("WalReader.List(nil, nil): got 0 files, want at least 1")
+	appendWalValue(t, store, "resumed", "4")
+	newTail, err := reader.LastWalFileId(tail)
+	if err != nil {
+		t.Fatalf("LastWalFileId(tail) after append: %v", err)
 	}
-
-	missingID := files[len(files)-1].Id() + 1000
-	missing := reader.Get(missingID)
-	defer missing.Destroy()
-
-	if missing.Id() != missingID {
-		t.Fatalf("WalReader.Get(missing): got id %d, want %d", missing.Id(), missingID)
-	}
-
-	if _, err := missing.Metadata(); err == nil {
-		t.Fatal("WalFile.Metadata() for missing file: got nil error, want non-nil error")
+	rows := flattenWalRows(readWalBatchesThrough(t, iter, newTail))
+	if len(rows) != 1 || string(rows[0].Key) != "resumed" {
+		t.Fatalf("resumed WAL stream returned rows=%v, want one resumed row", rows)
 	}
 }
 
@@ -3072,12 +3138,14 @@ func TestDbTtl(t *testing.T) {
 
 	key, value := []byte("alpha"), []byte("one")
 
-	putOptions := slatedb.PutOptions{Ttl: slatedb.TtlExpireAt{Field0: 1}}
-	writeOptions := slatedb.WriteOptions{AwaitDurable: true}
-	_, err := handle.db.PutWithOptions(key, value, putOptions, writeOptions)
+	putOptions := slatedb.PutOptions{Ttl: slatedb.TtlExpireAtMillis{Field0: 1}}
+	writeOptions := slatedb.WriteOptions{AwaitDurable: true, Seqnum: 0}
+	write, err := handle.db.PutWithOptions(key, value, putOptions, writeOptions)
 	if err != nil {
 		t.Fatalf("Put(alpha): %v", err)
 	}
+	write = trackWriteHandle(t, write)
+	awaitDurable(t, write)
 
 	readerHandle := openTestReader(t, store, nil)
 
@@ -3117,26 +3185,29 @@ type batchSeedRow struct {
 // needs one extra call returning an empty slice to detect exhaustion.
 var batchSeedRows = []batchSeedRow{
 	{key: "batch:01", value: "one", ttl: slatedb.TtlNoExpiry{}},
-	{key: "batch:02", value: "two", ttl: slatedb.TtlExpireAfterTicks{Field0: batchSeedTtlTicks}},
+	{key: "batch:02", value: "two", ttl: slatedb.TtlExpireAfterMillis{Field0: batchSeedTtlMillis}},
 	{key: "batch:03", value: "three", ttl: slatedb.TtlNoExpiry{}},
-	{key: "batch:04", value: "four", ttl: slatedb.TtlExpireAfterTicks{Field0: batchSeedTtlTicks}},
+	{key: "batch:04", value: "four", ttl: slatedb.TtlExpireAfterMillis{Field0: batchSeedTtlMillis}},
 	{key: "batch:05", value: "five", ttl: slatedb.TtlNoExpiry{}},
-	{key: "batch:06", value: "six", ttl: slatedb.TtlExpireAfterTicks{Field0: batchSeedTtlTicks}},
+	{key: "batch:06", value: "six", ttl: slatedb.TtlExpireAfterMillis{Field0: batchSeedTtlMillis}},
 }
 
-// batchSeedTtlTicks is far enough in the future that TTL'd seed rows never
+// batchSeedTtlMillis is far enough in the future that TTL'd seed rows never
 // expire mid-test, while still producing a non-nil ExpireTs.
-const batchSeedTtlTicks = 3_600_000
+const batchSeedTtlMillis = 3_600_000
 
 func seedBatchRows(t *testing.T, db *slatedb.Db) {
 	t.Helper()
 
-	writeOptions := slatedb.WriteOptions{AwaitDurable: true}
+	writeOptions := slatedb.WriteOptions{AwaitDurable: true, Seqnum: 0}
 	for _, row := range batchSeedRows {
 		putOptions := slatedb.PutOptions{Ttl: row.ttl}
-		if _, err := db.PutWithOptions([]byte(row.key), []byte(row.value), putOptions, writeOptions); err != nil {
+		write, err := db.PutWithOptions([]byte(row.key), []byte(row.value), putOptions, writeOptions)
+		if err != nil {
 			t.Fatalf("PutWithOptions(%q): %v", row.key, err)
 		}
+		write = trackWriteHandle(t, write)
+		awaitDurable(t, write)
 	}
 }
 
@@ -3387,7 +3458,7 @@ func openBenchDB(b *testing.B) *slatedb.Db {
 		db.Destroy()
 	})
 
-	writeOptions := slatedb.WriteOptions{AwaitDurable: false}
+	writeOptions := slatedb.WriteOptions{AwaitDurable: false, Seqnum: 0}
 	putOptions := slatedb.PutOptions{Ttl: slatedb.TtlDefault{}}
 	for i := 0; i < benchScanRows; i++ {
 		key := []byte(fmt.Sprintf("bench:%06d", i))

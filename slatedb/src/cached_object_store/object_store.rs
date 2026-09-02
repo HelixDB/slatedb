@@ -249,7 +249,7 @@ impl CachedObjectStore {
 
         // Second pass: load the selected files in bounded parallelism and cache them.
         let degree_of_parallelism = 32;
-        let _result = build_concurrent(files_to_load.into_iter(), degree_of_parallelism, |path| {
+        let _result = build_concurrent(files_to_load, degree_of_parallelism, |path| {
             let this = self.clone();
             async move {
                 match this
@@ -367,8 +367,8 @@ impl CachedObjectStore {
     async fn cached_put_opts(
         &self,
         location: &Path,
-        payload: object_store::PutPayload,
-        opts: object_store::PutOptions,
+        payload: PutPayload,
+        opts: PutOptions,
     ) -> object_store::Result<PutResult> {
         // The per-call tag decides whether this write is cached.
         let tag = ObjectStoreCallTag::from_extensions(&opts.extensions);
@@ -390,7 +390,7 @@ impl CachedObjectStore {
 
         // Convert PutPayload to stream and save parts to cache.
         let entry = self.cache_storage.entry(location, self.part_size_bytes);
-        let stream = stream::iter(payload.into_iter()).map(Ok::<Bytes, object_store::Error>);
+        let stream = stream::iter(payload).map(Ok::<Bytes, object_store::Error>);
         // Save parts, ignoring errors (cache failures must not fail the PUT).
         self.save_parts_stream(entry.as_ref(), stream, 0).await.ok();
 
@@ -1440,7 +1440,7 @@ mod tests {
         inner
             .put(
                 &location,
-                PutPayload::from_bytes(bytes::Bytes::from_static(b"hello world")),
+                PutPayload::from_bytes(Bytes::from_static(b"hello world")),
             )
             .await
             .unwrap();
@@ -1460,10 +1460,7 @@ mod tests {
             .expect("cache miss should fetch from inner store");
 
         assert!(result.extensions.get::<ExtensionMarker>().is_some());
-        assert_eq!(
-            result.bytes().await.unwrap(),
-            bytes::Bytes::from_static(b"hello")
-        );
+        assert_eq!(result.bytes().await.unwrap(), Bytes::from_static(b"hello"));
     }
 
     #[tokio::test]
@@ -1473,7 +1470,7 @@ mod tests {
         inner
             .put(
                 &location,
-                PutPayload::from_bytes(bytes::Bytes::from_static(b"hello")),
+                PutPayload::from_bytes(Bytes::from_static(b"hello")),
             )
             .await
             .unwrap();

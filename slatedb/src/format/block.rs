@@ -5,7 +5,7 @@ use crate::types::RowEntry;
 use crate::utils::clamp_allocated_size_bytes;
 use bytes::{BufMut, Bytes, BytesMut};
 
-pub(crate) const SIZEOF_U16: usize = std::mem::size_of::<u16>();
+pub(crate) const SIZEOF_U16: usize = size_of::<u16>();
 
 #[derive(Eq, PartialEq)]
 pub(crate) struct Block {
@@ -72,11 +72,8 @@ impl Block {
         }
         let offsets_raw = &data[data_end..data.len() - SIZEOF_U16];
         let mut offsets = Vec::with_capacity(entry_offsets_len);
-        for raw in offsets_raw.chunks_exact(SIZEOF_U16) {
-            let offset = u16::from_be_bytes(
-                raw.try_into()
-                    .map_err(|_| corrupt_block("invalid block row offset"))?,
-            );
+        for raw in offsets_raw.as_chunks::<SIZEOF_U16>().0 {
+            let offset = u16::from_be_bytes(*raw);
             if usize::from(offset) >= data_end {
                 return Err(corrupt_block("block row offset is outside row data"));
             }
@@ -141,7 +138,9 @@ fn compute_prefix(lhs: &[u8], rhs: &[u8]) -> usize {
 }
 
 fn compute_prefix_chunks<const N: usize>(lhs: &[u8], rhs: &[u8]) -> usize {
-    let off = std::iter::zip(lhs.chunks_exact(N), rhs.chunks_exact(N))
+    let (lhs_chunks, _) = lhs.as_chunks::<N>();
+    let (rhs_chunks, _) = rhs.as_chunks::<N>();
+    let off = std::iter::zip(lhs_chunks, rhs_chunks)
         .take_while(|(a, b)| a == b)
         .count()
         * N;

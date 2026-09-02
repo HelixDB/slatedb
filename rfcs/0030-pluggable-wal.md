@@ -88,15 +88,15 @@ replays these WAL files into memtables, filtering out any rows with sequence num
 
 **Writes**
 
-Once it's recovered persisted writes, the db hands the WAL (`WalBufferManager`) off to the 
-Batch Writer task. This task serializes all writes and buffers them in `WalBufferManager`, 
-which periodically flushes the writes to a new WAL file. `WalBufferManager` notifies blocked 
+Once it's recovered persisted writes, the db hands the WAL (`SlateDbWalWriter`) off to the
+Batch Writer task. This task serializes all writes and buffers them in `SlateDbWalWriter`,
+which periodically flushes the writes to a new WAL file. `SlateDbWalWriter` notifies blocked
 write tasks when writes are durably flushed. 
 
 **Memtable/L0 Flushing**
 
 The Batch Writer task adds writes to the memtable once they've been buffered in 
-`WalBufferManager`. It "freezes" memtables once they cross the memtable size threshold and 
+`SlateDbWalWriter`. It "freezes" memtables once they cross the memtable size threshold and
 annotates the frozen memtable with a `replay_after_wal_id` which holds the ID of some WAL File 
 whose writes are fully covered by the memtable (in the current implementation this is the last 
 durably flushed WAL File). The frozen memtables are picked up by a separate Manifest Writer task,
@@ -112,7 +112,7 @@ described above depending on what the user requested.
 
 **Checkpoints**
 
-When `WalBufferManager` durably persists a WAL File, it notifies the db, which updates 
+When `SlateDbWalWriter` durably persists a WAL File, it notifies the db, which updates
 `last_seen_wal_id` in the manifest with the flushed WAL ID. `DbReader` uses this field to 
 determine the range of WAL Files that should be read for a checkpoint.
 
@@ -331,6 +331,18 @@ pub trait WalWriter: Send {
     /// future that receives the result of the flush once it completes.
     async fn flush(&mut self) -> Result<FlushResultFuture, WalError>;
 
+    /// Returns true if the WAL implementation wants to request that the current in-memory
+    /// writes be flushed to a new l0. WAL implementations can use this to (1) bound the range
+    /// of writes that need to be replayed when SlateDB restarts, and (2) push data to L0s earlier
+    /// so that it's available to readers, which poll the latest manifest.
+    ///
+    /// ## Arguments
+    /// - `replay_after_wal_id`: The WAL ID used as the replay point for the last memtable
+    ///   that was flushed to L0
+    fn should_flush_memtable(&self, _replay_after_wal_id: u64) -> bool {
+        false
+    }
+    
     /// Returns a `WalObserver` for reading [`WalStatus`] and subscribing to events.
     fn observer(&self) -> Box<dyn WalObserver>;
 
@@ -347,14 +359,8 @@ pub struct WalRows {
     /// The rows read from the WAL File. All the rows with a given sequence number must be present
     /// in th same [`WalRows`].
     pub rows: Vec<RowEntry>,
-    /// The id of the last WAL File containing rows from `rows`. There may still be rows with higher
-    /// sequence numbers in the WAL File with this id.
-    pub last_wal_file_id: u64,
-    /// True when this batch is the last one in its WAL file. This is an
-    /// optimization, so its harmless to always set to false. Callers can already infer that a
-    /// file is fully applied when they see a batch from a later file, but this flag lets them
-    /// advance their WAL watermark over the current file without waiting for the next one.
-    pub last_in_file: bool,
+    /// The id of the last WAL File for which all rows have been consumed by the iterator.
+    pub last_consumed_wal_file_id: u64,
 }
 
 /// An iterator over rows in some range of the WAL
@@ -383,11 +389,16 @@ pub trait WalReader {
         &self,
         wal_file_id_range: WalFileRange,
     ) -> Result<Box<dyn WalIterator>, WalError>;
+
+    /// Returns the ID of the last WAL file currently present after `replay_after_wal_id`, or
+    /// `replay_after_wal_id` if no later WAL file is present. Implementations may use
+    /// `replay_after_wal_id` as a known lower bound when locating the end of the WAL.
+    async fn last_wal_file_id(&self, replay_after_wal_id: u64) -> Result<u64, WalError>;
 }
 
 /// API for plugging into WAL GC
 #[async_trait]
-pub trait WalGC {
+pub trait WalGc {
     /// Hook for garbage collecting the WAL. Takes a list of ranges of WAL Files that are currently
     /// referenced by some active Manifest. The implementation may delete any WAL File that is not
     /// included in the ranges in this list.
@@ -396,6 +407,65 @@ pub trait WalGC {
         referenced_ranges: Vec<WalFileRange>,
     ) -> Result<(), WalError>;
 }
+
+/// Administrative operations for a WAL implementation.
+#[async_trait]
+pub trait WalAdmin: Send + Sync + 'static {
+    /// Creates a garbage collector scoped to the WAL at `path`.
+    ///
+    /// ## Arguments
+    /// - `path`: The database path whose WAL should be garbage collected.
+    ///
+    /// ## Returns
+    /// A garbage collector that can remove unreferenced WAL files at `path`.
+    fn garbage_collector(&self, path: &Path) -> Box<dyn WalGc>;
+
+    /// Deletes the WAL at `path`.
+    ///
+    /// ## Arguments
+    /// - `path`: The database path whose WAL should be deleted.
+    ///
+    /// ## Returns
+    /// `Ok(())` after the WAL has been deleted, or a [`WalError`] if deletion fails.
+    async fn delete_wal(&self, path: &Path) -> Result<(), WalError>;
+
+    /// Given a path and WAL ID range, returns true if the WAL at that path is empty within the
+    /// specified range. A WAL is empty if it holds no records.
+    ///
+    /// ## Arguments
+    /// - `path`: The database path containing the WAL.
+    /// - `replay_after_wal_id`: The exclusive lower bound of the WAL range to inspect.
+    /// - `wal_id_last_seen`: The inclusive upper bound of the WAL range to inspect.
+    ///
+    /// ## Returns
+    /// `Ok(true)` if the referenced WAL contains no records, `Ok(false)` if it contains records,
+    /// or a [`WalError`] if the WAL could not be inspected.
+    async fn is_empty(
+        &self,
+        path: &Path,
+        replay_after_wal_id: u64,
+        wal_id_last_seen: u64,
+    ) -> Result<bool, WalError>;
+
+    /// Given a source path and manifest, copy the referenced WAL to a destination path and return
+    /// a replay range. This call must be idempotent (TODO: clarify)
+    ///
+    /// ## Arguments
+    /// - `from_path`: The db path that holds the source WAL range to be copied
+    /// - `from_manifest`: The source manifest that identifies the WAL to copy
+    /// - `to_path`: The db path of the clone that the WAL is being copied to.
+    ///
+    /// ## Returns
+    /// A (u64, u64) pair. The first item will be used as the replay start point (exclusive). The
+    /// second item should be the id of the last WAL file id in the copied WAL.
+    async fn clone_wal(
+        &self,
+        from_path: &Path,
+        from_manifest: VersionedManifest,
+        to_path: &Path,
+    ) -> Result<(u64, u64), WalError>;
+}
+
 ```
 
 Users can configure a custom WAL for the writer and reader using the db Builder:
@@ -563,6 +633,10 @@ Memtable and Db flushing stay the same. The Batch Writer task annotates each imm
 with a safe replay point using `WalStatus::last_flushed_wal_id`, and flushes the WAL using 
 `WalWriter::flush`.
 
+As part of this change we will move tracking of early memtable flush via
+`max_wal_flushes_before_l0_flush` to the native WAL implementation in the implementation of
+`WalWriter::should_flush_memtable`.
+
 #### Garbage Collection
 
 `WalGcTask` lists manifests to determine the set of referenced WAL File IDs and then delegates 
@@ -574,39 +648,30 @@ then deletes them.
 `DbReaderBuilder` initializes `DbReader` with a `WalReader` that it uses to construct iterators 
 for replaying the WAL when loading a checkpoint.
 
-`DbReader` will now also continually stream WAL updates when configured to track the latest 
-writes. It does this by creating its `WalIterator` with an unbounded end range and blocking on 
-`next` from its background polling task. If the reader observes a `WalError::WalTruncated` then it
+`DbReader` continually discovers WAL updates when configured to track the latest writes. It
+resolves the current tail, creates a bounded `WalIterator`, drains it to completion, and then
+refreshes the manifest before the next pass. If the reader observes a `WalError::WalTruncated`, it
 immediately refreshes the manifest.
 
 #### CDC
 
-We'll deprecate/remove the current CDC API. Users can use the `WalReader`/`WalIterator` proposed
-in this RFC. SlateDB's native `WalReader` will take a buffer size and a poll interval to use when
-tailing the current WAL:
+We'll deprecate/remove the file-listing CDC API. CDC users can use SlateDB's native
+`SlateDbWalReader`, which implements the `WalReader`/`WalIterator` traits proposed in this RFC.
 
-```rust
-struct ObjectStoreWalReader {
-    // ...
-}
+CDC uses an iterator with an unbounded end range. A consumer keeps the last fully consumed WAL
+file ID, creates one iterator over `(cursor + 1)..`, and persists each
+`WalRows.last_consumed_wal_file_id`. At the current tail, `WalIterator::next` polls the manifest and
+waits for the next WAL file rather than ending, so the caller does not alternate between tail
+discovery and iterator creation. Empty fence WALs return an empty batch that still advances the
+cursor. After a restart, the consumer creates a new iterator from the persisted cursor plus one.
 
-impl ObjectStoreWalReader {
-    pub fn new<P: Into<Path>>(
-        path: P,
-        object_store: Arc<dyn ObjectStore>,
-        /// The number of WAL Files to prefetch and buffer when streaming the WAL
-        buffered_files: usize,
-        /// The interval at which the next WAL file will be polled when streaming the latest updates
-        poll_interval: Duration
-    ) {
-        todo!()
-    }
-}
+#### Clones
 
-impl WalReader for ObjectStoreWalReader {
-    // ...
-}
-```
+Clone creation delegates to `WalAdmin::empty` to introspect source WALs to determine if they are
+empty when validating that unions/projections don't require copying the WAL.
+
+Clone creation delegates to `WalAdmin::clone_wal` to copy the WAL from the source db to the clone
+db.
 
 #### Error Handling
 
@@ -714,8 +779,8 @@ implementation is correct. Some important test cases we'll cover (non-exhaustive
 - `WalWriter` emits events when rows are durably stored.
 - `WalIterator` always iterates over writes in sequence order
 - `WalIterator` always returns full write batches in `WalRows`
-- `WalIterator` tracks the WAL file id in `WalRows` correctly (TODO: this probably needs some 
-  test interfaces in the reader for listing/reading wal files)
+- `WalIterator` tracks the last consumed WAL file id in `WalRows` correctly (TODO: this probably
+  needs some test interfaces in the reader for listing/reading wal files)
 
 **Performance**
 
@@ -730,8 +795,8 @@ benchmark tools that instantiate `DbBench` with a db configured to use a custom 
 
 ## Packaging
 
-The WAL traits and conformance tests will reside in a new crate called `slatedb-wal`. The native
-WAL implementation remains in `slatedb`.
+The WAL traits and conformance tests will all reside in the `wal` module. The native
+WAL implementation will move to a nested module `wal::slatedb`.
 
 ## Alternatives
 
@@ -771,6 +836,15 @@ reasonable/general.
 We could have `WalReader`/`WalIterator` iterate over WAL Files which in turn support row-based 
 iteration (similar to the CDC `WalReader`). I don't really see the benefit of imposing the extra 
 layering. It also forces implementations to map each write batch to a single WAL File.
+
+**Put WAL Trait Definitions in Separate Create**
+Initially this RFC proposed putting the WAL trait defs in a separate crate so that implementors
+only need to import that crate (vs all of slatedb). We opted not to go this route for a few reasons:
+- This requires moving core slatedb types out to either the new wal crate or to slatedb-common. In
+  particular, we'd need to move all the manifest definitions (`VersionedManifest`, `Manifest`) and
+  `RowEntry` as these are used by the writer init and reader/iterator, respectively.
+- A separate crate isn't that useful. Implementors will almost always have to import slatedb
+  anyway to run end-to-end tests. And users of custom WALs would be importing slatedb anyway.
 
 ## Open Questions
 

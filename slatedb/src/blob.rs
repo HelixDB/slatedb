@@ -19,6 +19,7 @@ pub(crate) struct BytesBlob {
 }
 
 impl BytesBlob {
+    #[allow(dead_code)]
     pub(crate) fn new(bytes: Bytes) -> Self {
         Self { bytes }
     }

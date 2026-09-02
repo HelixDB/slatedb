@@ -193,11 +193,7 @@ impl FsCacheStorage {
 
 #[async_trait::async_trait]
 impl LocalCacheStorage for FsCacheStorage {
-    fn entry(
-        &self,
-        location: &object_store::path::Path,
-        part_size: usize,
-    ) -> Box<dyn LocalCacheEntry> {
+    fn entry(&self, location: &Path, part_size: usize) -> Box<dyn LocalCacheEntry> {
         Box::new(FsCacheEntry {
             root_folder: self.root_folder.clone(),
             location: location.clone(),
@@ -1227,7 +1223,7 @@ impl FsCacheEvictorInner {
     // a specific index. Returns None if no available index exists.
     fn pick_random_available_index(
         &self,
-        rng: &mut impl rand::Rng,
+        rng: &mut impl Rng,
         keys: &[std::path::PathBuf],
         picked: &HashSet<usize>,
         exclude_idx: Option<usize>,
@@ -1351,7 +1347,7 @@ mod tests {
             .prefix("objstore_cache_test_evictor_")
             .tempdir()
             .unwrap();
-        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let recorder = MetricsRecorderHelper::noop();
 
         let evictor = FsCacheEvictorInner::new(
             temp_dir.path().to_path_buf(),
@@ -1379,7 +1375,7 @@ mod tests {
             .await;
         assert_eq!(evicted, 2048);
 
-        let file_paths = walkdir::WalkDir::new(temp_dir.path())
+        let file_paths = WalkDir::new(temp_dir.path())
             .into_iter()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
             .collect::<Vec<_>>();
@@ -1392,7 +1388,7 @@ mod tests {
             .prefix("objstore_cache_test_evictor_backpressure_")
             .tempdir()
             .unwrap();
-        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let recorder = MetricsRecorderHelper::noop();
 
         let evictor = FsCacheEvictor::new(
             temp_dir.path().to_path_buf(),
@@ -1438,7 +1434,7 @@ mod tests {
             .prefix("objstore_cache_test_evictor_")
             .tempdir()
             .unwrap();
-        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let recorder = MetricsRecorderHelper::noop();
         let evictor = Arc::new(FsCacheEvictorInner::new(
             temp_dir.path().to_path_buf(),
             1024 * 2,
@@ -1469,7 +1465,7 @@ mod tests {
             .prefix("objstore_cache_test_evictor_")
             .tempdir()
             .unwrap();
-        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let recorder = MetricsRecorderHelper::noop();
 
         let evictor = Arc::new(FsCacheEvictorInner::new(
             temp_dir.path().to_path_buf(),
@@ -1497,7 +1493,7 @@ mod tests {
             .prefix("objstore_cache_usage_snapshot_")
             .tempdir()
             .unwrap();
-        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let recorder = MetricsRecorderHelper::noop();
         let usage = Arc::new(FsCacheUsage {
             initialized: AtomicBool::new(false),
             used_bytes: AtomicU64::new(0),
@@ -1571,7 +1567,7 @@ mod tests {
             .prefix("objstore_cache_usage_updates_")
             .tempdir()
             .unwrap();
-        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let recorder = MetricsRecorderHelper::noop();
         let storage = FsCacheStorage::new(
             temp_dir.path().to_path_buf(),
             None,
@@ -1658,7 +1654,7 @@ mod tests {
             .prefix("objstore_cache_test_pick_")
             .tempdir()
             .unwrap();
-        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let recorder = MetricsRecorderHelper::noop();
         let evictor = FsCacheEvictorInner::new(
             temp_dir.path().to_path_buf(),
             1024,

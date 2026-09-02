@@ -242,6 +242,11 @@ pub trait DbReadOps {
 /// This trait defines the asynchronous write API exposed by [`Db`](crate::Db),
 /// allowing consumers to write generic code or test doubles over the writer
 /// surface without depending on the concrete `Db` type.
+///
+/// Durability behavior is controlled by [`WriteOptions::await_durable`], which
+/// defaults to `true`. When it is `false`, call [`WriteHandle::await_durable`]
+/// on the returned handle to wait for one write, or [`Self::flush`] to flush
+/// all pending writes.
 #[async_trait::async_trait]
 pub trait DbWriteOps {
     /// The transaction type returned by [`Self::begin`]. Stub
@@ -251,6 +256,9 @@ pub trait DbWriteOps {
 
     /// Write a value into the database with default `PutOptions` and
     /// `WriteOptions`.
+    ///
+    /// The default write options wait for durability. See [`DbWriteOps`] for
+    /// details.
     ///
     /// ## Arguments
     /// - `key`: the key to write
@@ -269,6 +277,8 @@ pub trait DbWriteOps {
 
     /// Write a value into the database with custom `PutOptions` and
     /// `WriteOptions`.
+    ///
+    /// Durability behavior follows `write_opts`. See [`DbWriteOps`] for details.
     ///
     /// ## Arguments
     /// - `key`: the key to write
@@ -291,6 +301,9 @@ pub trait DbWriteOps {
 
     /// Delete a key from the database with default `WriteOptions`.
     ///
+    /// The default write options wait for durability. See [`DbWriteOps`] for
+    /// details.
+    ///
     /// ## Arguments
     /// - `key`: the key to delete
     ///
@@ -302,6 +315,8 @@ pub trait DbWriteOps {
     }
 
     /// Delete a key from the database with custom `WriteOptions`.
+    ///
+    /// Durability behavior follows `options`. See [`DbWriteOps`] for details.
     ///
     /// ## Arguments
     /// - `key`: the key to delete
@@ -317,6 +332,9 @@ pub trait DbWriteOps {
 
     /// Merge a value into the database with default `MergeOptions` and
     /// `WriteOptions`.
+    ///
+    /// The default write options wait for durability. See [`DbWriteOps`] for
+    /// details.
     ///
     /// Merge operations allow applications to bypass the traditional
     /// read/modify/write cycle by expressing partial updates using an
@@ -347,6 +365,8 @@ pub trait DbWriteOps {
     /// Merge a value into the database with custom `MergeOptions` and
     /// `WriteOptions`.
     ///
+    /// Durability behavior follows `write_opts`. See [`DbWriteOps`] for details.
+    ///
     /// ## Arguments
     /// - `key`: the key to merge into
     /// - `value`: the merge operand to apply
@@ -369,6 +389,9 @@ pub trait DbWriteOps {
 
     /// Write a batch of put/delete operations atomically to the database.
     ///
+    /// The default write options wait for durability. See [`DbWriteOps`] for
+    /// details.
+    ///
     /// ## Arguments
     /// - `batch`: the batch of operations to write
     ///
@@ -382,6 +405,8 @@ pub trait DbWriteOps {
     /// Write a batch of put/delete operations atomically to the database with
     /// custom `WriteOptions`.
     ///
+    /// Durability behavior follows `options`. See [`DbWriteOps`] for details.
+    ///
     /// ## Arguments
     /// - `batch`: the batch of operations to write
     /// - `options`: the write options to use
@@ -394,8 +419,8 @@ pub trait DbWriteOps {
         options: &WriteOptions,
     ) -> Result<WriteHandle, crate::Error>;
 
-    /// Flush in-memory writes to disk. This function blocks until the
-    /// in-memory data has been durably written to object storage.
+    /// Flush in-memory writes to object storage. This function blocks until
+    /// the in-memory data has been durably written.
     ///
     /// ## Errors
     /// - `Error`: if there was an error flushing the database.
@@ -589,6 +614,10 @@ pub trait DbTransactionOps: DbReadOps {
 
     /// Commit the transaction with default `WriteOptions`.
     ///
+    /// A successful commit applies the write atomically but does not wait for
+    /// durability. Call [`WriteHandle::await_durable`] on the returned handle
+    /// when the result is `Some`.
+    ///
     /// ## Returns
     /// - `Ok(Some(WriteHandle))` if the commit is successful and there are
     ///   writes in the batch.
@@ -605,6 +634,11 @@ pub trait DbTransactionOps: DbReadOps {
     }
 
     /// Commit the transaction with custom `WriteOptions`.
+    ///
+    /// A successful commit applies the write atomically but does not wait for
+    /// durability. Call [`WriteHandle::await_durable`] on the returned handle
+    /// when the result is `Some`.
+    ///
     async fn commit_with_options(
         self,
         options: &WriteOptions,

@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::mem;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -83,7 +82,7 @@ impl CompactionExecuteBench {
             BlockCachePolicy::default(),
         ));
         let num_keys = sst_bytes / (val_bytes + key_bytes);
-        let mut key_start = vec![0u8; key_bytes - mem::size_of::<u32>()];
+        let mut key_start = vec![0u8; key_bytes - size_of::<u32>()];
         self.rand.rng().fill_bytes(key_start.as_mut_slice());
         let mut futures = FuturesUnordered::<JoinHandle<Result<(), SlateDBError>>>::new();
         for i in 0..num_ssts {
@@ -183,7 +182,7 @@ impl CompactionExecuteBench {
             .now()
             .signed_duration_since(start)
             .num_milliseconds();
-        info!("wrote sst [id={:?}, elapsed_ms={}]", &sst.id, elapsed_ms);
+        info!("wrote sst [id={:?}, elapsed_ms={}]", sst.id, elapsed_ms);
         Ok(())
     }
 

@@ -141,10 +141,7 @@ impl BlockBuilder {
         }
     }
 
-    pub(crate) fn add(
-        &mut self,
-        entry: crate::types::RowEntry,
-    ) -> Result<bool, crate::error::SlateDBError> {
+    pub(crate) fn add(&mut self, entry: crate::types::RowEntry) -> Result<bool, SlateDBError> {
         match self {
             Self::V1(builder) => builder.add(entry),
             Self::V2(builder) => builder.add(entry),
@@ -197,10 +194,7 @@ impl BlockBuilderWithStats {
         self.builder.would_fit(entry)
     }
 
-    pub(crate) fn add(
-        &mut self,
-        entry: crate::types::RowEntry,
-    ) -> Result<bool, crate::error::SlateDBError> {
+    pub(crate) fn add(&mut self, entry: crate::types::RowEntry) -> Result<bool, SlateDBError> {
         match &entry.value {
             crate::types::ValueDeletable::Value(_) => self.stats.num_puts += 1,
             crate::types::ValueDeletable::Merge(_) => self.stats.num_merges += 1,
@@ -414,7 +408,7 @@ pub(crate) struct EncodedSsTableFooterBuilder<'a, 'b> {
     /// codec for the SST info
     sst_info_codec: &'a dyn SsTableInfoCodec,
     /// builder for the index block
-    index_builder: flatbuffers::FlatBufferBuilder<'b, flatbuffers::DefaultAllocator>,
+    index_builder: flatbuffers::FlatBufferBuilder<'b, DefaultAllocator>,
     /// metadata block
     block_meta: Vec<flatbuffers::WIPOffset<BlockMeta<'b>>>,
     /// filter blocks
@@ -621,7 +615,12 @@ pub(crate) async fn compress_and_transform(
 ) -> Result<usize, SlateDBError> {
     let compressed = match compression_codec {
         None => data,
-        Some(c) => compress(data, c)?,
+        Some(c) => {
+            let compressed = compress(data, c)?;
+            // Account for CPU-only compression work.
+            tokio::task::coop::consume_budget().await;
+            compressed
+        }
     };
     let transformed = transform(compressed, block_transformer).await?;
     let checksum = crc32fast::hash(&transformed);
@@ -685,10 +684,15 @@ pub(crate) async fn transform(
     block_transformer: Option<&Arc<dyn BlockTransformer>>,
 ) -> Result<Bytes, SlateDBError> {
     let transformed = match block_transformer {
-        Some(t) => t
-            .encode(data)
-            .await
-            .map_err(|_| SlateDBError::BlockTransformError)?,
+        Some(t) => {
+            let transformed = t
+                .encode(data)
+                .await
+                .map_err(|_| SlateDBError::BlockTransformError)?;
+            // Account for CPU-only transformation work.
+            tokio::task::coop::consume_budget().await;
+            transformed
+        }
         None => data,
     };
     Ok(transformed)
@@ -698,6 +702,7 @@ pub(crate) type LengthOffsetAndVersion = (u64, u64, u16);
 
 pub(crate) type TableInfoAndVersion = (SsTableInfo, u16);
 
+#[allow(dead_code)]
 pub(crate) enum StagedSstInfoError {
     Initial(SlateDBError),
     Later(SlateDBError),
@@ -728,6 +733,7 @@ impl Default for SsTableFormat {
     }
 }
 
+#[allow(dead_code)]
 impl SsTableFormat {
     async fn read_length_and_metadata_offset_and_version(
         &self,
@@ -1247,13 +1253,17 @@ impl SsTableFormat {
         }
     }
 
-    fn block_range(
+    pub(crate) fn block_range(
         &self,
         blocks: Range<usize>,
         info: &SsTableInfo,
         index: &SsTableIndex,
     ) -> Range<u64> {
-        let mut end_offset = info.filter_offset;
+        let mut end_offset = if info.filter_len > 0 {
+            info.filter_offset
+        } else {
+            info.index_offset
+        };
         if blocks.end < index.block_meta().len() {
             let next_block_meta = index.block_meta().get(blocks.end);
             end_offset = next_block_meta.offset();

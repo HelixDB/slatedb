@@ -121,7 +121,7 @@ mod composite_filters {
         let put = PutOptions::default();
         let write = WriteOptions {
             await_durable: false,
-            seqnum: 0,
+            ..WriteOptions::default()
         };
         // Write each batch in its own SST so multiple SSTs participate in the
         // read path and the filter has something to actually skip.
@@ -301,7 +301,7 @@ mod subrange {
         let put = PutOptions::default();
         let write = WriteOptions {
             await_durable: false,
-            seqnum: 0,
+            ..WriteOptions::default()
         };
         let ssts: &[&[&[u8]]] = &[
             &[b"aaa1", b"ccc1"], // sandwich
@@ -495,7 +495,7 @@ mod empty_prefix_filter {
         let put = PutOptions::default();
         let write = WriteOptions {
             await_durable: false,
-            seqnum: 0,
+            ..WriteOptions::default()
         };
         for key in [b"a".as_slice(), b"b".as_slice()] {
             db.put_with_options(key, b"v", &put, &write)
@@ -585,7 +585,7 @@ mod prop_test {
         let put_opts = PutOptions::default();
         let write_opts = WriteOptions {
             await_durable: false,
-            seqnum: 0,
+            ..Default::default()
         };
         for (i, key) in keys.iter().enumerate() {
             let value = format!("v{}", i).into_bytes();
