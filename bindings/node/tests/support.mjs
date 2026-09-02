@@ -63,6 +63,7 @@ export function scanOptions(readAheadBytes, cacheBlocks, maxFetchTasks) {
 export function readerOptions(skipWalReplay) {
   return {
     manifest_poll_interval_ms: 100,
+    wal_poll_interval_ms: 100,
     checkpoint_lifetime_ms: 1_000,
     max_memtable_bytes: 64 * 1024 * 1024,
     skip_wal_replay: skipWalReplay,

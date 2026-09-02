@@ -1456,6 +1456,7 @@ func TestDbReaderRefreshBehavior(t *testing.T) {
 		t.Helper()
 		if err := builder.WithOptions(slatedb.ReaderOptions{
 			ManifestPollIntervalMs: 100,
+			WalPollIntervalMs:      100,
 			CheckpointLifetimeMs:   1000,
 			MaxMemtableBytes:       64 * 1024 * 1024,
 			SkipWalReplay:          false,
@@ -1488,6 +1489,7 @@ func TestDbReaderWalReplayBehavior(t *testing.T) {
 			t.Helper()
 			if err := builder.WithOptions(slatedb.ReaderOptions{
 				ManifestPollIntervalMs: 100,
+				WalPollIntervalMs:      100,
 				CheckpointLifetimeMs:   1000,
 				MaxMemtableBytes:       64 * 1024 * 1024,
 				SkipWalReplay:          false,
@@ -1534,6 +1536,7 @@ func TestDbReaderWalReplayBehavior(t *testing.T) {
 			t.Helper()
 			if err := builder.WithOptions(slatedb.ReaderOptions{
 				ManifestPollIntervalMs: 100,
+				WalPollIntervalMs:      100,
 				CheckpointLifetimeMs:   1000,
 				MaxMemtableBytes:       64 * 1024 * 1024,
 				SkipWalReplay:          true,
@@ -1566,6 +1569,7 @@ func TestDbReaderWalReplayBehavior(t *testing.T) {
 			t.Helper()
 			if err := builder.WithOptions(slatedb.ReaderOptions{
 				ManifestPollIntervalMs: 100,
+				WalPollIntervalMs:      100,
 				CheckpointLifetimeMs:   1000,
 				MaxMemtableBytes:       64 * 1024 * 1024,
 				SkipWalReplay:          true,

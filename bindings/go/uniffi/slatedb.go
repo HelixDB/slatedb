@@ -10410,6 +10410,8 @@ func (_ FfiDestroyerReadOptions) Destroy(value ReadOptions) {
 type ReaderOptions struct {
 	// How often the reader polls for new manifests and WAL data, in milliseconds.
 	ManifestPollIntervalMs uint64
+	// How frequently an open reader probes the exact next WAL ID.
+	WalPollIntervalMs uint64
 	// Lifetime of an internally managed checkpoint, in milliseconds.
 	CheckpointLifetimeMs uint64
 	// Maximum size of one in-memory table used while replaying WAL data.
@@ -10425,6 +10427,7 @@ type ReaderOptions struct {
 
 func (r *ReaderOptions) Destroy() {
 	FfiDestroyerUint64{}.Destroy(r.ManifestPollIntervalMs)
+	FfiDestroyerUint64{}.Destroy(r.WalPollIntervalMs)
 	FfiDestroyerUint64{}.Destroy(r.CheckpointLifetimeMs)
 	FfiDestroyerUint64{}.Destroy(r.MaxMemtableBytes)
 	FfiDestroyerBool{}.Destroy(r.SkipWalReplay)
@@ -10444,6 +10447,7 @@ func (c FfiConverterReaderOptions) Read(reader io.Reader) ReaderOptions {
 		FfiConverterUint64INSTANCE.Read(reader),
 		FfiConverterUint64INSTANCE.Read(reader),
 		FfiConverterUint64INSTANCE.Read(reader),
+		FfiConverterUint64INSTANCE.Read(reader),
 		FfiConverterBoolINSTANCE.Read(reader),
 		FfiConverterOptionalUint32INSTANCE.Read(reader),
 	}
@@ -10459,6 +10463,7 @@ func (c FfiConverterReaderOptions) LowerExternal(value ReaderOptions) ExternalCR
 
 func (c FfiConverterReaderOptions) Write(writer io.Writer, value ReaderOptions) {
 	FfiConverterUint64INSTANCE.Write(writer, value.ManifestPollIntervalMs)
+	FfiConverterUint64INSTANCE.Write(writer, value.WalPollIntervalMs)
 	FfiConverterUint64INSTANCE.Write(writer, value.CheckpointLifetimeMs)
 	FfiConverterUint64INSTANCE.Write(writer, value.MaxMemtableBytes)
 	FfiConverterBoolINSTANCE.Write(writer, value.SkipWalReplay)
