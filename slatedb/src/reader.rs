@@ -1343,6 +1343,59 @@ mod tests {
         Ok(wb_batch)
     }
 
+    #[rstest]
+    #[case::updated_value(RowEntry::new_value(b"k", b"new", 2), Some(Bytes::from_static(b"new")))]
+    #[case::deleted_value(RowEntry::new_tombstone(b"k", 2), None)]
+    #[case::merge_operand(RowEntry::new_merge(b"k", b"+", 2), Some(Bytes::from_static(b"old+")))]
+    #[tokio::test]
+    async fn review_multi_get_preserves_sorted_run_boundary_order(
+        #[case] newest_row: RowEntry,
+        #[case] expected: Option<Bytes>,
+    ) -> Result<(), SlateDBError> {
+        let mut state = TestDbState::new().await;
+        let newest = state.build_sst(vec![newest_row]).await?;
+        let oldest = state
+            .build_sst(vec![RowEntry::new_value(b"k", b"old", 1)])
+            .await?;
+        // A valid run orders versions newest-first across the shared boundary
+        // key. View IDs generated within the same millisecond can sort in the
+        // opposite order because their random component is not monotonic.
+        Arc::make_mut(&mut state.core.tree)
+            .compacted
+            .push(SortedRun::new(
+                0,
+                [
+                    SsTableView::new(Ulid::from_parts(1, 2), newest),
+                    SsTableView::new(Ulid::from_parts(1, 1), oldest),
+                ],
+            ));
+        let stats = DbStats::new(&MetricsRecorderHelper::noop());
+        let reader = build_reader(&state, stats, true).await;
+        let options = ReadOptions::default();
+        let single = reader
+            .get_key_value_with_options(b"k", &options, &state, None, None)
+            .await?
+            .map(|kv| kv.value);
+        assert_eq!(single, expected, "point get follows sorted-run order");
+
+        let keys = [Bytes::from_static(b"k"), Bytes::from_static(b"k")];
+        let snapshot = reader
+            .multi_get_key_value_with_options(&keys, &options, &state, Some(1))
+            .await?;
+        assert!(snapshot
+            .iter()
+            .all(|kv| kv.as_ref().map(|kv| kv.value.as_ref()) == Some(b"old")));
+
+        let multi = reader
+            .multi_get_key_value_with_options(&keys, &options, &state, None)
+            .await?
+            .into_iter()
+            .map(|kv| kv.map(|kv| kv.value))
+            .collect::<Vec<_>>();
+        assert_eq!(multi, vec![single.clone(), single]);
+        Ok(())
+    }
+
     struct LayerPriorityTestCase {
         /// Test entries with their layer locations
         entries: Vec<TestEntry>,
