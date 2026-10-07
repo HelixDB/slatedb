@@ -702,8 +702,8 @@ impl TableStore {
     /// [`Self::block_loader`] because they require a block index lookup.
     ///
     /// Building one formats the SST path, clones shared handles and boxes a
-    /// closure, so callers build it only after a cache probe has missed: cache
-    /// hits never pay for a loader they would not invoke.
+    /// closure, so callers build it only after a cache probe has missed or
+    /// failed: cache hits never pay for a loader they would not invoke.
     fn read_loader(&self, handle: &SsTableHandle, target: CacheTarget) -> CacheLoader {
         let info = handle.info.clone();
         let object_store = self.object_stores.store_for(&handle.id);
@@ -756,7 +756,7 @@ impl TableStore {
     }
 
     /// Build a [`CacheLoader`] for one data block. Like [`Self::read_loader`],
-    /// callers build it only after a cache probe has missed.
+    /// callers build it only after a cache probe has missed or failed.
     fn block_loader(
         &self,
         handle: &SsTableHandle,
@@ -1325,6 +1325,35 @@ mod tests {
     use slatedb_common::DbRand;
 
     const ROOT: &str = "/root";
+
+    /// Opens a small memory-and-disk foyer cache over `dir`, which survives close
+    /// and reopen.
+    #[cfg(feature = "foyer")]
+    async fn open_hybrid_cache<V: foyer::StorageValue>(
+        dir: &std::path::Path,
+    ) -> foyer::HybridCache<CachedKey, V> {
+        use foyer::{
+            BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCacheBuilder,
+            PsyncIoEngineConfig,
+        };
+        HybridCacheBuilder::new()
+            .memory(1024 * 1024)
+            .with_weighter(|_, _: &V| 1)
+            .storage()
+            .with_io_engine_config(PsyncIoEngineConfig::new())
+            .with_engine_config(
+                BlockEngineConfig::new(
+                    FsDeviceBuilder::new(dir)
+                        .with_capacity(4 * 1024 * 1024)
+                        .build()
+                        .unwrap(),
+                )
+                .with_block_size(64 * 1024),
+            )
+            .build()
+            .await
+            .unwrap()
+    }
 
     /// Wraps an object store: counts range-bounded `get_opts` calls and pauses the first
     /// one until `release` is notified. Other methods just delegate. Shared by the
@@ -2557,6 +2586,45 @@ mod tests {
         }
     }
 
+    /// A hybrid cache whose disk tier holds an entry it cannot decode fails the
+    /// probe, yet its fetch still runs the loader and keeps the entry in memory,
+    /// so the next read is served by the cache rather than the object store.
+    #[cfg(feature = "foyer")]
+    #[tokio::test]
+    async fn undecodable_hybrid_disk_entry_is_reloaded_through_the_fetch() {
+        use crate::db_cache::{foyer_hybrid::FoyerHybridCache, CachedEntry};
+
+        // given: an SST, and a disk cache holding bytes under its index key that do
+        // not decode as a cache entry
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (format, handle, _) = write_sst_with_every_section(&store).await;
+        let index_key = CachedKey::from((handle.id, handle.info.index_offset));
+        let dir = tempfile::tempdir().unwrap();
+        let planted = open_hybrid_cache::<Vec<u8>>(dir.path()).await;
+        planted.insert(index_key.clone(), vec![0xAB; 64]);
+        planted.close().await.unwrap();
+        drop(planted);
+        let cache = Arc::new(FoyerHybridCache::new_with_cache(
+            open_hybrid_cache::<CachedEntry>(dir.path()).await,
+        ));
+        assert!(cache.get_index(&index_key).await.is_err());
+        let reader = TableStore::new(
+            ObjectStores::new(store.clone(), None),
+            format,
+            Path::from(ROOT),
+            Some(cache),
+            TableStoreKind::Main,
+            BlockCachePolicy::default(),
+        );
+
+        // when: the index is read with cache_blocks=true, then the SST disappears
+        let index = reader.read_index(&handle, true).await.unwrap();
+        store.delete(&reader.path(&handle.id)).await.unwrap();
+
+        // then: the next read is served by the cache
+        assert!(reader.read_index(&handle, true).await.unwrap() == index);
+    }
+
     /// A failed probe counts a cache error, not an access, and the fetch after it
     /// counts a second error only when it fails too.
     #[tokio::test]
@@ -3477,9 +3545,12 @@ mod tests {
     ///    object-store call); the release fires only after B has registered as a
     ///    waiter.
     #[cfg(feature = "foyer")]
+    #[rstest]
+    #[case::memory_cache(false)]
+    #[case::hybrid_cache(true)]
     #[tokio::test]
-    async fn dedups_concurrent_reads_through_object_store() {
-        use crate::db_cache::foyer::FoyerCache;
+    async fn dedups_concurrent_reads_through_object_store(#[case] hybrid: bool) {
+        use crate::db_cache::{foyer::FoyerCache, foyer_hybrid::FoyerHybridCache};
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use tokio::sync::Notify;
 
@@ -3511,7 +3582,7 @@ mod tests {
             .unwrap();
 
         // given: the same store wrapped so the first range read pauses, behind a
-        // real FoyerCache that supports dedup
+        // real foyer cache (memory-only or hybrid) that supports dedup
         let first_read_started = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let counting = Arc::new(PauseFirstReadStore {
@@ -3522,7 +3593,14 @@ mod tests {
             release: release.clone(),
         });
         let counting_store: Arc<dyn ObjectStore> = counting.clone();
-        let cache: Arc<dyn DbCache> = Arc::new(FoyerCache::new());
+        let dir = tempfile::tempdir().unwrap();
+        let cache: Arc<dyn DbCache> = if hybrid {
+            Arc::new(FoyerHybridCache::new_with_cache(
+                open_hybrid_cache(dir.path()).await,
+            ))
+        } else {
+            Arc::new(FoyerCache::new())
+        };
         let reader = Arc::new(TableStore::new(
             ObjectStores::new(counting_store, None),
             format,
@@ -3548,8 +3626,9 @@ mod tests {
             "exactly one read should have hit the store so far"
         );
 
-        // when: task B races A for the same index. join! polls B first, so B's
-        // fetch_index reaches foyer's dedup map before release_task fires.
+        // when: task B races A for the same index. join! polls B first, so B
+        // reaches foyer's dedup map (via fetch_index, or already via the hybrid
+        // cache's probe) before release_task fires.
         let task_b = {
             let reader = reader.clone();
             let handle = handle.clone();
@@ -3581,9 +3660,12 @@ mod tests {
     /// in `read_blocks_using_index` that routes 1-block reads (e.g. point-gets via
     /// `SstIterator::for_key`) through `cache.fetch_block`.
     #[cfg(feature = "foyer")]
+    #[rstest]
+    #[case::memory_cache(false)]
+    #[case::hybrid_cache(true)]
     #[tokio::test]
-    async fn dedups_concurrent_block_reads_through_object_store() {
-        use crate::db_cache::foyer::FoyerCache;
+    async fn dedups_concurrent_block_reads_through_object_store(#[case] hybrid: bool) {
+        use crate::db_cache::{foyer::FoyerCache, foyer_hybrid::FoyerHybridCache};
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use tokio::sync::Notify;
 
@@ -3620,7 +3702,7 @@ mod tests {
         let index = writer.read_index(&handle, false).await.unwrap();
 
         // given: the same store wrapped so the first range read pauses, behind a
-        // real FoyerCache that supports dedup
+        // real foyer cache (memory-only or hybrid) that supports dedup
         let first_read_started = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let counting = Arc::new(PauseFirstReadStore {
@@ -3631,7 +3713,14 @@ mod tests {
             release: release.clone(),
         });
         let counting_store: Arc<dyn ObjectStore> = counting.clone();
-        let cache: Arc<dyn DbCache> = Arc::new(FoyerCache::new());
+        let dir = tempfile::tempdir().unwrap();
+        let cache: Arc<dyn DbCache> = if hybrid {
+            Arc::new(FoyerHybridCache::new_with_cache(
+                open_hybrid_cache(dir.path()).await,
+            ))
+        } else {
+            Arc::new(FoyerCache::new())
+        };
         let reader = Arc::new(TableStore::new(
             ObjectStores::new(counting_store, None),
             format,
@@ -3662,8 +3751,9 @@ mod tests {
             "exactly one read should have hit the store so far"
         );
 
-        // when: task B races A for the same block. join! polls B first, so B's
-        // fetch_block reaches foyer's dedup map before release_task fires.
+        // when: task B races A for the same block. join! polls B first, so B
+        // reaches foyer's dedup map (via fetch_block, or already via the hybrid
+        // cache's probe) before release_task fires.
         let task_b = {
             let reader = reader.clone();
             let handle = handle.clone();
