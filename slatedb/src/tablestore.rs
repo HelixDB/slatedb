@@ -581,22 +581,24 @@ impl TableStore {
         }
         let cache_key: CachedKey = (handle.id, handle.info.filter_offset).into();
         if let Some(cache) = self.cache_for_reads() {
-            // cache_blocks=true: dedup-aware fetch; concurrent callers collapse onto
-            // one loader. cache_blocks=false: read-only lookup that won't pollute the
-            // cache on miss. Cache errors fall through to a best-effort direct load;
-            // we intentionally don't re-insert there — `fetch_X` errors are almost
+            // Probe first so a hit never builds a loader (SST path formatting, boxed
+            // closure, Arc clones). On a miss, cache_blocks=true takes the dedup-aware
+            // fetch: concurrent callers collapse onto one loader. cache_blocks=false
+            // is a read-only lookup that won't pollute the cache on miss. Probe and
+            // fetch errors fall through to a best-effort direct load; we
+            // intentionally don't re-insert there — `fetch_X` errors are almost
             // always the smuggled loader error (so the direct retry will also fail),
             // and on the rare foyer-machinery error an insert would likely fail too.
-            let entry = if cache_blocks {
-                cache
+            let entry = match cache.get_filter(&cache_key).await {
+                Ok(Some(entry)) => Some(entry),
+                Ok(None) if cache_blocks => cache
                     .fetch_filter(
                         cache_key.clone(),
                         self.read_loader(handle, CacheTarget::Filters),
                     )
                     .await
-                    .ok()
-            } else {
-                cache.get_filter(&cache_key).await.unwrap_or(None)
+                    .ok(),
+                Ok(None) | Err(_) => None,
             };
             if let Some(entry) = entry {
                 // Already decoded.
@@ -636,13 +638,13 @@ impl TableStore {
         let cache_key = (handle.id, handle.info.stats_offset).into();
         if let Some(cache) = self.cache_for_reads() {
             // See `read_filters` for the rationale on the fall-through path.
-            let entry = if cache_blocks {
-                cache
+            let entry = match cache.get_stats(&cache_key).await {
+                Ok(Some(entry)) => Some(entry),
+                Ok(None) if cache_blocks => cache
                     .fetch_stats(cache_key, self.read_loader(handle, CacheTarget::Stats))
                     .await
-                    .ok()
-            } else {
-                cache.get_stats(&cache_key).await.unwrap_or(None)
+                    .ok(),
+                Ok(None) | Err(_) => None,
             };
             if let Some(stats) = entry.and_then(|e| e.sst_stats()) {
                 return Ok(Some(stats.as_ref().clone()));
@@ -670,13 +672,13 @@ impl TableStore {
         let cache_key = (handle.id, handle.info.index_offset).into();
         if let Some(cache) = self.cache_for_reads() {
             // See `read_filters` for the rationale on the fall-through path.
-            let entry = if cache_blocks {
-                cache
+            let entry = match cache.get_index(&cache_key).await {
+                Ok(Some(entry)) => Some(entry),
+                Ok(None) if cache_blocks => cache
                     .fetch_index(cache_key, self.read_loader(handle, CacheTarget::Index))
                     .await
-                    .ok()
-            } else {
-                cache.get_index(&cache_key).await.unwrap_or(None)
+                    .ok(),
+                Ok(None) | Err(_) => None,
             };
             if let Some(index) = entry.and_then(|e| e.sst_index()) {
                 return Ok(index);
@@ -696,9 +698,9 @@ impl TableStore {
     /// or index). Panics on [`CacheTarget::Data`]: data blocks resolve through
     /// [`Self::block_loader`] because they require a block index lookup.
     ///
-    /// Builds a fresh boxed closure on every call, even when the cache hits and
-    /// the loader is never invoked; revisit if cache-hit allocations show up in
-    /// profiles.
+    /// Building one formats the SST path, clones shared handles and boxes a
+    /// closure, so callers build it only after a cache probe has missed: cache
+    /// hits never pay for a loader they would not invoke.
     fn read_loader(&self, handle: &SsTableHandle, target: CacheTarget) -> CacheLoader {
         let info = handle.info.clone();
         let object_store = self.object_stores.store_for(&handle.id);
@@ -750,9 +752,8 @@ impl TableStore {
         })
     }
 
-    /// Builds a fresh boxed closure on every call, even when the cache hits and
-    /// the loader is never invoked; revisit if cache-hit allocations show up in
-    /// profiles.
+    /// Build a [`CacheLoader`] for one data block. Like [`Self::read_loader`],
+    /// callers build it only after a cache probe has missed.
     fn block_loader(
         &self,
         handle: &SsTableHandle,
@@ -884,26 +885,34 @@ impl TableStore {
         // etc.) take a dedup-aware fast-path: concurrent callers for the same block
         // collapse onto one loader. Multi-block reads fall through to the range-
         // coalesced path below, which issues one object-store GET per contiguous
-        // run of uncached blocks. Cache errors fall through to the direct load,
-        // which produces the authoritative error if any.
+        // run of uncached blocks. The single-block path probes the cache before
+        // building a loader, so hits skip the loader setup. Cache errors fall
+        // through to the direct load, which produces the authoritative error if
+        // any.
         if cache_blocks && blocks.len() == 1 {
             if let Some(cache) = self.cache_for_reads() {
                 let block_num = blocks.start;
                 let offset = index.borrow().block_meta().get(block_num).offset();
                 let cache_key: CachedKey = (handle.id, offset).into();
-                let loader = self.block_loader(handle, index.clone(), block_num);
-                if let Ok(entry) = cache.fetch_block(cache_key, loader).await {
-                    if let Some(block) = entry.block() {
-                        let mut result = VecDeque::with_capacity(1);
-                        result.push_back(block);
-                        return Ok(result);
-                    }
+                let entry = match cache.get_block(&cache_key).await {
+                    Ok(Some(entry)) => Some(entry),
+                    Ok(None) => cache
+                        .fetch_block(
+                            cache_key,
+                            self.block_loader(handle, index.clone(), block_num),
+                        )
+                        .await
+                        .ok(),
+                    Err(_) => None,
+                };
+                if let Some(block) = entry.and_then(|entry| entry.block()) {
+                    let mut result = VecDeque::with_capacity(1);
+                    result.push_back(block);
+                    return Ok(result);
                 }
             }
         }
 
-        let object_store = self.object_stores.store_for(&handle.id);
-        let path = self.path(&handle.id);
         // Initialize the result vector and a vector to track uncached ranges
         let mut blocks_read = VecDeque::with_capacity(blocks.end - blocks.start);
         let mut uncached_ranges = Vec::new();
@@ -949,7 +958,14 @@ impl TableStore {
             // If no cache is available, treat all blocks as uncached
             uncached_ranges.push(blocks.clone());
         }
+        // Every block came from the cache: skip resolving the SST path.
+        if uncached_ranges.is_empty() {
+            return Ok(blocks_read);
+        }
+
         // Read uncached blocks concurrently
+        let object_store = self.object_stores.store_for(&handle.id);
+        let path = self.path(&handle.id);
         let uncached_blocks = join_all(uncached_ranges.iter().map(|range| {
             let object_store = &object_store;
             let path = &path;
@@ -2168,6 +2184,311 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    /// Writes, through a cacheless table store, a compacted SST holding an index,
+    /// filters, stats and one data block per row. Returns the format to read it
+    /// back with, its handle and its rows in order.
+    async fn write_sst_with_every_section(
+        store: &Arc<dyn ObjectStore>,
+    ) -> (SsTableFormat, SsTableHandle, Vec<(Vec<u8>, ValueDeletable)>) {
+        let format = SsTableFormat {
+            block_size: 32,
+            min_filter_keys: 1,
+            ..SsTableFormat::default()
+        };
+        let writer = TableStore::new(
+            ObjectStores::new(store.clone(), None),
+            format.clone(),
+            Path::from(ROOT),
+            None,
+            TableStoreKind::Main,
+            BlockCachePolicy::default(),
+        );
+        let rows = (0..8u8)
+            .map(|i| {
+                (
+                    vec![i; 16],
+                    ValueDeletable::Value(Bytes::copy_from_slice(&[i + 1; 16])),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut builder = writer.table_builder();
+        for (key, value) in &rows {
+            let ValueDeletable::Value(value) = value else {
+                unreachable!("rows are all values")
+            };
+            builder
+                .add(RowEntry::new_value(key, value, 0))
+                .await
+                .unwrap();
+        }
+        let id = SsTableId::Compacted(ulid::Ulid::new());
+        let handle = writer
+            .write_sst(&id, &builder.build().await.unwrap())
+            .await
+            .unwrap();
+        assert!(handle.info.filter_len > 0);
+        assert!(handle.info.stats_len > 0);
+        (format, handle, rows)
+    }
+
+    /// Name and encoded bytes of each filter, for comparing filter reads.
+    fn encoded_filters(filters: &[crate::filter_policy::NamedFilter]) -> Vec<(String, Vec<u8>)> {
+        filters
+            .iter()
+            .map(|named| {
+                let mut buf = Vec::new();
+                named.filter.encode(&mut buf);
+                (named.name.clone(), buf)
+            })
+            .collect()
+    }
+
+    /// Cache misses with `cache_blocks=true` hand exactly one loader to the cache
+    /// per section and populate it; afterwards every read (with or without
+    /// `cache_blocks`) is served from the cache without building a loader or
+    /// touching the object store.
+    #[tokio::test]
+    async fn cached_reads_skip_loader_and_object_store() {
+        // given: an SST and a reader whose cache counts handed-over loaders
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (format, handle, rows) = write_sst_with_every_section(&store).await;
+        let cache = Arc::new(TestCache::new());
+        let reader = TableStore::new(
+            ObjectStores::new(store.clone(), None),
+            format,
+            Path::from(ROOT),
+            Some(cache.clone()),
+            TableStoreKind::Main,
+            BlockCachePolicy::default(),
+        );
+
+        // when: each section misses once with cache_blocks=true
+        let index = reader.read_index(&handle, true).await.unwrap();
+        assert_eq!(cache.fetches(), 1);
+        let filters = reader.read_filters(&handle, true).await.unwrap();
+        assert_eq!(cache.fetches(), 2);
+        let stats = reader.read_stats(&handle, true).await.unwrap();
+        assert_eq!(cache.fetches(), 3);
+        let first_block = reader
+            .read_blocks_using_index(&handle, index.clone(), 0..1, true)
+            .await
+            .unwrap();
+        assert_eq!(cache.fetches(), 4);
+        // the multi-block path probes per block and inserts without a loader
+        let num_blocks = index.borrow().block_meta().len();
+        assert_eq!(num_blocks, rows.len());
+        let rest = reader
+            .read_blocks_using_index(&handle, index.clone(), 1..num_blocks, true)
+            .await
+            .unwrap();
+        assert_eq!(cache.fetches(), 4);
+
+        // then: the cold reads returned the SST contents and populated the cache
+        assert!(stats.is_some());
+        assert_blocks(&first_block, &rows[..1]).await;
+        assert_blocks(&rest, &rows[1..]).await;
+        assert_eq!(cache.entry_count(), 3 + num_blocks as u64);
+        let misses_after_cold_reads = cache.misses();
+
+        // when: the SST disappears, so any object-store read would fail
+        store.delete(&reader.path(&handle.id)).await.unwrap();
+
+        // then: every warm read is a pure cache hit that never builds a loader
+        for cache_blocks in [true, false] {
+            assert!(reader.read_index(&handle, cache_blocks).await.unwrap() == index);
+            assert_eq!(
+                encoded_filters(&reader.read_filters(&handle, cache_blocks).await.unwrap()),
+                encoded_filters(&filters)
+            );
+            assert_eq!(
+                reader.read_stats(&handle, cache_blocks).await.unwrap(),
+                stats
+            );
+            for block_num in 0..num_blocks {
+                let block = reader
+                    .read_blocks_using_index(
+                        &handle,
+                        index.clone(),
+                        block_num..block_num + 1,
+                        cache_blocks,
+                    )
+                    .await
+                    .unwrap();
+                assert_blocks(&block, &rows[block_num..block_num + 1]).await;
+            }
+            let all = reader
+                .read_blocks_using_index(&handle, index.clone(), 0..num_blocks, cache_blocks)
+                .await
+                .unwrap();
+            assert_blocks(&all, &rows).await;
+        }
+        assert_eq!(cache.fetches(), 4);
+        assert_eq!(cache.misses(), misses_after_cold_reads);
+    }
+
+    /// With `cache_blocks=false`, a miss reads the object store directly: no loader
+    /// is handed to the cache and nothing is inserted.
+    #[tokio::test]
+    async fn uncached_reads_without_cache_blocks_neither_fetch_nor_populate() {
+        // given: an SST and a reader with an empty cache
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (format, handle, rows) = write_sst_with_every_section(&store).await;
+        let cache = Arc::new(TestCache::new());
+        let reader = TableStore::new(
+            ObjectStores::new(store.clone(), None),
+            format,
+            Path::from(ROOT),
+            Some(cache.clone()),
+            TableStoreKind::Main,
+            BlockCachePolicy::default(),
+        );
+
+        // when: every section is read with cache_blocks=false
+        let index = reader.read_index(&handle, false).await.unwrap();
+        let filters = reader.read_filters(&handle, false).await.unwrap();
+        let stats = reader.read_stats(&handle, false).await.unwrap();
+        let num_blocks = index.borrow().block_meta().len();
+        let first_block = reader
+            .read_blocks_using_index(&handle, index.clone(), 0..1, false)
+            .await
+            .unwrap();
+        let all = reader
+            .read_blocks_using_index(&handle, index.clone(), 0..num_blocks, false)
+            .await
+            .unwrap();
+
+        // then: the reads returned the SST contents without touching the cache
+        assert!(!filters.is_empty());
+        assert!(stats.is_some());
+        assert_blocks(&first_block, &rows[..1]).await;
+        assert_blocks(&all, &rows).await;
+        assert_eq!(cache.fetches(), 0);
+        assert_eq!(cache.inserts(), 0);
+        assert_eq!(cache.entry_count(), 0);
+        assert_eq!(cache.misses(), 3 + 1 + num_blocks as u64);
+    }
+
+    /// A cache whose probes fail never blocks a read: every section falls back to
+    /// the object store, with or without `cache_blocks`.
+    #[tokio::test]
+    async fn failing_cache_probe_falls_back_to_object_store() {
+        // given: an SST, a cacheless reference reader and a reader whose cache
+        // fails every probe
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (format, handle, rows) = write_sst_with_every_section(&store).await;
+        let uncached = TableStore::new(
+            ObjectStores::new(store.clone(), None),
+            format.clone(),
+            Path::from(ROOT),
+            None,
+            TableStoreKind::Main,
+            BlockCachePolicy::default(),
+        );
+        let reader = TableStore::new(
+            ObjectStores::new(store.clone(), None),
+            format,
+            Path::from(ROOT),
+            Some(Arc::new(crate::db_cache::test_utils::FailingCache)),
+            TableStoreKind::Main,
+            BlockCachePolicy::default(),
+        );
+        let expected_index = uncached.read_index(&handle, false).await.unwrap();
+        let expected_filters =
+            encoded_filters(&uncached.read_filters(&handle, false).await.unwrap());
+        let expected_stats = uncached.read_stats(&handle, false).await.unwrap();
+        let num_blocks = expected_index.borrow().block_meta().len();
+
+        for cache_blocks in [true, false] {
+            // when / then: every read matches the cacheless reader
+            let index = reader.read_index(&handle, cache_blocks).await.unwrap();
+            assert!(index == expected_index);
+            assert_eq!(
+                encoded_filters(&reader.read_filters(&handle, cache_blocks).await.unwrap()),
+                expected_filters
+            );
+            assert_eq!(
+                reader.read_stats(&handle, cache_blocks).await.unwrap(),
+                expected_stats
+            );
+            let first_block = reader
+                .read_blocks_using_index(&handle, index.clone(), 0..1, cache_blocks)
+                .await
+                .unwrap();
+            assert_blocks(&first_block, &rows[..1]).await;
+            let all = reader
+                .read_blocks_using_index(&handle, index, 0..num_blocks, cache_blocks)
+                .await
+                .unwrap();
+            assert_blocks(&all, &rows).await;
+        }
+    }
+
+    /// Probing before fetching must not double-count: a cold read is exactly one
+    /// miss and a warm read exactly one hit, both in the cache's access metrics
+    /// and in the per-query storage metrics.
+    #[tokio::test]
+    async fn cache_reads_count_each_access_once() {
+        use crate::db_cache::stats::ACCESS_COUNT;
+        use crate::query_metrics::{QueryCacheStatistics, QueryMetricsObserver};
+        use slatedb_common::metrics::{
+            lookup_metric_with_labels, DefaultMetricsRecorder, MetricLevel, MetricsRecorderHelper,
+        };
+
+        // given: an SST and a reader behind the metric-recording cache wrapper
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (format, handle, _) = write_sst_with_every_section(&store).await;
+        let recorder = Arc::new(DefaultMetricsRecorder::new());
+        let wrapper = Arc::new(DbCacheWrapper::new(
+            Arc::new(TestCache::new()),
+            &MetricsRecorderHelper::new(recorder.clone(), MetricLevel::default()),
+            Arc::new(DefaultSystemClock::default()),
+        ));
+        let reader = TableStore::new(
+            ObjectStores::new(store.clone(), None),
+            format,
+            Path::from(ROOT),
+            Some(wrapper),
+            TableStoreKind::Main,
+            BlockCachePolicy::default(),
+        );
+        let access = |entry_kind: &str, result: &str| {
+            lookup_metric_with_labels(
+                &recorder,
+                ACCESS_COUNT,
+                &[("entry_kind", entry_kind), ("result", result)],
+            )
+        };
+
+        for (round, result) in [(1, "miss"), (2, "hit")] {
+            // when: every section is read once with cache_blocks=true
+            let observer = QueryMetricsObserver::default();
+            crate::query_metrics::scope_query_metrics(observer.clone(), async {
+                let index = reader.read_index(&handle, true).await.unwrap();
+                reader.read_filters(&handle, true).await.unwrap();
+                reader.read_stats(&handle, true).await.unwrap();
+                reader
+                    .read_blocks_using_index(&handle, index, 0..1, true)
+                    .await
+                    .unwrap();
+            })
+            .await;
+
+            // then: each read counted one access with this round's result
+            let expected_hits = u64::from(result == "hit") * 4;
+            assert_eq!(
+                observer.snapshot().block_cache,
+                QueryCacheStatistics {
+                    hits: expected_hits,
+                    misses: 4 - expected_hits,
+                }
+            );
+            for entry_kind in ["index", "filter", "stats", "data_block"] {
+                assert_eq!(access(entry_kind, "miss"), Some(1), "{entry_kind}");
+                assert_eq!(access(entry_kind, "hit"), Some(round - 1), "{entry_kind}");
+            }
+        }
     }
 
     #[tokio::test]
