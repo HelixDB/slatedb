@@ -1705,6 +1705,70 @@ mod tests {
         }
     }
 
+    /// `fetch_*` never counts the access (the `get_*` probe that precedes it
+    /// already did), whether its loader runs or the entry is already cached, but
+    /// it still counts errors.
+    #[rstest]
+    #[tokio::test]
+    async fn test_fetch_counts_errors_but_not_accesses(
+        cache: (DbCacheWrapper, Arc<DefaultMetricsRecorder>),
+    ) {
+        use crate::db_cache::CacheLoader;
+        use crate::format::block::Block;
+        use slatedb_common::metrics::lookup_metric;
+
+        let (cache, registry) = cache;
+        let mut builder = BlockBuilder::new_latest(4096);
+        assert!(builder.add(RowEntry::new_value(b"k", b"v", 0)).unwrap());
+        let entry = CachedEntry::with_block(Arc::new(builder.build().unwrap()));
+        let loader: CacheLoader = Box::new(move || Box::pin(async move { Ok(entry) }));
+        let failing = || -> CacheLoader {
+            Box::new(|| {
+                Box::pin(async {
+                    Err(
+                        crate::error::SlateDBError::from(Arc::new(std::io::Error::other(
+                            "injected loader error",
+                        )))
+                        .into(),
+                    )
+                })
+            })
+        };
+        let key = CachedKey::from((SST_ID, 7u64));
+
+        // when: a fetch loads and inserts, then a second fetch is served from the cache
+        let loaded: Arc<Block> = cache
+            .fetch_block(key.clone(), loader)
+            .await
+            .unwrap()
+            .block()
+            .unwrap();
+        let cached = cache
+            .fetch_block(key.clone(), failing())
+            .await
+            .unwrap()
+            .block()
+            .unwrap();
+        // and: a fetch whose loader fails
+        let missing = CachedKey::from((SST_ID, 8u64));
+        assert!(cache.fetch_block(missing, failing()).await.is_err());
+
+        // then: no access was counted, only the error
+        assert!(Arc::ptr_eq(&loaded, &cached));
+        for result in ["hit", "miss"] {
+            assert_eq!(
+                lookup_metric_with_labels(
+                    &registry,
+                    super::stats::ACCESS_COUNT,
+                    &[("entry_kind", "data_block"), ("result", result)]
+                ),
+                Some(0),
+                "{result}"
+            );
+        }
+        assert_eq!(lookup_metric(&registry, super::stats::ERROR_COUNT), Some(1));
+    }
+
     #[tokio::test]
     async fn test_should_count_get_errors() {
         // given: a cache that always returns errors
