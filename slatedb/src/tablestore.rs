@@ -582,16 +582,19 @@ impl TableStore {
         let cache_key: CachedKey = (handle.id, handle.info.filter_offset).into();
         if let Some(cache) = self.cache_for_reads() {
             // Probe first so a hit never builds a loader (SST path formatting, boxed
-            // closure, Arc clones). On a miss, cache_blocks=true takes the dedup-aware
-            // fetch: concurrent callers collapse onto one loader. cache_blocks=false
-            // is a read-only lookup that won't pollute the cache on miss. Probe and
-            // fetch errors fall through to a best-effort direct load; we
-            // intentionally don't re-insert there — `fetch_X` errors are almost
-            // always the smuggled loader error (so the direct retry will also fail),
-            // and on the rare foyer-machinery error an insert would likely fail too.
+            // closure, Arc clones). When the probe misses or fails, cache_blocks=true
+            // takes the dedup-aware fetch, as a fetch-only read would: concurrent
+            // callers collapse onto one loader, and a cache whose lookup failed (e.g.
+            // a hybrid cache's disk-tier read error) can still load and keep the
+            // entry. cache_blocks=false is a read-only lookup that won't pollute the
+            // cache on miss. Fetch errors, and probe errors without cache_blocks,
+            // fall through to a best-effort direct load; we intentionally don't
+            // re-insert there — `fetch_X` errors are almost always the smuggled
+            // loader error (so the direct retry will also fail), and on the rare
+            // foyer-machinery error an insert would likely fail too.
             let entry = match cache.get_filter(&cache_key).await {
                 Ok(Some(entry)) => Some(entry),
-                Ok(None) if cache_blocks => cache
+                Ok(None) | Err(_) if cache_blocks => cache
                     .fetch_filter(
                         cache_key.clone(),
                         self.read_loader(handle, CacheTarget::Filters),
@@ -640,7 +643,7 @@ impl TableStore {
             // See `read_filters` for the rationale on the fall-through path.
             let entry = match cache.get_stats(&cache_key).await {
                 Ok(Some(entry)) => Some(entry),
-                Ok(None) if cache_blocks => cache
+                Ok(None) | Err(_) if cache_blocks => cache
                     .fetch_stats(cache_key, self.read_loader(handle, CacheTarget::Stats))
                     .await
                     .ok(),
@@ -674,7 +677,7 @@ impl TableStore {
             // See `read_filters` for the rationale on the fall-through path.
             let entry = match cache.get_index(&cache_key).await {
                 Ok(Some(entry)) => Some(entry),
-                Ok(None) if cache_blocks => cache
+                Ok(None) | Err(_) if cache_blocks => cache
                     .fetch_index(cache_key, self.read_loader(handle, CacheTarget::Index))
                     .await
                     .ok(),
@@ -886,9 +889,9 @@ impl TableStore {
         // collapse onto one loader. Multi-block reads fall through to the range-
         // coalesced path below, which issues one object-store GET per contiguous
         // run of uncached blocks. The single-block path probes the cache before
-        // building a loader, so hits skip the loader setup. Cache errors fall
-        // through to the direct load, which produces the authoritative error if
-        // any.
+        // building a loader, so hits skip the loader setup; a miss or a failed
+        // probe still goes through the fetch. Fetch errors fall through to the
+        // direct load, which produces the authoritative error if any.
         if cache_blocks && blocks.len() == 1 {
             if let Some(cache) = self.cache_for_reads() {
                 let block_num = blocks.start;
@@ -896,14 +899,13 @@ impl TableStore {
                 let cache_key: CachedKey = (handle.id, offset).into();
                 let entry = match cache.get_block(&cache_key).await {
                     Ok(Some(entry)) => Some(entry),
-                    Ok(None) => cache
+                    Ok(None) | Err(_) => cache
                         .fetch_block(
                             cache_key,
                             self.block_loader(handle, index.clone(), block_num),
                         )
                         .await
                         .ok(),
-                    Err(_) => None,
                 };
                 if let Some(block) = entry.and_then(|entry| entry.block()) {
                     let mut result = VecDeque::with_capacity(1);
@@ -2425,6 +2427,70 @@ mod tests {
         }
     }
 
+    /// A failed probe does not skip the fetch: with `cache_blocks=true` the loader
+    /// still goes to the cache, which can recover (a hybrid cache whose disk-tier
+    /// read fails runs the loader) and keep the entry, so later reads are served
+    /// by the cache rather than the object store. `cache_blocks=false` never
+    /// fetches, so its reads go to the object store.
+    #[tokio::test]
+    async fn failed_probe_still_fetches_through_the_cache() {
+        // given: an SST and a reader whose cache fails every probe but can fetch
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (format, handle, rows) = write_sst_with_every_section(&store).await;
+        let cache = Arc::new(TestCache::with_failing_probes());
+        let reader = TableStore::new(
+            ObjectStores::new(store.clone(), None),
+            format,
+            Path::from(ROOT),
+            Some(cache.clone()),
+            TableStoreKind::Main,
+            BlockCachePolicy::default(),
+        );
+
+        // when: every section is read once with cache_blocks=true
+        let index = reader.read_index(&handle, true).await.unwrap();
+        let filters = encoded_filters(&reader.read_filters(&handle, true).await.unwrap());
+        let stats = reader.read_stats(&handle, true).await.unwrap();
+        let block = reader
+            .read_blocks_using_index(&handle, index.clone(), 0..1, true)
+            .await
+            .unwrap();
+
+        // then: each read handed its loader to the cache, which kept the entry
+        assert!(stats.is_some());
+        assert_blocks(&block, &rows[..1]).await;
+        assert_eq!(cache.fetches(), 4);
+        assert_eq!(cache.entry_count(), 4);
+
+        // when: the SST disappears, so any object-store read would fail
+        store.delete(&reader.path(&handle.id)).await.unwrap();
+
+        // then: cache_blocks=true reads are still served through the fetch
+        assert!(reader.read_index(&handle, true).await.unwrap() == index);
+        assert_eq!(
+            encoded_filters(&reader.read_filters(&handle, true).await.unwrap()),
+            filters
+        );
+        assert_eq!(reader.read_stats(&handle, true).await.unwrap(), stats);
+        let block = reader
+            .read_blocks_using_index(&handle, index.clone(), 0..1, true)
+            .await
+            .unwrap();
+        assert_blocks(&block, &rows[..1]).await;
+        assert_eq!(cache.fetches(), 8);
+        assert_eq!(cache.inserts(), 4);
+
+        // and: cache_blocks=false reads never fetch, so they reach the object store
+        assert!(reader.read_index(&handle, false).await.is_err());
+        assert!(reader.read_filters(&handle, false).await.is_err());
+        assert!(reader.read_stats(&handle, false).await.is_err());
+        assert!(reader
+            .read_blocks_using_index(&handle, index, 0..1, false)
+            .await
+            .is_err());
+        assert_eq!(cache.fetches(), 8);
+    }
+
     /// Probing before fetching must not double-count: a cold read is exactly one
     /// miss and a warm read exactly one hit, both in the cache's access metrics
     /// and in the per-query storage metrics.
@@ -2487,6 +2553,73 @@ mod tests {
             for entry_kind in ["index", "filter", "stats", "data_block"] {
                 assert_eq!(access(entry_kind, "miss"), Some(1), "{entry_kind}");
                 assert_eq!(access(entry_kind, "hit"), Some(round - 1), "{entry_kind}");
+            }
+        }
+    }
+
+    /// A failed probe counts a cache error, not an access, and the fetch after it
+    /// counts a second error only when it fails too.
+    #[tokio::test]
+    async fn failed_probes_count_errors_not_accesses() {
+        use crate::db_cache::stats::{ACCESS_COUNT, ERROR_COUNT};
+        use crate::db_cache::test_utils::FailingCache;
+        use slatedb_common::metrics::{
+            lookup_metric, lookup_metric_with_labels, DefaultMetricsRecorder, MetricLevel,
+            MetricsRecorderHelper,
+        };
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (format, handle, _) = write_sst_with_every_section(&store).await;
+        // (cache, errors per section read, errors per single-block read): a fetch
+        // that recovers after the probe failed, or one that fails as well. A failed
+        // single-block fetch falls back to the multi-block path, which probes again.
+        let caches: [(Arc<dyn DbCache>, i64, i64); 2] = [
+            (Arc::new(TestCache::with_failing_probes()), 1, 1),
+            (Arc::new(FailingCache), 2, 3),
+        ];
+        for (cache, section_errors, block_errors) in caches {
+            // given: a reader behind the metric-recording wrapper of that cache
+            let recorder = Arc::new(DefaultMetricsRecorder::new());
+            let reader = TableStore::new(
+                ObjectStores::new(store.clone(), None),
+                format.clone(),
+                Path::from(ROOT),
+                Some(Arc::new(DbCacheWrapper::new(
+                    cache,
+                    &MetricsRecorderHelper::new(recorder.clone(), MetricLevel::default()),
+                    Arc::new(DefaultSystemClock::default()),
+                ))),
+                TableStoreKind::Main,
+                BlockCachePolicy::default(),
+            );
+            let errors = || lookup_metric(&recorder, ERROR_COUNT).unwrap();
+
+            // when / then: each read counts its errors
+            let index = reader.read_index(&handle, true).await.unwrap();
+            assert_eq!(errors(), section_errors);
+            reader.read_filters(&handle, true).await.unwrap();
+            assert_eq!(errors(), 2 * section_errors);
+            reader.read_stats(&handle, true).await.unwrap();
+            assert_eq!(errors(), 3 * section_errors);
+            reader
+                .read_blocks_using_index(&handle, index, 0..1, true)
+                .await
+                .unwrap();
+            assert_eq!(errors(), 3 * section_errors + block_errors);
+
+            // and: no read counted an access
+            for entry_kind in ["index", "filter", "stats", "data_block"] {
+                for result in ["hit", "miss"] {
+                    assert_eq!(
+                        lookup_metric_with_labels(
+                            &recorder,
+                            ACCESS_COUNT,
+                            &[("entry_kind", entry_kind), ("result", result)],
+                        ),
+                        Some(0),
+                        "{entry_kind} {result}"
+                    );
+                }
             }
         }
     }

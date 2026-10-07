@@ -746,10 +746,12 @@ impl DbCache for SplitCache {
 ///
 /// ## Statistics
 /// Each lookup is counted once, as a hit or a miss, by the `get_*` probe.
-/// Readers probe with `get_*` and only call `fetch_*` after that probe missed,
-/// so `fetch_*` records errors but never the access itself: counting it again
-/// would double every miss. A miss whose load is deduplicated onto a concurrent
-/// caller's loader is therefore still a miss for this caller.
+/// Readers probe with `get_*` and only call `fetch_*` after that probe missed or
+/// failed, so `fetch_*` records errors but never the access itself: counting it
+/// again would double every miss. A miss whose load is deduplicated onto a
+/// concurrent caller's loader is therefore still a miss for this caller. A
+/// failed probe counts an error instead of an access, and a fetch that then
+/// fails too counts a second error.
 ///
 /// ## Scoping
 /// When multiple `Db` instances share the same underlying cache object, this wrapper assigns a
@@ -1191,6 +1193,9 @@ pub(crate) mod test_utils {
         misses: AtomicU64,
         inserts: AtomicU64,
         fetches: AtomicU64,
+        /// When set, every `get_*` probe fails while `fetch_*` still serves,
+        /// loads and inserts entries.
+        failing_probes: bool,
     }
 
     impl TestCache {
@@ -1201,6 +1206,17 @@ pub(crate) mod test_utils {
                 misses: AtomicU64::new(0),
                 inserts: AtomicU64::new(0),
                 fetches: AtomicU64::new(0),
+                failing_probes: false,
+            }
+        }
+
+        /// A cache whose `get_*` probes all fail while `fetch_*` still works,
+        /// like a hybrid cache whose disk-tier read errors but whose fetch
+        /// recovers by running the loader and caching its entry.
+        pub(crate) fn with_failing_probes() -> Self {
+            Self {
+                failing_probes: true,
+                ..Self::new()
             }
         }
 
@@ -1253,24 +1269,37 @@ pub(crate) mod test_utils {
         pub(crate) fn clear(&self) {
             self.items.lock().unwrap().clear();
         }
+
+        /// A `get_*` probe: [`Self::get`], or an error under `failing_probes`.
+        fn probe(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
+            if self.failing_probes {
+                return Err(
+                    crate::error::SlateDBError::from(Arc::new(std::io::Error::other(
+                        "injected probe error",
+                    )))
+                    .into(),
+                );
+            }
+            Ok(self.get(key))
+        }
     }
 
     #[async_trait]
     impl DbCache for TestCache {
         async fn get_block(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
-            Ok(self.get(key))
+            self.probe(key)
         }
 
         async fn get_index(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
-            Ok(self.get(key))
+            self.probe(key)
         }
 
         async fn get_filter(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
-            Ok(self.get(key))
+            self.probe(key)
         }
 
         async fn get_stats(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
-            Ok(self.get(key))
+            self.probe(key)
         }
 
         async fn insert(&self, key: CachedKey, value: CachedEntry) {
