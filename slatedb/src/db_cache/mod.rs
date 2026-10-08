@@ -12,7 +12,7 @@
 //! To use the cache, you need to configure the [DbOptions](crate::config::DbOptions) with the desired cache implementation.
 
 use std::ops::{Bound, RangeBounds};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -744,6 +744,15 @@ impl DbCache for SplitCache {
 
 /// Wraps a [`DbCache`] to add statistics, error logging, and cache scoping.
 ///
+/// ## Statistics
+/// Each lookup is counted once, as a hit or a miss, by the `get_*` probe.
+/// Readers probe with `get_*` and only call `fetch_*` after that probe missed or
+/// failed, so `fetch_*` records errors but never the access itself: counting it
+/// again would double every miss. A miss whose load is deduplicated onto a
+/// concurrent caller's loader is therefore still a miss for this caller. A
+/// failed probe counts an error instead of an access, and a fetch that then
+/// fails too counts a second error.
+///
 /// ## Scoping
 /// When multiple `Db` instances share the same underlying cache object, this wrapper assigns a
 /// unique `scope_id` so their entries do not collide. All cache operations transparently rewrite
@@ -784,19 +793,6 @@ const ERROR_LOG_INTERVAL: TimeDelta = TimeDelta::seconds(1);
 impl DbCacheWrapper {
     fn scoped_key(&self, key: &CachedKey) -> CachedKey {
         key.with_scope(self.scope_id)
-    }
-
-    fn record_fetch_outcome(
-        &self,
-        block_type: &str,
-        loader_ran: bool,
-        result: &Result<CachedEntry, crate::Error>,
-    ) {
-        match result {
-            Ok(_) if loader_ran => self.record_miss(block_type),
-            Ok(_) => self.record_hit(block_type),
-            Err(err) => self.record_get_err(block_type, err),
-        }
     }
 
     fn record_hit(&self, block_type: &str) {
@@ -949,11 +945,10 @@ impl DbCache for DbCacheWrapper {
         key: CachedKey,
         loader: CacheLoader,
     ) -> Result<CachedEntry, crate::Error> {
-        let scoped_key = self.scoped_key(&key);
-        let (loader, loader_ran) = instrumented_loader(loader);
-        let result = self.cache.fetch_block(scoped_key, loader).await;
-        self.record_fetch_outcome("block", loader_ran.was_called(), &result);
-        result
+        self.cache
+            .fetch_block(self.scoped_key(&key), loader)
+            .await
+            .inspect_err(|err| self.record_get_err("block", err))
     }
 
     async fn fetch_index(
@@ -961,11 +956,10 @@ impl DbCache for DbCacheWrapper {
         key: CachedKey,
         loader: CacheLoader,
     ) -> Result<CachedEntry, crate::Error> {
-        let scoped_key = self.scoped_key(&key);
-        let (loader, loader_ran) = instrumented_loader(loader);
-        let result = self.cache.fetch_index(scoped_key, loader).await;
-        self.record_fetch_outcome("index", loader_ran.was_called(), &result);
-        result
+        self.cache
+            .fetch_index(self.scoped_key(&key), loader)
+            .await
+            .inspect_err(|err| self.record_get_err("index", err))
     }
 
     async fn fetch_filter(
@@ -973,11 +967,10 @@ impl DbCache for DbCacheWrapper {
         key: CachedKey,
         loader: CacheLoader,
     ) -> Result<CachedEntry, crate::Error> {
-        let scoped_key = self.scoped_key(&key);
-        let (loader, loader_ran) = instrumented_loader(loader);
-        let result = self.cache.fetch_filter(scoped_key, loader).await;
-        self.record_fetch_outcome("filter", loader_ran.was_called(), &result);
-        result
+        self.cache
+            .fetch_filter(self.scoped_key(&key), loader)
+            .await
+            .inspect_err(|err| self.record_get_err("filter", err))
     }
 
     async fn fetch_stats(
@@ -985,11 +978,10 @@ impl DbCache for DbCacheWrapper {
         key: CachedKey,
         loader: CacheLoader,
     ) -> Result<CachedEntry, crate::Error> {
-        let scoped_key = self.scoped_key(&key);
-        let (loader, loader_ran) = instrumented_loader(loader);
-        let result = self.cache.fetch_stats(scoped_key, loader).await;
-        self.record_fetch_outcome("stats", loader_ran.was_called(), &result);
-        result
+        self.cache
+            .fetch_stats(self.scoped_key(&key), loader)
+            .await
+            .inspect_err(|err| self.record_get_err("stats", err))
     }
 }
 
@@ -1085,28 +1077,6 @@ impl DbCache for UnownedDbCache {
     }
 }
 
-/// Tracks whether the loader closure was actually invoked. Used by `DbCacheWrapper`
-/// to attribute fetches as hits (loader skipped, value served from cache or a
-/// concurrent fetch) or misses (this caller's loader ran).
-#[derive(Clone)]
-struct LoaderRan(Arc<AtomicBool>);
-
-impl LoaderRan {
-    fn was_called(&self) -> bool {
-        self.0.load(Ordering::Relaxed)
-    }
-}
-
-fn instrumented_loader(loader: CacheLoader) -> (CacheLoader, LoaderRan) {
-    let flag = Arc::new(AtomicBool::new(false));
-    let flag_for_closure = flag.clone();
-    let wrapped: CacheLoader = Box::new(move || {
-        flag_for_closure.store(true, Ordering::Relaxed);
-        loader()
-    });
-    (wrapped, LoaderRan(flag))
-}
-
 pub mod stats {
     use slatedb_common::metrics::{CounterFn, MetricsRecorderHelper};
     use std::sync::Arc;
@@ -1175,7 +1145,7 @@ pub mod stats {
 
 #[cfg(test)]
 pub(crate) mod test_utils {
-    use crate::db_cache::{CachedEntry, CachedKey, DbCache};
+    use crate::db_cache::{CacheLoader, CachedEntry, CachedKey, DbCache};
     use async_trait::async_trait;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1222,6 +1192,10 @@ pub(crate) mod test_utils {
         hits: AtomicU64,
         misses: AtomicU64,
         inserts: AtomicU64,
+        fetches: AtomicU64,
+        /// When set, every `get_*` probe fails while `fetch_*` still serves,
+        /// loads and inserts entries.
+        failing_probes: bool,
     }
 
     impl TestCache {
@@ -1231,6 +1205,18 @@ pub(crate) mod test_utils {
                 hits: AtomicU64::new(0),
                 misses: AtomicU64::new(0),
                 inserts: AtomicU64::new(0),
+                fetches: AtomicU64::new(0),
+                failing_probes: false,
+            }
+        }
+
+        /// A cache whose `get_*` probes all fail while `fetch_*` still works,
+        /// like a hybrid cache whose disk-tier read errors but whose fetch
+        /// recovers by running the loader and caching its entry.
+        pub(crate) fn with_failing_probes() -> Self {
+            Self {
+                failing_probes: true,
+                ..Self::new()
             }
         }
 
@@ -1260,27 +1246,60 @@ pub(crate) mod test_utils {
             self.inserts.load(Ordering::Relaxed)
         }
 
+        /// Number of `fetch_*` calls, i.e. how many loaders callers handed over.
+        pub(crate) fn fetches(&self) -> u64 {
+            self.fetches.load(Ordering::Relaxed)
+        }
+
+        /// The trait's default get-miss-load-insert, plus a `fetches` count.
+        async fn fetch(
+            &self,
+            key: CachedKey,
+            loader: CacheLoader,
+        ) -> Result<CachedEntry, crate::Error> {
+            self.fetches.fetch_add(1, Ordering::Relaxed);
+            if let Some(entry) = self.get(&key) {
+                return Ok(entry);
+            }
+            let entry = loader().await?;
+            self.insert(key, entry.clone()).await;
+            Ok(entry)
+        }
+
         pub(crate) fn clear(&self) {
             self.items.lock().unwrap().clear();
+        }
+
+        /// A `get_*` probe: [`Self::get`], or an error under `failing_probes`.
+        fn probe(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
+            if self.failing_probes {
+                return Err(
+                    crate::error::SlateDBError::from(Arc::new(std::io::Error::other(
+                        "injected probe error",
+                    )))
+                    .into(),
+                );
+            }
+            Ok(self.get(key))
         }
     }
 
     #[async_trait]
     impl DbCache for TestCache {
         async fn get_block(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
-            Ok(self.get(key))
+            self.probe(key)
         }
 
         async fn get_index(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
-            Ok(self.get(key))
+            self.probe(key)
         }
 
         async fn get_filter(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
-            Ok(self.get(key))
+            self.probe(key)
         }
 
         async fn get_stats(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
-            Ok(self.get(key))
+            self.probe(key)
         }
 
         async fn insert(&self, key: CachedKey, value: CachedEntry) {
@@ -1297,6 +1316,38 @@ pub(crate) mod test_utils {
         fn entry_count(&self) -> u64 {
             let guard = self.items.lock().unwrap();
             guard.iter().count() as u64
+        }
+
+        async fn fetch_block(
+            &self,
+            key: CachedKey,
+            loader: CacheLoader,
+        ) -> Result<CachedEntry, crate::Error> {
+            self.fetch(key, loader).await
+        }
+
+        async fn fetch_index(
+            &self,
+            key: CachedKey,
+            loader: CacheLoader,
+        ) -> Result<CachedEntry, crate::Error> {
+            self.fetch(key, loader).await
+        }
+
+        async fn fetch_filter(
+            &self,
+            key: CachedKey,
+            loader: CacheLoader,
+        ) -> Result<CachedEntry, crate::Error> {
+            self.fetch(key, loader).await
+        }
+
+        async fn fetch_stats(
+            &self,
+            key: CachedKey,
+            loader: CacheLoader,
+        ) -> Result<CachedEntry, crate::Error> {
+            self.fetch(key, loader).await
         }
     }
 }
@@ -1681,6 +1732,70 @@ mod tests {
                 )
             );
         }
+    }
+
+    /// `fetch_*` never counts the access (the `get_*` probe that precedes it
+    /// already did), whether its loader runs or the entry is already cached, but
+    /// it still counts errors.
+    #[rstest]
+    #[tokio::test]
+    async fn test_fetch_counts_errors_but_not_accesses(
+        cache: (DbCacheWrapper, Arc<DefaultMetricsRecorder>),
+    ) {
+        use crate::db_cache::CacheLoader;
+        use crate::format::block::Block;
+        use slatedb_common::metrics::lookup_metric;
+
+        let (cache, registry) = cache;
+        let mut builder = BlockBuilder::new_latest(4096);
+        assert!(builder.add(RowEntry::new_value(b"k", b"v", 0)).unwrap());
+        let entry = CachedEntry::with_block(Arc::new(builder.build().unwrap()));
+        let loader: CacheLoader = Box::new(move || Box::pin(async move { Ok(entry) }));
+        let failing = || -> CacheLoader {
+            Box::new(|| {
+                Box::pin(async {
+                    Err(
+                        crate::error::SlateDBError::from(Arc::new(std::io::Error::other(
+                            "injected loader error",
+                        )))
+                        .into(),
+                    )
+                })
+            })
+        };
+        let key = CachedKey::from((SST_ID, 7u64));
+
+        // when: a fetch loads and inserts, then a second fetch is served from the cache
+        let loaded: Arc<Block> = cache
+            .fetch_block(key.clone(), loader)
+            .await
+            .unwrap()
+            .block()
+            .unwrap();
+        let cached = cache
+            .fetch_block(key.clone(), failing())
+            .await
+            .unwrap()
+            .block()
+            .unwrap();
+        // and: a fetch whose loader fails
+        let missing = CachedKey::from((SST_ID, 8u64));
+        assert!(cache.fetch_block(missing, failing()).await.is_err());
+
+        // then: no access was counted, only the error
+        assert!(Arc::ptr_eq(&loaded, &cached));
+        for result in ["hit", "miss"] {
+            assert_eq!(
+                lookup_metric_with_labels(
+                    &registry,
+                    super::stats::ACCESS_COUNT,
+                    &[("entry_kind", "data_block"), ("result", result)]
+                ),
+                Some(0),
+                "{result}"
+            );
+        }
+        assert_eq!(lookup_metric(&registry, super::stats::ERROR_COUNT), Some(1));
     }
 
     #[tokio::test]
