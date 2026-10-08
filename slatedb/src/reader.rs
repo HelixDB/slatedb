@@ -1344,13 +1344,33 @@ mod tests {
     }
 
     #[rstest]
-    #[case::updated_value(RowEntry::new_value(b"k", b"new", 2), Some(Bytes::from_static(b"new")))]
-    #[case::deleted_value(RowEntry::new_tombstone(b"k", 2), None)]
-    #[case::merge_operand(RowEntry::new_merge(b"k", b"+", 2), Some(Bytes::from_static(b"old+")))]
+    #[case::updated_value_reversed_ids(
+        RowEntry::new_value(b"k", b"new", 2),
+        Some(Bytes::from_static(b"new")),
+        true
+    )]
+    #[case::deleted_value_reversed_ids(RowEntry::new_tombstone(b"k", 2), None, true)]
+    #[case::merge_operand_reversed_ids(
+        RowEntry::new_merge(b"k", b"+", 2),
+        Some(Bytes::from_static(b"old+")),
+        true
+    )]
+    #[case::updated_value_ordered_ids(
+        RowEntry::new_value(b"k", b"new", 2),
+        Some(Bytes::from_static(b"new")),
+        false
+    )]
+    #[case::deleted_value_ordered_ids(RowEntry::new_tombstone(b"k", 2), None, false)]
+    #[case::merge_operand_ordered_ids(
+        RowEntry::new_merge(b"k", b"+", 2),
+        Some(Bytes::from_static(b"old+")),
+        false
+    )]
     #[tokio::test]
-    async fn review_multi_get_preserves_sorted_run_boundary_order(
+    async fn multi_get_matches_point_get_across_sorted_run_boundary(
         #[case] newest_row: RowEntry,
         #[case] expected: Option<Bytes>,
+        #[case] reverse_view_ids: bool,
     ) -> Result<(), SlateDBError> {
         let mut state = TestDbState::new().await;
         let newest = state.build_sst(vec![newest_row]).await?;
@@ -1360,13 +1380,14 @@ mod tests {
         // A valid run orders versions newest-first across the shared boundary
         // key. View IDs generated within the same millisecond can sort in the
         // opposite order because their random component is not monotonic.
+        let (newest_id, oldest_id) = if reverse_view_ids { (2, 1) } else { (1, 2) };
         Arc::make_mut(&mut state.core.tree)
             .compacted
             .push(SortedRun::new(
                 0,
                 [
-                    SsTableView::new(Ulid::from_parts(1, 2), newest),
-                    SsTableView::new(Ulid::from_parts(1, 1), oldest),
+                    SsTableView::new(Ulid::from_parts(1, newest_id), newest),
+                    SsTableView::new(Ulid::from_parts(1, oldest_id), oldest),
                 ],
             ));
         let stats = DbStats::new(&MetricsRecorderHelper::noop());
@@ -1378,13 +1399,26 @@ mod tests {
             .map(|kv| kv.value);
         assert_eq!(single, expected, "point get follows sorted-run order");
 
-        let keys = [Bytes::from_static(b"k"), Bytes::from_static(b"k")];
+        let keys = [
+            Bytes::from_static(b"k"),
+            Bytes::from_static(b"missing"),
+            Bytes::from_static(b"k"),
+        ];
         let snapshot = reader
             .multi_get_key_value_with_options(&keys, &options, &state, Some(1))
-            .await?;
-        assert!(snapshot
-            .iter()
-            .all(|kv| kv.as_ref().map(|kv| kv.value.as_ref()) == Some(b"old")));
+            .await?
+            .into_iter()
+            .map(|kv| kv.map(|kv| kv.value))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            snapshot,
+            vec![
+                Some(Bytes::from_static(b"old")),
+                None,
+                Some(Bytes::from_static(b"old")),
+            ],
+            "snapshot excludes sequence 2 regardless of view ID order"
+        );
 
         let multi = reader
             .multi_get_key_value_with_options(&keys, &options, &state, None)
@@ -1392,7 +1426,11 @@ mod tests {
             .into_iter()
             .map(|kv| kv.map(|kv| kv.value))
             .collect::<Vec<_>>();
-        assert_eq!(multi, vec![single.clone(), single]);
+        assert_eq!(
+            multi,
+            vec![single.clone(), None, single],
+            "batch reads must follow sorted-run order, reverse_view_ids={reverse_view_ids}"
+        );
         Ok(())
     }
 
