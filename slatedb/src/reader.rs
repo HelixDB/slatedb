@@ -573,24 +573,22 @@ impl Reader {
         values: &mut [Option<KeyValue>],
         fallback_to_point_get: &mut [bool],
     ) -> Result<(), SlateDBError> {
-        let mut groups = BTreeMap::<ulid::Ulid, (crate::db_state::SsTableView, Vec<usize>)>::new();
+        // Shared boundary keys can span SSTs. Preserve stored run order so
+        // their newest visible version is resolved first, regardless of view ID.
+        let mut groups = BTreeMap::<usize, Vec<usize>>::new();
         for key_idx in key_indices.iter().copied() {
             if resolved[key_idx] || fallback_to_point_get[key_idx] {
                 continue;
             }
 
-            for sst in sorted_run.tables_covering_point_key(unique_keys[key_idx].as_ref()) {
-                groups
-                    .entry(sst.id)
-                    .or_insert_with(|| (sst.clone(), Vec::new()))
-                    .1
-                    .push(key_idx);
+            for sst_idx in sorted_run.point_table_idx_covering_key(unique_keys[key_idx].as_ref()) {
+                groups.entry(sst_idx).or_default().push(key_idx);
             }
         }
 
-        for (_, (sst, group_key_indices)) in groups {
+        for (sst_idx, group_key_indices) in groups {
             self.resolve_rows_from_sst_for_keys(
-                &sst,
+                &sorted_run.sst_views()[sst_idx],
                 &group_key_indices,
                 unique_keys,
                 max_seq,
@@ -1431,6 +1429,249 @@ mod tests {
             vec![single.clone(), None, single],
             "batch reads must follow sorted-run order, reverse_view_ids={reverse_view_ids}"
         );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case([1, 2, 3])]
+    #[case([1, 3, 2])]
+    #[case([2, 1, 3])]
+    #[case([2, 3, 1])]
+    #[case([3, 1, 2])]
+    #[case([3, 2, 1])]
+    #[tokio::test]
+    async fn multi_get_sorted_run_preserves_order_for_all_view_id_permutations(
+        #[case] view_ids: [u128; 3],
+        #[values(None, Some(0), Some(1), Some(2), Some(3))] max_seq: Option<u64>,
+    ) -> Result<(), SlateDBError> {
+        let mut state = TestDbState::new().await;
+        let newest = state
+            .build_sst(vec![
+                RowEntry::new_value(b"a", b"first", 3),
+                RowEntry::new_value(b"k", b"new", 3),
+            ])
+            .await?;
+        let middle = state
+            .build_sst(vec![RowEntry::new_value(b"k", b"middle", 2)])
+            .await?;
+        let oldest = state
+            .build_sst(vec![
+                RowEntry::new_value(b"k", b"old", 1),
+                RowEntry::new_value(b"z", b"last", 1),
+            ])
+            .await?;
+        Arc::make_mut(&mut state.core.tree)
+            .compacted
+            .push(SortedRun::new(
+                0,
+                [newest, middle, oldest]
+                    .into_iter()
+                    .zip(view_ids)
+                    .map(|(sst, id)| SsTableView::new(Ulid::from_parts(1, id), sst)),
+            ));
+        let reader =
+            build_reader(&state, DbStats::new(&MetricsRecorderHelper::noop()), false).await;
+        let options = ReadOptions::default();
+        let keys = [b"z".as_slice(), b"k", b"missing", b"a", b"k"].map(Bytes::from_static);
+        let multi = reader
+            .multi_get_key_value_with_options(&keys, &options, &state, max_seq)
+            .await?;
+        let visible_seq = max_seq.unwrap_or(3).min(3);
+        let expected_k = match visible_seq {
+            0 => None,
+            1 => Some(Bytes::from_static(b"old")),
+            2 => Some(Bytes::from_static(b"middle")),
+            _ => Some(Bytes::from_static(b"new")),
+        };
+        assert_eq!(
+            multi
+                .iter()
+                .map(|kv| kv.as_ref().map(|kv| kv.value.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (visible_seq >= 1).then(|| Bytes::from_static(b"last")),
+                expected_k.clone(),
+                None,
+                (visible_seq >= 3).then(|| Bytes::from_static(b"first")),
+                expected_k,
+            ],
+            "view_ids={view_ids:?}, max_seq={max_seq:?}"
+        );
+        for (key, actual) in keys.iter().zip(multi) {
+            let point = reader
+                .get_key_value_with_options(key, &options, &state, None, max_seq)
+                .await?;
+            assert_eq!(actual, point);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multi_get_sorted_run_respects_projected_views_of_shared_sst(
+    ) -> Result<(), SlateDBError> {
+        let mut state = TestDbState::new().await;
+        let shared = state
+            .build_sst(vec![
+                RowEntry::new_value(b"a", b"first", 3),
+                RowEntry::new_value(b"k", b"new", 3),
+                RowEntry::new_value(b"m", b"hidden", 3),
+                RowEntry::new_value(b"z", b"hidden", 3),
+            ])
+            .await?;
+        let oldest = state
+            .build_sst(vec![
+                RowEntry::new_value(b"k", b"old", 1),
+                RowEntry::new_value(b"z", b"last", 1),
+            ])
+            .await?;
+        Arc::make_mut(&mut state.core.tree)
+            .compacted
+            .push(SortedRun::new(
+                0,
+                [
+                    SsTableView::new_projected(
+                        Ulid::from_parts(1, 3),
+                        shared.clone(),
+                        Some(BytesRange::from_slice(b"a".as_slice()..b"k".as_slice())),
+                    ),
+                    SsTableView::new_projected(
+                        Ulid::from_parts(1, 2),
+                        shared,
+                        Some(BytesRange::from_slice(b"k".as_slice()..=b"k".as_slice())),
+                    ),
+                    SsTableView::new_projected(
+                        Ulid::from_parts(1, 1),
+                        oldest,
+                        Some(BytesRange::from_slice(b"k".as_slice()..=b"z".as_slice())),
+                    ),
+                ],
+            ));
+        let reader =
+            build_reader(&state, DbStats::new(&MetricsRecorderHelper::noop()), false).await;
+        let options = ReadOptions::default();
+        let keys = [b"z".as_slice(), b"k", b"m", b"a", b"k", b"missing"].map(Bytes::from_static);
+        let multi = reader
+            .multi_get_key_value_with_options(&keys, &options, &state, None)
+            .await?;
+        assert_eq!(
+            multi
+                .iter()
+                .map(|kv| kv.as_ref().map(|kv| kv.value.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                Some(Bytes::from_static(b"last")),
+                Some(Bytes::from_static(b"new")),
+                None,
+                Some(Bytes::from_static(b"first")),
+                Some(Bytes::from_static(b"new")),
+                None,
+            ],
+            "projected views must exclude hidden physical rows"
+        );
+        for (key, actual) in keys.iter().zip(multi) {
+            let point = reader
+                .get_key_value_with_options(key, &options, &state, None, None)
+                .await?;
+            assert_eq!(actual, point);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multi_get_sorted_run_requires_operator_for_newer_merge() -> Result<(), SlateDBError> {
+        let mut state = TestDbState::new().await;
+        let newest = state
+            .build_sst(vec![RowEntry::new_merge(b"k", b"+", 2)])
+            .await?;
+        let oldest = state
+            .build_sst(vec![RowEntry::new_value(b"k", b"old", 1)])
+            .await?;
+        Arc::make_mut(&mut state.core.tree)
+            .compacted
+            .push(SortedRun::new(
+                0,
+                [
+                    SsTableView::new(Ulid::from_parts(1, 2), newest),
+                    SsTableView::new(Ulid::from_parts(1, 1), oldest),
+                ],
+            ));
+        let reader =
+            build_reader(&state, DbStats::new(&MetricsRecorderHelper::noop()), false).await;
+        let options = ReadOptions::default();
+        let keys = [Bytes::from_static(b"k")];
+        let snapshot = reader
+            .multi_get_key_value_with_options(&keys, &options, &state, Some(1))
+            .await?;
+        assert_eq!(
+            snapshot[0].as_ref().map(|kv| kv.value.as_ref()),
+            Some(b"old".as_slice())
+        );
+        assert!(matches!(
+            reader
+                .get_key_value_with_options(b"k", &options, &state, None, None)
+                .await,
+            Err(SlateDBError::MergeOperatorMissing)
+        ));
+        assert!(matches!(
+            reader
+                .multi_get_key_value_with_options(&keys, &options, &state, None)
+                .await,
+            Err(SlateDBError::MergeOperatorMissing)
+        ));
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::newer_l0(true)]
+    #[case::newer_sorted_run(false)]
+    #[tokio::test]
+    async fn multi_get_sorted_run_preserves_newer_layer_precedence(
+        #[case] newer_layer_is_l0: bool,
+        #[values(None, Some(0), Some(1), Some(2))] max_seq: Option<u64>,
+    ) -> Result<(), SlateDBError> {
+        let mut state = TestDbState::new().await;
+        let newest = state
+            .build_sst(vec![RowEntry::new_value(b"k", b"run", 2)])
+            .await?;
+        let oldest = state
+            .build_sst(vec![RowEntry::new_value(b"k", b"old", 1)])
+            .await?;
+        Arc::make_mut(&mut state.core.tree)
+            .compacted
+            .push(SortedRun::new(
+                0,
+                [
+                    SsTableView::new(Ulid::from_parts(1, 2), newest),
+                    SsTableView::new(Ulid::from_parts(1, 1), oldest),
+                ],
+            ));
+        let newer = SsTableView::identity(
+            state
+                .build_sst(vec![RowEntry::new_value(b"k", b"layer", 3)])
+                .await?,
+        );
+        let tree = Arc::make_mut(&mut state.core.tree);
+        if newer_layer_is_l0 {
+            tree.l0.push_front(newer);
+        } else {
+            tree.compacted.insert(0, SortedRun::new(1, [newer]));
+        }
+        let reader =
+            build_reader(&state, DbStats::new(&MetricsRecorderHelper::noop()), false).await;
+        let keys = [b"k".as_slice(), b"missing", b"k"].map(Bytes::from_static);
+        let multi = reader
+            .multi_get_key_value_with_options(&keys, &ReadOptions::default(), &state, max_seq)
+            .await?
+            .into_iter()
+            .map(|kv| kv.map(|kv| kv.value))
+            .collect::<Vec<_>>();
+        let expected = match max_seq {
+            Some(0) => None,
+            Some(1) => Some(Bytes::from_static(b"old")),
+            Some(2) => Some(Bytes::from_static(b"run")),
+            _ => Some(Bytes::from_static(b"layer")),
+        };
+        assert_eq!(multi, vec![expected.clone(), None, expected]);
         Ok(())
     }
 
