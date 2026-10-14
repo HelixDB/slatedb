@@ -1628,6 +1628,52 @@ mod tests {
     }
 
     #[rstest::rstest]
+    #[case::scan_on_reconcile_only(None)]
+    #[case::periodic_scan(Some(Duration::from_secs(3600)))]
+    #[tokio::test]
+    async fn dropping_storage_should_stop_evictor_tasks_and_close_file_handles(
+        #[case] scan_interval: Option<Duration>,
+    ) {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("objstore_cache_drop_")
+            .tempdir()
+            .unwrap();
+        let recorder = MetricsRecorderHelper::noop();
+        let storage = FsCacheStorage::new(
+            temp_dir.path().to_path_buf(),
+            Some(1024 * 1024),
+            scan_interval,
+            Arc::new(CachedObjectStoreStats::new(&recorder)),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+            10,
+        );
+        storage.start_evictor().await;
+
+        let entry = storage.entry(&Path::from("cached/object"), 1024);
+        entry.save_part(0, Bytes::from(vec![1; 17])).await.unwrap();
+        assert_eq!(
+            entry.read_part(0, 0..17).await.unwrap(),
+            Some(Bytes::from(vec![1; 17]))
+        );
+        drop(entry);
+        assert_eq!(storage.file_handle_cache_population(), 1);
+
+        let inner = Arc::downgrade(&storage.evictor.inner);
+        let file_handles = Arc::downgrade(&storage.file_handle_cache.inner);
+        drop(storage);
+
+        // Aborted tasks drop their futures when the runtime next polls them.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while inner.strong_count() > 0 || file_handles.strong_count() > 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the storage should end the evictor tasks and close its file handles");
+    }
+
+    #[rstest::rstest]
     // Basic case: 2 keys, nothing picked, no exclusion
     #[case(&[0, 1], &[], None, &[0, 1])]
     // Basic case: 2 keys, nothing picked, exclude index 0

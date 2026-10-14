@@ -3381,6 +3381,59 @@ mod tests {
         db.close().await.unwrap();
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn closed_reader_should_release_object_store_cache_file_handles() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_closed_reader_object_cache");
+        let db = Db::builder(path.clone(), Arc::clone(&object_store))
+            .build()
+            .await
+            .unwrap();
+        db.put(b"key", b"value").await.unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+
+        let cache_dir = tempfile::Builder::new()
+            .prefix("dbreader_close_object_cache_")
+            .tempdir()
+            .unwrap();
+        let mut options = DbReaderOptions::default();
+        options.object_store_cache_options.root_folder = Some(cache_dir.path().to_path_buf());
+        options.object_store_cache_options.part_size_bytes = 1024;
+        options.object_store_cache_options.scan_interval = None;
+        let reader = DbReader::builder(path, Arc::clone(&object_store))
+            .with_options(options)
+            .with_db_cache_disabled()
+            .build()
+            .await
+            .unwrap();
+        // The first read caches the SST's parts; the second reads them back
+        // through the cache's open file handles.
+        for _ in 0..2 {
+            assert_eq!(
+                reader.get(b"key").await.unwrap(),
+                Some(Bytes::from_static(b"value"))
+            );
+        }
+        assert!(test_utils::open_fds_under(cache_dir.path()) > 0);
+
+        reader.close().await.unwrap();
+        drop(reader);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while test_utils::open_fds_under(cache_dir.path()) > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a closed and dropped reader should close every object-store cache file");
+        db.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn reader_snapshot_creation_should_do_no_io_and_share_generation_checkpoint() {
         let recording = Arc::new(test_utils::RecordingObjectStore::new(Arc::new(
