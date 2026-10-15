@@ -12006,6 +12006,52 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn closed_db_should_release_object_store_cache_file_handles() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cache_dir = tempfile::Builder::new()
+            .prefix("db_close_object_cache_")
+            .tempdir()
+            .unwrap();
+        let mut settings = Settings::default();
+        settings.object_store_cache_options.root_folder = Some(cache_dir.path().to_path_buf());
+        settings.object_store_cache_options.part_size_bytes = 1024;
+        settings.object_store_cache_options.scan_interval = None;
+        let db = Db::builder("/tmp/test_closed_db_object_cache", object_store)
+            .with_settings(settings)
+            .with_db_cache_disabled()
+            .build()
+            .await
+            .unwrap();
+        db.put(b"key", b"value").await.unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+        // The first read caches the SST's parts; the second reads them back
+        // through the cache's open file handles.
+        for _ in 0..2 {
+            assert_eq!(
+                db.get(b"key").await.unwrap(),
+                Some(Bytes::from_static(b"value"))
+            );
+        }
+        assert!(test_utils::open_fds_under(cache_dir.path()) > 0);
+
+        db.close().await.unwrap();
+        drop(db);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while test_utils::open_fds_under(cache_dir.path()) > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a closed and dropped db should close every object-store cache file");
+    }
+
     mod object_store_cache {
         use super::*;
         use crate::cached_object_store::stats::{PART_ACCESS_COUNT, PART_HIT_COUNT};

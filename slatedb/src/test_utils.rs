@@ -1834,3 +1834,14 @@ impl ObjectStore for RecordingObjectStore {
         self.inner.copy_opts(from, to, options).await
     }
 }
+
+/// Counts this process's open file descriptors that point under `root`.
+#[cfg(target_os = "linux")]
+pub(crate) fn open_fds_under(root: &std::path::Path) -> usize {
+    let root = root.canonicalize().expect("root should exist");
+    std::fs::read_dir("/proc/self/fd")
+        .expect("procfs should list this process's descriptors")
+        .filter_map(|fd| std::fs::read_link(fd.ok()?.path()).ok())
+        .filter(|target| target.starts_with(&root))
+        .count()
+}
