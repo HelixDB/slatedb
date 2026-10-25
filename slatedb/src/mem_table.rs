@@ -836,9 +836,8 @@ mod tests {
         let replacement = rows
             .remove(&SequencedKey::new(Bytes::from_static(b"same"), 7))
             .unwrap();
-        assert!((0..WRITERS).any(|writer| {
-            replacement == RowEntry::new_value(b"same", &vec![writer as u8; 64], 7)
-        }));
+        assert!((0..WRITERS)
+            .any(|writer| { replacement == RowEntry::new_value(b"same", &[writer as u8; 64], 7) }));
         let expected: BTreeMap<_, _> = (0..WRITERS)
             .flat_map(|writer| {
                 (0..ROWS_PER_WRITER).map(move |index| {
