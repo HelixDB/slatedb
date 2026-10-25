@@ -14,12 +14,12 @@ async-channel = { workspace = true }
 async-trait = { workspace = true }
 atomic = { workspace = true }
 backon = { workspace = true }
+bbtree = { workspace = true }
 bitflags = { workspace = true }
 bytes = { workspace = true, features = ["serde"] }
 chrono = { workspace = true, features = ["serde"] }
 sysinfo = { workspace = true }
 crc32fast = { workspace = true }
-crossbeam-skiplist = { workspace = true }
 dotenvy = { workspace = true }
 duration-str = { workspace = true, features = [
     "serde",

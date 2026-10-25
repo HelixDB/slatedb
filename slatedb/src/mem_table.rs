@@ -1,12 +1,9 @@
-use std::cell::Cell;
 use std::ops::{Bound, RangeBounds};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use crossbeam_skiplist::map::Range;
-use crossbeam_skiplist::SkipMap;
 use ouroboros::self_referencing;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering::SeqCst;
@@ -49,6 +46,16 @@ impl PartialOrd for SequencedKey {
     }
 }
 
+impl bbtree::InlineKey for SequencedKey {
+    /// Only user-key bytes participate in the inline comparison. Equal windows,
+    /// including different sequences or zero-padded prefixes, fall back to `Ord`.
+    fn inline_key_at(&self, offset: usize) -> bbtree::InlineWord {
+        bbtree::InlineKey::inline_key_at(self.user_key.as_ref(), offset)
+    }
+}
+
+type MemTableMap = bbtree::BBTreeMap<SequencedKey, RowEntry, bbtree::WithInlineKey>;
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct KVTableInternalKeyRange {
     start_bound: Bound<SequencedKey>,
@@ -62,6 +69,19 @@ impl RangeBounds<SequencedKey> for KVTableInternalKeyRange {
 
     fn end_bound(&self) -> Bound<&SequencedKey> {
         self.end_bound.as_ref()
+    }
+}
+
+impl KVTableInternalKeyRange {
+    fn is_empty(&self) -> bool {
+        match (self.start_bound(), self.end_bound()) {
+            (Bound::Included(start), Bound::Included(end)) => start > end,
+            (
+                Bound::Included(start) | Bound::Excluded(start),
+                Bound::Included(end) | Bound::Excluded(end),
+            ) => start >= end,
+            _ => false,
+        }
     }
 }
 
@@ -91,8 +111,9 @@ impl<T: RangeBounds<Bytes>> From<T> for KVTableInternalKeyRange {
 }
 
 pub(crate) struct KVTable {
-    map: Arc<SkipMap<SequencedKey, RowEntry>>,
+    map: Arc<MemTableMap>,
     durable: WatchableOnceCell<Result<(), SlateDBError>>,
+    entry_num: AtomicUsize,
     entries_size_in_bytes: AtomicUsize,
     /// this corresponds to the timestamp of the most recent
     /// modifying operation on this KVTable (insertion or deletion)
@@ -182,11 +203,21 @@ pub(crate) struct ImmutableMemtable {
 
 #[self_referencing]
 pub(crate) struct MemTableIteratorInner<T: RangeBounds<SequencedKey>> {
-    map: Arc<SkipMap<SequencedKey, RowEntry>>,
-    /// `inner` is the Iterator impl of SkipMap, which is the underlying data structure of MemTable.
+    map: Arc<MemTableMap>,
+    /// The cursor clones bounded batches and holds no tree latch between calls.
     #[borrows(map)]
     #[not_covariant]
-    inner: Range<'this, SequencedKey, T, SequencedKey, RowEntry>,
+    inner: Option<
+        bbtree::bbtree_map::RangeCloned<
+            'this,
+            SequencedKey,
+            RowEntry,
+            bbtree::WithInlineKey,
+            bbtree::Global,
+            SequencedKey,
+            T,
+        >,
+    >,
     ordering: IterationOrder,
     item: Option<RowEntry>,
     /// Stack used in descending mode to re-order entries within a key group.
@@ -231,8 +262,8 @@ impl MemTableIterator {
 
     fn next_ascending(&mut self) -> Option<RowEntry> {
         let ans = self.borrow_item().clone();
-        let next_entry = self.with_inner_mut(|inner| inner.next());
-        let cloned_next = next_entry.map(|entry| entry.value().clone());
+        let next_entry = self.with_inner_mut(|inner| inner.as_mut().and_then(Iterator::next));
+        let cloned_next = next_entry.map(|(_, row)| row);
         self.with_item_mut(|item| *item = cloned_next);
         ans
     }
@@ -245,7 +276,7 @@ impl MemTableIterator {
         }
 
         // Stack is empty. The current `item` (if any) is the start of a new
-        // key group. Collect all entries for this key from the SkipMap.
+        // key group. Collect all entries for this key from the tree.
         let first = self.borrow_item().clone();
         match first {
             Some(first) => {
@@ -262,8 +293,12 @@ impl MemTableIterator {
             None => {
                 // item is None — either iterator is exhausted, or this is the
                 // priming call. Advance inner to populate item for the next call.
-                let next = self
-                    .with_inner_mut(|inner| inner.next_back().map(|entry| entry.value().clone()));
+                let next = self.with_inner_mut(|inner| {
+                    inner
+                        .as_mut()
+                        .and_then(|inner| inner.next_back())
+                        .map(|(_, row)| row)
+                });
                 self.with_item_mut(|item| *item = next);
                 None
             }
@@ -274,8 +309,9 @@ impl MemTableIterator {
         loop {
             let next = self.with_inner_mut(|inner| {
                 inner
-                    .next_back()
-                    .map(|entry| (entry.key().user_key.clone(), entry.value().clone()))
+                    .as_mut()
+                    .and_then(|inner| inner.next_back())
+                    .map(|(key, row)| (key.user_key, row))
             });
             match next {
                 Some((key, row)) if key == *current_key => {
@@ -364,7 +400,8 @@ impl ImmutableMemtable {
 impl KVTable {
     pub(crate) fn new() -> Self {
         Self {
-            map: Arc::new(SkipMap::new()),
+            map: Arc::new(MemTableMap::with_strategy(bbtree::WithInlineKey)),
+            entry_num: AtomicUsize::new(0),
             entries_size_in_bytes: AtomicUsize::new(0),
             durable: WatchableOnceCell::new(),
             last_tick: AtomicI64::new(i64::MIN),
@@ -455,7 +492,7 @@ impl KVTable {
     }
 
     pub(crate) fn metadata(&self) -> KVTableMetadata {
-        let entry_num = self.map.len();
+        let entry_num = self.entry_num.load(Ordering::Relaxed);
         let entries_size_in_bytes = self.entries_size_in_bytes.load(Ordering::Relaxed);
         let last_tick = self.last_tick.load(SeqCst);
         let last_seq = self.last_seq().unwrap_or(0);
@@ -511,7 +548,11 @@ impl KVTable {
         let internal_range = KVTableInternalKeyRange::from(range);
         let mut iterator = MemTableIteratorInnerBuilder {
             map: self.map.clone(),
-            inner_builder: |map| map.range(internal_range),
+            // Unlike SkipMap, bbtree rejects empty/reversed bounds. Represent
+            // those ranges without a cursor so every scan still returns empty.
+            inner_builder: |map| {
+                (!internal_range.is_empty()).then(|| map.range_cloned(internal_range))
+            },
             ordering,
             item: None,
             descending_stack: Vec::new(),
@@ -523,7 +564,6 @@ impl KVTable {
 
     pub(crate) fn put(&self, row: RowEntry) {
         let internal_key = SequencedKey::new(row.key.clone(), row.seq);
-        let previous_size = Cell::new(None);
 
         // it is safe to use fetch_max here to update the last tick
         // because the monotonicity is enforced when generating the clock tick
@@ -537,22 +577,20 @@ impl KVTable {
         self.first_seq.fetch_min(row.seq, SeqCst);
 
         let row_size = row.estimated_size();
-        self.map.compare_insert(internal_key, row, |previous_row| {
-            // Optimistically calculate the size of the previous value.
-            // `compare_fn` might be called multiple times in case of concurrent
-            // writes to the same key, so we use `Cell` to avoid subtracting
-            // the size multiple times. The last call will set the correct size.
-            previous_size.set(Some(previous_row.estimated_size()));
-            true
-        });
-        if let Some(size) = previous_size.take() {
-            self.entries_size_in_bytes
-                .fetch_sub(size, Ordering::Relaxed);
-            self.entries_size_in_bytes
-                .fetch_add(row_size, Ordering::Relaxed);
-        } else {
-            self.entries_size_in_bytes
-                .fetch_add(row_size, Ordering::Relaxed);
+        let previous_row = self
+            .map
+            .insert(internal_key, row)
+            .expect("memtable allocation failed");
+        self.entries_size_in_bytes
+            .fetch_add(row_size, Ordering::Relaxed);
+        match previous_row {
+            Some(previous_row) => {
+                self.entries_size_in_bytes
+                    .fetch_sub(previous_row.estimated_size(), Ordering::Relaxed);
+            }
+            None => {
+                self.entry_num.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -576,7 +614,7 @@ impl KVTable {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::collections::{BTreeMap, VecDeque};
 
     use super::*;
     use crate::bytes_range::BytesRange;
@@ -731,6 +769,232 @@ mod tests {
         metadata = table.table().metadata();
         assert_eq!(metadata.entry_num, 6);
         assert_eq!(metadata.entries_size_in_bytes, 104);
+    }
+
+    #[test]
+    fn test_memtable_replacement_tracks_only_current_row() {
+        let table = WritableKVTable::new();
+        let mut timestamped = RowEntry::new_value(b"same", b"longer replacement", 7);
+        timestamped.create_ts = Some(10);
+        timestamped.expire_ts = Some(20);
+        for row in [
+            RowEntry::new_value(b"same", b"value", 7),
+            timestamped,
+            RowEntry::new_value(b"same", b"v", 7),
+            RowEntry::new_tombstone(b"same", 7),
+            RowEntry::new_value(b"same", b"restored", 7),
+        ] {
+            table.put(row.clone());
+            let metadata = table.metadata();
+            assert_eq!(metadata.entry_num, 1);
+            assert_eq!(metadata.entries_size_in_bytes, row.estimated_size());
+            let mut iter = table.table().iter();
+            assert_eq!(iter.next_sync(), Some(row));
+            assert_eq!(iter.next_sync(), None);
+        }
+    }
+
+    #[test]
+    fn test_memtable_concurrent_replacements_and_inserts_track_final_rows() {
+        const WRITERS: usize = 4;
+        const ROWS_PER_WRITER: usize = 256;
+        let table = KVTable::new();
+        let barrier = std::sync::Barrier::new(WRITERS);
+        std::thread::scope(|scope| {
+            for writer in 0..WRITERS {
+                let table = &table;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for index in 0..ROWS_PER_WRITER {
+                        table.put(RowEntry::new_value(
+                            b"same",
+                            &vec![writer as u8; index % 64 + 1],
+                            7,
+                        ));
+                        table.put(RowEntry::new_value(
+                            format!("writer-{writer:02}-{index:04}").as_bytes(),
+                            b"distinct",
+                            index as u64,
+                        ));
+                    }
+                });
+            }
+        });
+
+        let mut iter = table.iter();
+        let mut rows: BTreeMap<_, _> = std::iter::from_fn(|| iter.next_sync())
+            .map(|row| (SequencedKey::new(row.key.clone(), row.seq), row))
+            .collect();
+        let metadata = table.metadata();
+        assert_eq!(metadata.entry_num, WRITERS * ROWS_PER_WRITER + 1);
+        assert_eq!(metadata.entry_num, rows.len());
+        assert_eq!(
+            metadata.entries_size_in_bytes,
+            rows.values().map(RowEntry::estimated_size).sum::<usize>()
+        );
+        let replacement = rows
+            .remove(&SequencedKey::new(Bytes::from_static(b"same"), 7))
+            .unwrap();
+        assert!((0..WRITERS).any(|writer| {
+            replacement == RowEntry::new_value(b"same", &vec![writer as u8; 64], 7)
+        }));
+        let expected: BTreeMap<_, _> = (0..WRITERS)
+            .flat_map(|writer| {
+                (0..ROWS_PER_WRITER).map(move |index| {
+                    let row = RowEntry::new_value(
+                        format!("writer-{writer:02}-{index:04}").as_bytes(),
+                        b"distinct",
+                        index as u64,
+                    );
+                    (SequencedKey::new(row.key.clone(), row.seq), row)
+                })
+            })
+            .collect();
+        assert_eq!(rows, expected);
+    }
+
+    #[test]
+    fn test_memtable_binary_keys_and_sequence_extremes_match_btree_map() {
+        let table = WritableKVTable::new();
+        let prefix = vec![0; 96];
+        let mut keys = vec![
+            Bytes::new(),
+            Bytes::from_static(b"\0"),
+            Bytes::from_static(b"\0\0"),
+            Bytes::from_static(b"\0\0\x01"),
+            Bytes::from_static(b"\0\xff"),
+            Bytes::from_static(b"\x01"),
+            Bytes::from_static(b"\xff"),
+            Bytes::copy_from_slice(&prefix[..64]),
+            Bytes::copy_from_slice(&prefix[..65]),
+            Bytes::copy_from_slice(&prefix),
+        ];
+        keys.extend((0..512u16).map(|suffix| {
+            let mut key = prefix.clone();
+            key.extend_from_slice(&suffix.to_be_bytes());
+            Bytes::from(key)
+        }));
+        let mut expected = BTreeMap::new();
+        for key in keys.into_iter().rev() {
+            for seq in [0, u64::MAX, 1, u64::MAX - 1] {
+                let row = RowEntry::new_value(&key, &seq.to_be_bytes(), seq);
+                table.put(row.clone());
+                expected.insert(SequencedKey::new(key.clone(), seq), row);
+            }
+        }
+        for ordering in [IterationOrder::Ascending, IterationOrder::Descending] {
+            let mut expected_rows: Vec<_> = expected.values().cloned().collect();
+            if matches!(ordering, IterationOrder::Descending) {
+                expected_rows.sort_by(|a, b| b.key.cmp(&a.key).then(b.seq.cmp(&a.seq)));
+            }
+            let mut iter = table.table().range(.., ordering);
+            let actual: Vec<_> = std::iter::from_fn(|| iter.next_sync()).collect();
+            assert_eq!(actual, expected_rows);
+        }
+    }
+
+    #[test]
+    fn test_memtable_iterator_keeps_map_alive() {
+        let expected: Vec<_> = (0..1024u64)
+            .map(|index| RowEntry::new_value(&index.to_be_bytes(), b"value", index))
+            .collect();
+        let mut iter = {
+            let table = WritableKVTable::new();
+            for row in &expected {
+                table.put(row.clone());
+            }
+            table.table().iter()
+        };
+        let actual: Vec<_> = std::iter::from_fn(|| iter.next_sync()).collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_memtable_primed_iterator_observes_inserts_ahead_across_leaf_splits() {
+        for ordering in [IterationOrder::Ascending, IterationOrder::Descending] {
+            let table = KVTable::new();
+            let mut expected: BTreeMap<_, _> = (0..4096u64)
+                .step_by(2)
+                .map(|index| {
+                    let row = RowEntry::new_value(&index.to_be_bytes(), b"original", 0);
+                    table.put(row.clone());
+                    (row.key.clone(), row)
+                })
+                .collect();
+            let mut iter = table.range(.., ordering);
+            let mut actual: Vec<_> = (0..16).map(|_| iter.next_sync().unwrap()).collect();
+
+            // All insertions lie ahead of both the returned and prefetched rows.
+            // The cursor must release its latches while the writer splits leaves.
+            let inserted = std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        (65..4032u64)
+                            .step_by(2)
+                            .map(|index| {
+                                let row = RowEntry::new_value(&index.to_be_bytes(), b"inserted", 0);
+                                table.put(row.clone());
+                                (row.key.clone(), row)
+                            })
+                            .collect::<BTreeMap<_, _>>()
+                    })
+                    .join()
+                    .unwrap()
+            });
+            expected.extend(inserted);
+            actual.extend(std::iter::from_fn(|| iter.next_sync()));
+            let mut expected: Vec<_> = expected.into_values().collect();
+            if matches!(ordering, IterationOrder::Descending) {
+                expected.reverse();
+            }
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn test_memtable_empty_reversed_and_single_key_ranges() {
+        let table = WritableKVTable::new();
+        for seq in [0, 1, u64::MAX] {
+            table.put(RowEntry::new_value(b"key", b"value", seq));
+        }
+        for ordering in [IterationOrder::Ascending, IterationOrder::Descending] {
+            let mut empty = table.table().range(BytesRange::new_empty(), ordering);
+            assert_eq!(empty.next_sync(), None);
+            for bounds in [
+                (
+                    Bound::Excluded(Bytes::from_static(b"key")),
+                    Bound::Excluded(Bytes::from_static(b"key")),
+                ),
+                (
+                    Bound::Included(Bytes::from_static(b"key")),
+                    Bound::Excluded(Bytes::from_static(b"key")),
+                ),
+                (
+                    Bound::Excluded(Bytes::from_static(b"key")),
+                    Bound::Included(Bytes::from_static(b"key")),
+                ),
+                (
+                    Bound::Included(Bytes::from_static(b"z")),
+                    Bound::Included(Bytes::from_static(b"a")),
+                ),
+            ] {
+                let mut empty = table.table().range(bounds, ordering);
+                assert_eq!(empty.next_sync(), None);
+            }
+            let mut included = table.table().range(
+                Bytes::from_static(b"key")..=Bytes::from_static(b"key"),
+                ordering,
+            );
+            let actual: Vec<_> = std::iter::from_fn(|| included.next_sync()).collect();
+            assert_eq!(
+                actual,
+                [u64::MAX, 1, 0]
+                    .into_iter()
+                    .map(|seq| RowEntry::new_value(b"key", b"value", seq))
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     #[tokio::test]
