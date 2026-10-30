@@ -186,11 +186,17 @@ async fn write_keys(db: &Db, count: usize) {
         let key = format!("key{:06}", i);
         let mut value = format!("value{:06}", i).into_bytes();
         value.extend_from_slice(&padding);
+        // The fork's writes await durability by default, which never comes
+        // with periodic WAL flushes disabled; the explicit memtable flush
+        // below makes these writes durable instead.
         db.put_with_options(
             key.as_bytes(),
             &value,
             &Default::default(),
-            &WriteOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..Default::default()
+            },
         )
         .await
         .expect("put failed");
@@ -557,7 +563,10 @@ async fn flush_does_not_read_the_index_of_untouched_ssts() {
                 key.as_bytes(),
                 &value,
                 &Default::default(),
-                &WriteOptions::default(),
+                &WriteOptions {
+                    await_durable: false,
+                    ..Default::default()
+                },
             )
             .await
             .expect("put failed");
