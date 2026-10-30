@@ -145,8 +145,9 @@ async fn open_bank_reader(ctx: &ActorCtx, options: DbReaderOptions) -> Result<Db
         .with_seed(ctx.rand().rng().next_u64())
         // Production caches may use wall clocks, randomized hashing, or
         // background workers. This bounded FIFO cache keeps cache hits and
-        // evictions inside the deterministic single-threaded schedule.
-        .with_db_cache(Arc::new(DeterministicDbCache::new(8 * 1024 * 1024)));
+        // evictions inside the deterministic single-threaded schedule. Each
+        // reader owns its cache, so the cache id needs no uniqueness.
+        .with_db_cache(Arc::new(DeterministicDbCache::new(8 * 1024 * 1024)), 0);
 
     if let Some(wal_object_store) = ctx.wal_object_store() {
         builder = builder.with_wal_object_store(wal_object_store);
