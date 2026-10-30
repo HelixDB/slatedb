@@ -1698,6 +1698,54 @@ mod tests {
         Ok(())
     }
 
+    /// A key that falls back to a point get stays part of its multi-get
+    /// request, so the whole batch counts as one get request.
+    #[tokio::test]
+    async fn multi_get_counts_one_request_when_a_key_falls_back_to_point_get(
+    ) -> Result<(), SlateDBError> {
+        let mut state = TestDbState::new().await;
+        populate_db_state(
+            &mut state,
+            vec![
+                TestEntry::merge(b"merged", b"b", 2),
+                TestEntry::merge(b"merged", b"a", 1),
+                TestEntry::value(b"plain", b"value", 1),
+            ],
+        )
+        .await?;
+        let recorder = Arc::new(DefaultMetricsRecorder::new());
+        let stats = DbStats::new(&MetricsRecorderHelper::new(
+            recorder.clone() as Arc<dyn MetricsRecorder>,
+            MetricLevel::default(),
+        ));
+        let reader = build_reader(&state, stats, true).await;
+
+        let values = reader
+            .multi_get_key_value_with_options(
+                &[Bytes::from_static(b"merged"), Bytes::from_static(b"plain")],
+                &ReadOptions::default().with_dirty(true),
+                &state,
+                None,
+            )
+            .await?
+            .into_iter()
+            .map(|kv| kv.map(|kv| kv.value))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            values,
+            vec![
+                Some(Bytes::from_static(b"ab")),
+                Some(Bytes::from_static(b"value"))
+            ]
+        );
+        assert_eq!(
+            lookup_metric_with_labels(&recorder, crate::db_stats::REQUEST_COUNT, &[("op", "get")]),
+            Some(1)
+        );
+        Ok(())
+    }
+
     #[rstest]
     #[case([1, 2, 3])]
     #[case([1, 3, 2])]
