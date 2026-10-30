@@ -357,6 +357,7 @@ impl Reader {
         write_batch_iter: Option<WriteBatchIterator>,
         max_seq: Option<u64>,
     ) -> Result<Option<KeyValue>, SlateDBError> {
+        self.db_stats.get_requests.increment(1);
         let read_trace = Self::read_trace(options.tracing_options.as_ref());
         let read = self.get_key_value_with_options_inner(
             key,
@@ -378,7 +379,6 @@ impl Reader {
         max_seq: Option<u64>,
         read_trace: ReadTrace,
     ) -> Result<Option<KeyValue>, SlateDBError> {
-        self.db_stats.get_requests.increment(1);
         let max_seq = self.prepare_max_seq(max_seq, options.durability_filter, options.dirty);
         let key_slice = key.as_ref();
         let range = BytesRange::from_slice(key_slice..=key_slice);
@@ -568,13 +568,16 @@ impl Reader {
             .enumerate()
             .filter_map(|(idx, should_fallback)| should_fallback.then_some(idx))
         {
+            // Resolve the key as a point get inside this multi-get's request:
+            // same read span, and no second `get_requests` count.
             values[key_idx] = self
-                .get_key_value_with_options(
+                .get_key_value_with_options_inner(
                     unique_keys[key_idx].as_ref(),
                     options,
                     db_state,
                     None,
                     max_seq,
+                    read_trace.clone(),
                 )
                 .await?;
             resolved[key_idx] = true;

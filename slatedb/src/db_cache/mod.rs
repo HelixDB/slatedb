@@ -319,7 +319,9 @@ pub trait DbCache: Send + Sync {
     /// Custom implementations must report the lookup result in [`CacheFetch::lookup`].
     /// Return [`CacheLookup::Miss`] when this fetch loads the entry from object storage.
     /// Return [`CacheLookup::Hit`] when memory, disk, or a concurrent fetch supplies the entry.
-    /// The cache wrapper uses this result to update hit and miss counters.
+    /// SlateDB uses this result to mark the read's tracing span as cached.
+    /// Hit and miss counters come from the `get_*` probe that SlateDB makes
+    /// before every fetch, not from this result.
     /// It does not track whether the supplied loader runs.
     /// This contract also applies to [`Self::fetch_index`], [`Self::fetch_filter`], and [`Self::fetch_stats`].
     ///
