@@ -594,18 +594,17 @@ mod tests {
     use crate::db::builder::CloneSourceSpec;
     use crate::db::Db;
     use crate::db_reader::DbReader;
-    use crate::db_state::SsTableId;
     use crate::error::SlateDBError;
     use crate::iter::IterationOrder;
     use crate::manifest::store::{ManifestStore, StoredManifest};
     use crate::manifest::Manifest;
     use crate::manifest::{ManifestCore, VersionedManifest};
-    use crate::object_stores::ObjectStores;
     use crate::paths::PathResolver;
     use crate::proptest_util::{rng, sample};
     use crate::test_utils;
     use crate::utils::IdGenerator;
     use crate::wal::slatedb::admin::SlateDbWalAdmin;
+    use crate::wal::slatedb::store::WalFileId;
     use crate::wal::{WalAdmin, WalError, WalFileRange, WalGc};
     use async_trait::async_trait;
     use bytes::Bytes;
@@ -679,7 +678,8 @@ mod tests {
     async fn create_native_clone<P: Into<Path>, R: RangeBounds<Bytes> + Clone>(
         clone_sources: Vec<CloneSourceSpec<R>>,
         clone_path: P,
-        object_stores: ObjectStores,
+        object_store: Arc<dyn ObjectStore>,
+        wal_object_store: Arc<dyn ObjectStore>,
         fp_registry: Arc<FailPointRegistry>,
         system_clock: Arc<dyn SystemClock>,
         rand: Arc<DbRand>,
@@ -687,18 +687,11 @@ mod tests {
         segment_filter: Option<SegmentFilterFn>,
         segment_projection: Option<SegmentProjectionFn>,
     ) -> Result<(), SlateDBError> {
-        let wal_admin = Arc::new(SlateDbWalAdmin::new(
-            object_stores
-                .store_of(crate::object_stores::ObjectStoreType::Wal)
-                .clone(),
-            fp_registry.clone(),
-        ));
+        let wal_admin = Arc::new(SlateDbWalAdmin::new(wal_object_store, fp_registry.clone()));
         crate::clone::create_clone(
             clone_sources,
             clone_path,
-            object_stores
-                .store_of(crate::object_stores::ObjectStoreType::Main)
-                .clone(),
+            object_store,
             wal_admin,
             fp_registry,
             system_clock,
@@ -728,7 +721,8 @@ mod tests {
         create_native_clone(
             vec![source],
             clone_path,
-            ObjectStores::new(object_store, Some(wal_object_store)),
+            object_store,
+            wal_object_store,
             fp_registry,
             system_clock,
             rand,
@@ -1020,6 +1014,112 @@ mod tests {
         test_utils::assert_ranged_db_scan(&table, .., IterationOrder::Ascending, &mut db_iter)
             .await;
         reader.close().await.unwrap();
+    }
+
+    // A clone lists every ancestor it inherits. Once compaction has re-localized all of an
+    // ancestor's SSTs, the detach collector releases the parent's pin on that ancestor. A
+    // clone of a checkpoint taken before the release reads nothing from the ancestor, so it
+    // must not need the pin.
+    #[tokio::test]
+    async fn should_clone_checkpoint_whose_emptied_ancestor_was_detached() {
+        let mut rng = rng::new_test_rng(None);
+        let table = sample::table(&mut rng, 1000, 10);
+
+        let object_store = Arc::new(InMemory::new());
+        let grandparent_path = Path::from("/tmp/test_grandparent");
+        let parent_path = Path::from("/tmp/test_parent");
+        let clone_path = Path::from("/tmp/test_clone");
+        let system_clock: Arc<dyn SystemClock> = Arc::new(DefaultSystemClock::new());
+        let rand = Arc::new(DbRand::default());
+
+        // The grandparent owns no SSTs, so the parent's entry for it is empty from the start,
+        // as it is once compaction has re-localized everything the parent borrowed.
+        Db::open(grandparent_path.clone(), object_store.clone())
+            .await
+            .unwrap()
+            .close()
+            .await
+            .unwrap();
+        create_clone(
+            parent_path.clone(),
+            grandparent_path.clone(),
+            object_store.clone(),
+            object_store.clone(),
+            None,
+            Arc::new(FailPointRegistry::new()),
+            system_clock.clone(),
+            rand.clone(),
+        )
+        .await
+        .unwrap();
+
+        // The parent's own collector would detach the empty entry as soon as it runs; the
+        // test releases the pin itself below, after the checkpoint that still lists it.
+        let parent_db = Db::builder(parent_path.clone(), object_store.clone())
+            .with_settings(Settings {
+                garbage_collector_options: None,
+                ..Settings::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        test_utils::seed_database(&parent_db, &table, false)
+            .await
+            .unwrap();
+        parent_db
+            .flush_with_options(FlushOptions {
+                flush_type: FlushType::MemTable,
+            })
+            .await
+            .unwrap();
+        let checkpoint = parent_db
+            .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
+            .await
+            .unwrap();
+        parent_db.close().await.unwrap();
+
+        // Release the parent's pin on the grandparent, as the detach collector does.
+        let checkpointed = ManifestStore::new(&parent_path, object_store.clone())
+            .read_manifest(checkpoint.manifest_id)
+            .await
+            .unwrap();
+        let ancestor = checkpointed
+            .external_dbs
+            .iter()
+            .find(|e| e.path == grandparent_path.to_string())
+            .expect("the checkpoint lists the grandparent");
+        assert!(ancestor.sst_ids.is_empty());
+        let mut grandparent_manifest = StoredManifest::load(
+            Arc::new(ManifestStore::new(&grandparent_path, object_store.clone())),
+            system_clock.clone(),
+        )
+        .await
+        .unwrap();
+        grandparent_manifest
+            .delete_checkpoint(ancestor.final_checkpoint_id.unwrap())
+            .await
+            .unwrap();
+
+        create_clone(
+            clone_path.clone(),
+            parent_path.clone(),
+            object_store.clone(),
+            object_store.clone(),
+            Some(checkpoint.id),
+            Arc::new(FailPointRegistry::new()),
+            system_clock.clone(),
+            rand.clone(),
+        )
+        .await
+        .unwrap();
+
+        let clone_db = Db::open(clone_path.clone(), object_store.clone())
+            .await
+            .unwrap();
+        let mut db_iter = clone_db.scan(..).await.unwrap();
+        test_utils::assert_ranged_db_scan(&table, .., IterationOrder::Ascending, &mut db_iter)
+            .await;
+        clone_db.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -1608,7 +1708,7 @@ mod tests {
             "expected cloned state to retain WAL-only SSTs"
         );
         let expected_missing_wal_path = PathResolver::from_root(Path::from(parent_path))
-            .sst_path(&SsTableId::Wal(
+            .wal_sst_path(&WalFileId::from(
                 manifest.manifest.core.replay_after_wal_id + 1,
             ))
             .to_string();
@@ -1726,7 +1826,8 @@ mod tests {
         let err = create_native_clone(
             vec![CloneSourceSpec::new(parent_path.clone())],
             clone_path.clone(),
-            ObjectStores::new(object_store.clone(), Some(object_store.clone())),
+            object_store.clone(),
+            object_store.clone(),
             Arc::new(FailPointRegistry::new()),
             Arc::new(DefaultSystemClock::new()),
             Arc::new(DbRand::default()),
@@ -1759,7 +1860,8 @@ mod tests {
         create_native_clone(
             vec![CloneSourceSpec::new(parent_path.clone())],
             clone_path.clone(),
-            ObjectStores::new(object_store.clone(), Some(object_store.clone())),
+            object_store.clone(),
+            object_store.clone(),
             Arc::new(FailPointRegistry::new()),
             Arc::new(DefaultSystemClock::new()),
             Arc::new(DbRand::default()),
@@ -1875,7 +1977,8 @@ mod tests {
         create_native_clone(
             sources,
             clone_path.clone(),
-            ObjectStores::new(object_store.clone(), Some(object_store)),
+            object_store.clone(),
+            object_store,
             Arc::new(FailPointRegistry::new()),
             Arc::new(DefaultSystemClock::new()),
             Arc::new(DbRand::default()),
@@ -2557,7 +2660,7 @@ mod tests {
         // Plant the WAL object directly in the object store at the resolved path.
         use object_store::ObjectStoreExt;
         let wal_path =
-            PathResolver::from_root(path.clone()).sst_path(&SsTableId::Wal(planted_wal_id));
+            PathResolver::from_root(path.clone()).wal_sst_path(&WalFileId::from(planted_wal_id));
         object_store.put(&wal_path, wal_bytes.into()).await.unwrap();
 
         planted_wal_id
@@ -2628,7 +2731,8 @@ mod tests {
                 CloneSourceSpec::new(parent_path_b.clone()),
             ],
             clone_path.clone(),
-            ObjectStores::new(object_store.clone(), Some(object_store.clone())),
+            object_store.clone(),
+            object_store.clone(),
             Arc::new(FailPointRegistry::new()),
             system_clock.clone(),
             Arc::new(DbRand::default()),
@@ -2691,7 +2795,8 @@ mod tests {
                 CloneSourceSpec::new(parent_path_b.clone()),
             ],
             clone_path.clone(),
-            ObjectStores::new(object_store.clone(), Some(object_store.clone())),
+            object_store.clone(),
+            object_store.clone(),
             Arc::new(FailPointRegistry::new()),
             system_clock.clone(),
             Arc::new(DbRand::default()),
@@ -2744,7 +2849,7 @@ mod tests {
         build_plain_wal_disabled_parent(&parent_path_b, object_store.clone(), &table_b).await;
 
         let expected_missing_wal_path = PathResolver::from_root(parent_path_a.clone())
-            .sst_path(&SsTableId::Wal({
+            .wal_sst_path(&WalFileId::from({
                 let manifest_store =
                     Arc::new(ManifestStore::new(&parent_path_a, object_store.clone()));
                 let sm = StoredManifest::load(manifest_store, system_clock.clone())
@@ -2760,7 +2865,8 @@ mod tests {
                 CloneSourceSpec::new(parent_path_b.clone()),
             ],
             clone_path.clone(),
-            ObjectStores::new(object_store.clone(), Some(object_store.clone())),
+            object_store.clone(),
+            object_store.clone(),
             Arc::new(FailPointRegistry::new()),
             system_clock.clone(),
             Arc::new(DbRand::default()),

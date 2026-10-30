@@ -23,7 +23,7 @@
 //! async fn main() -> Result<(), Error> {
 //!     let object_store = Arc::new(InMemory::new());
 //!     let db = Db::builder("test_db", object_store)
-//!         .with_db_cache(Arc::new(FoyerCache::new()))
+//!         .with_db_cache(Arc::new(FoyerCache::new()), 0)
 //!         .build()
 //!         .await?;
 //!     Ok(())
@@ -32,8 +32,8 @@
 //!
 
 use crate::db_cache::{
-    CacheLoader, CacheUsageSnapshot, CachedEntry, CachedKey, DbCache, DbCacheUsageSnapshot,
-    DEFAULT_MAX_CAPACITY,
+    instrumented_loader, CacheFetch, CacheLoader, CacheLookup, CacheUsageSnapshot, CachedEntry,
+    CachedKey, DbCache, DbCacheUsageSnapshot, DEFAULT_MAX_CAPACITY,
 };
 use crate::error::SlateDBError;
 use async_trait::async_trait;
@@ -144,7 +144,7 @@ impl DbCache for FoyerCache {
         &self,
         key: CachedKey,
         loader: CacheLoader,
-    ) -> Result<CachedEntry, crate::Error> {
+    ) -> Result<CacheFetch, crate::Error> {
         self.dedup_fetch(key, loader).await
     }
 
@@ -152,7 +152,7 @@ impl DbCache for FoyerCache {
         &self,
         key: CachedKey,
         loader: CacheLoader,
-    ) -> Result<CachedEntry, crate::Error> {
+    ) -> Result<CacheFetch, crate::Error> {
         self.dedup_fetch(key, loader).await
     }
 
@@ -160,7 +160,7 @@ impl DbCache for FoyerCache {
         &self,
         key: CachedKey,
         loader: CacheLoader,
-    ) -> Result<CachedEntry, crate::Error> {
+    ) -> Result<CacheFetch, crate::Error> {
         self.dedup_fetch(key, loader).await
     }
 
@@ -168,7 +168,7 @@ impl DbCache for FoyerCache {
         &self,
         key: CachedKey,
         loader: CacheLoader,
-    ) -> Result<CachedEntry, crate::Error> {
+    ) -> Result<CacheFetch, crate::Error> {
         self.dedup_fetch(key, loader).await
     }
 }
@@ -185,13 +185,57 @@ impl FoyerCache {
         &self,
         key: CachedKey,
         loader: CacheLoader,
-    ) -> Result<CachedEntry, crate::Error> {
+    ) -> Result<CacheFetch, crate::Error> {
+        let (loader, loader_ran) = instrumented_loader(loader);
         let fetch = self
             .inner
             .get_or_fetch(&key, move || async move { loader().await });
         match fetch.await {
-            Ok(entry) => Ok(entry.value().clone()),
+            Ok(entry) => Ok(CacheFetch {
+                entry: entry.value().clone(),
+                lookup: if loader_ran.was_called() {
+                    CacheLookup::Miss
+                } else {
+                    CacheLookup::Hit
+                },
+            }),
             Err(err) => Err(SlateDBError::FoyerError(Arc::new(err)).into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db_state::SsTableId;
+    use crate::format::sst::BlockBuilder;
+    use crate::types::RowEntry;
+    use ulid::Ulid;
+
+    #[tokio::test]
+    async fn test_fetch_lookup_from_memory() {
+        let cache = FoyerCache::new();
+        let key = CachedKey::from((SsTableId::new(Ulid::new()), 0));
+        let mut builder = BlockBuilder::new_latest(4096);
+        assert!(builder
+            .add(RowEntry::new_value(b"key", b"value", 0))
+            .unwrap());
+        let block = Arc::new(builder.build().unwrap());
+        let entry = CachedEntry::with_block(block.clone());
+        let loader: CacheLoader = Box::new(move || Box::pin(async move { Ok(entry) }));
+
+        let first = cache.fetch_block(key.clone(), loader).await.unwrap();
+        assert_eq!(first.lookup, CacheLookup::Miss);
+        assert!(Arc::ptr_eq(&first.entry.block().unwrap(), &block));
+        let second = cache
+            .fetch_block(
+                key,
+                Box::new(|| panic!("A cache hit must not run the loader.")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.lookup, CacheLookup::Hit);
+        assert!(Arc::ptr_eq(&second.entry.block().unwrap(), &block));
+        cache.close().await.unwrap();
     }
 }

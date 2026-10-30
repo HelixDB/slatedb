@@ -390,8 +390,8 @@ pub struct ScanOptions {
     /// Optional context forwarded to custom filter policies; ignored by
     /// built-in filters. See [`FilterContext`].
     ///
-    /// Only consulted for `scan_prefix` today. Plain range scans do not
-    /// evaluate SST filters, so this field has no effect on `scan`.
+    /// Consulted by `scan_prefix`, and by `scan` only when a registered
+    /// policy reports [`crate::filter_policy::FilterPolicy::supports_range_queries`].
     pub filter_context: Option<FilterContext>,
     /// Optional caller-provided tracing settings.
     pub tracing_options: Option<TracingOptions>,
@@ -798,10 +798,6 @@ pub struct Settings {
     /// memtable will be frozen even if it has not reached `l0_sst_size_bytes`.
     pub max_wal_flushes_before_l0_flush: u64,
 
-    /// Controls concurrent full-object WAL prefetch during recovery.
-    #[serde(default)]
-    pub wal_replay: WalReplaySettings,
-
     /// Defines the max total number of SSTs in L0 across the entire key space. Memtables
     /// will not be flushed if the total L0 count (including in-flight uploads) would exceed
     /// this value, until compaction can compact the ssts into compacted.
@@ -918,7 +914,6 @@ impl std::fmt::Debug for Settings {
                 "max_wal_flushes_before_l0_flush",
                 &self.max_wal_flushes_before_l0_flush,
             )
-            .field("wal_replay", &self.wal_replay)
             .field("l0_max_ssts", &self.l0_max_ssts)
             .field("l0_max_ssts_per_key", &self.l0_max_ssts_per_key)
             .field("l0_flush_parallelism", &self.l0_flush_parallelism)
@@ -957,7 +952,6 @@ impl Settings {
     /// Returns an [`crate::Error`] with [`crate::ErrorKind::Invalid`] describing
     /// the first invalid setting or combination encountered.
     pub fn validate(&self) -> Result<(), crate::Error> {
-        self.wal_replay.validate()?;
         if self.l0_flush_parallelism == 0 {
             return Err(SlateDBError::InvalidConfiguration(
                 "l0_flush_parallelism must be at least 1".into(),
@@ -1174,7 +1168,6 @@ impl Default for Settings {
             max_unflushed_bytes: 1_073_741_824,
             l0_sst_size_bytes: 64 * 1024 * 1024,
             max_wal_flushes_before_l0_flush: 4096,
-            wal_replay: WalReplaySettings::default(),
             l0_max_ssts: 8,
             l0_max_ssts_per_key: 8,
             l0_flush_parallelism: 4,
@@ -1190,96 +1183,6 @@ impl Default for Settings {
             object_store_max_retries: None,
             #[cfg(test)]
             block_format: None,
-        }
-    }
-}
-
-/// Limits full-object WAL prefetch during writer and reader recovery.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(default)]
-pub struct WalReplaySettings {
-    /// Maximum number of WAL objects fetched concurrently.
-    pub max_concurrent_objects: usize,
-
-    /// Maximum WAL payload memory used by full-object replay.
-    ///
-    /// Replay reserves `min(max_inflight_bytes / 4, 64 MiB)` for metadata, the
-    /// index, and one lazily decoded block. Half of that working partition is
-    /// reserved for metadata/index and half for the current decoded block. It
-    /// uses the remainder for retained normal-sized encoded objects. Oversized
-    /// objects use bounded range replay instead of bypassing the limit. Writers
-    /// reject a WAL before durable acknowledgement when one of its sections
-    /// cannot be recovered within these partitions.
-    pub max_inflight_bytes: usize,
-}
-
-impl WalReplaySettings {
-    const MAX_DECODE_WORKING_BYTES: usize = 64 * 1024 * 1024;
-
-    pub(crate) fn validate(&self) -> Result<(), SlateDBError> {
-        if self.max_concurrent_objects == 0 {
-            return Err(SlateDBError::InvalidConfiguration(
-                "wal_replay.max_concurrent_objects must be at least 1".into(),
-            ));
-        }
-        if self.max_inflight_bytes == 0 {
-            return Err(SlateDBError::InvalidConfiguration(
-                "wal_replay.max_inflight_bytes must be at least 1".into(),
-            ));
-        }
-        if u32::try_from(self.max_inflight_bytes).is_err() {
-            return Err(SlateDBError::InvalidConfiguration(
-                "wal_replay.max_inflight_bytes must fit in a 32-bit semaphore permit count".into(),
-            ));
-        }
-        self.encoded_byte_limit()?;
-        Ok(())
-    }
-
-    pub(crate) fn working_memory_limit(&self) -> usize {
-        (self.max_inflight_bytes / 4).min(Self::MAX_DECODE_WORKING_BYTES)
-    }
-
-    pub(crate) fn encoded_byte_limit(&self) -> Result<usize, SlateDBError> {
-        self.max_inflight_bytes
-            .checked_sub(self.working_memory_limit())
-            .ok_or(SlateDBError::InvalidConfiguration(
-                "wal replay memory budget cannot reserve decode working memory".into(),
-            ))
-    }
-
-    pub(crate) fn block_working_memory_limit(&self) -> usize {
-        self.working_memory_limit() / 2
-    }
-
-    pub(crate) fn metadata_working_memory_limit(&self) -> usize {
-        self.working_memory_limit() / 2
-    }
-
-    pub(crate) fn validate_wal_block_size(&self, block_size: usize) -> Result<(), SlateDBError> {
-        // In the worst uncompressed case range replay holds the encoded block,
-        // its decoded bytes, and a materialized `u16` offset vector together.
-        let required_bytes = block_size
-            .checked_mul(3)
-            .and_then(|size| size.checked_add(10))
-            .ok_or(SlateDBError::InvalidConfiguration(
-                "SST block size overflows WAL replay memory accounting".into(),
-            ))?;
-        let limit_bytes = self.block_working_memory_limit();
-        if required_bytes > limit_bytes {
-            return Err(SlateDBError::InvalidConfiguration(format!(
-                "SST block size requires {required_bytes} bytes of WAL replay working memory, limit is {limit_bytes} bytes"
-            )));
-        }
-        Ok(())
-    }
-}
-
-impl Default for WalReplaySettings {
-    fn default() -> Self {
-        Self {
-            max_concurrent_objects: 64,
-            max_inflight_bytes: 256 * 1024 * 1024,
         }
     }
 }
@@ -1307,10 +1210,6 @@ pub struct DbReaderOptions {
     /// The max size of a single in-memory table used to buffer WAL entries
     /// Defaults to 64MB
     pub max_memtable_bytes: u64,
-
-    /// Controls concurrent full-object WAL prefetch during recovery.
-    #[serde(default)]
-    pub wal_replay: WalReplaySettings,
 
     /// Options for the local disk cache. If `root_folder` is set, the reader
     /// will wrap its object store in a `CachedObjectStore` backed by the
@@ -1346,7 +1245,6 @@ impl Default for DbReaderOptions {
             wal_poll_interval: default_reader_wal_poll_interval(),
             checkpoint_lifetime: Duration::from_secs(10 * 60),
             max_memtable_bytes: 64 * 1024 * 1024,
-            wal_replay: WalReplaySettings::default(),
             object_store_cache_options: ObjectStoreCacheOptions::default(),
             skip_wal_replay: false,
             metric_level: None,
@@ -1450,6 +1348,23 @@ pub struct CompactorOptions {
     #[serde(serialize_with = "serialize_duration")]
     pub commit_compacted_interval: Duration,
 
+    /// How long the compactor checkpoint protects input SSTs while publishing a
+    /// manifest that replaces them with compacted output.
+    ///
+    /// A scan, get, snapshot, or transaction that began before the manifest update
+    /// and still needs an input SST must finish within this duration. If it runs
+    /// longer, garbage collection may delete the SST, causing the operation to fail
+    /// with a [`crate::ErrorKind::Data`] error backed by
+    /// [`object_store::Error::NotFound`]. Shorter lifetimes reduce retained storage;
+    /// longer lifetimes give in-flight reads more time to finish. Defaults to 15
+    /// minutes.
+    #[serde(
+        default = "default_compactor_checkpoint_lifetime",
+        deserialize_with = "deserialize_duration",
+        serialize_with = "serialize_duration"
+    )]
+    pub checkpoint_lifetime: Duration,
+
     /// How long the coordinator will wait without a heartbeat before reclaiming
     /// a `Running` compaction from its worker and resetting it to `Submitted`.
     /// A worker that crashes or stalls will have its jobs reclaimed after this
@@ -1467,8 +1382,9 @@ pub struct CompactorOptions {
 /// Default options for the compactor. Currently, only a
 /// `SizeTieredCompactionScheduler` compaction strategy is implemented.
 impl Default for CompactorOptions {
-    /// Returns a `CompactorOptions` with a 5 second poll interval and an embedded
-    /// worker enabled with default [`CompactionWorkerOptions`].
+    /// Returns a `CompactorOptions` with a 5 second poll interval, a 15 minute
+    /// checkpoint lifetime, and an embedded worker enabled with default
+    /// [`CompactionWorkerOptions`].
     fn default() -> Self {
         Self {
             poll_interval: Duration::from_secs(5),
@@ -1479,6 +1395,7 @@ impl Default for CompactorOptions {
             worker: Some(CompactionWorkerOptions::default()),
             metric_level: None,
             commit_compacted_interval: Duration::from_secs(1),
+            checkpoint_lifetime: default_compactor_checkpoint_lifetime(),
             worker_heartbeat_timeout: Duration::from_secs(30),
             object_store_max_retries: None,
         }
@@ -1500,6 +1417,7 @@ impl std::fmt::Debug for CompactorOptions {
             .field("worker", &self.worker)
             .field("metric_level", &self.metric_level)
             .field("commit_compacted_interval", &self.commit_compacted_interval)
+            .field("checkpoint_lifetime", &self.checkpoint_lifetime)
             .field("worker_heartbeat_timeout", &self.worker_heartbeat_timeout)
             .field("object_store_max_retries", &self.object_store_max_retries)
             .finish()
@@ -1608,6 +1526,10 @@ fn default_compaction_worker_options() -> Option<CompactionWorkerOptions> {
     Some(CompactionWorkerOptions::default())
 }
 
+fn default_compactor_checkpoint_lifetime() -> Duration {
+    Duration::from_mins(15)
+}
+
 /// Options for the Size-Tiered Compaction Scheduler
 #[derive(Clone, Copy, Debug)]
 pub struct SizeTieredCompactionSchedulerOptions {
@@ -1621,6 +1543,27 @@ pub struct SizeTieredCompactionSchedulerOptions {
     /// be included in a given compaction. A sorted run S will be added to a compaction C if S's
     /// size is less than this value times the min size of the runs currently included in C.
     pub include_size_threshold: f32,
+
+    /// The projected sorted-run count above which fallback consolidation starts for each tree.
+    /// Zero disables the trigger. This value does not impose a hard limit.
+    /// The scheduler rejects one with a warning and disables the fallback.
+    /// Enabled values must be at least two.
+    ///
+    /// The projected count includes active compactions and newly selected work.
+    /// The fallback limits its sources to reach this count without going below it.
+    /// Normal size-based scheduling can reduce the count further.
+    ///
+    /// A threshold of two can cause frequent fallback merges as new runs arrive.
+    /// Repeatedly merging new data with a growing run increases storage reads and writes
+    /// and consumes compaction capacity. Other low thresholds can have the same cost.
+    ///
+    /// When normal scheduling finds no work, the fallback ignores `min_compaction_sources`
+    /// and `include_size_threshold`. It requires at least two sources and respects
+    /// `max_compaction_sources`, source conflicts, and existing limits on compaction work.
+    ///
+    /// The fallback tries consecutive groups from newest to oldest. It stops each group
+    /// at `max_compaction_sources` and keeps the newest eligible sources in that group.
+    pub sorted_run_consolidation_threshold: usize,
 }
 
 impl Default for SizeTieredCompactionSchedulerOptions {
@@ -1629,6 +1572,7 @@ impl Default for SizeTieredCompactionSchedulerOptions {
             min_compaction_sources: 4,
             max_compaction_sources: 8,
             include_size_threshold: 4.0,
+            sorted_run_consolidation_threshold: 0,
         }
     }
 }
@@ -1665,6 +1609,15 @@ impl From<&HashMap<String, String>> for SizeTieredCompactionSchedulerOptions {
                         );
                     }
                 },
+                "sorted_run_consolidation_threshold" => match value.parse::<usize>() {
+                    Ok(parsed) => options.sorted_run_consolidation_threshold = parsed,
+                    Err(err) => {
+                        warn!(
+                            "invalid scheduler option value for sorted_run_consolidation_threshold: '{}': {}",
+                            value, err
+                        );
+                    }
+                },
                 _ => {
                     warn!("unknown scheduler option '{}'; ignoring", key);
                 }
@@ -1695,6 +1648,10 @@ impl From<SizeTieredCompactionSchedulerOptions> for HashMap<String, String> {
         map.insert(
             "include_size_threshold".to_string(),
             options.include_size_threshold.to_string(),
+        );
+        map.insert(
+            "sorted_run_consolidation_threshold".to_string(),
+            options.sorted_run_consolidation_threshold.to_string(),
         );
         map
     }
@@ -2040,6 +1997,27 @@ mod tests {
     }
 
     #[test]
+    fn test_compactor_checkpoint_lifetime_config() {
+        let default_lifetime = Duration::from_mins(15);
+        assert_eq!(
+            default_lifetime,
+            CompactorOptions::default().checkpoint_lifetime
+        );
+
+        let mut value = serde_json::to_value(CompactorOptions::default()).unwrap();
+        value.as_object_mut().unwrap().insert(
+            "checkpoint_lifetime".to_string(),
+            serde_json::Value::String("42s".to_string()),
+        );
+        let configured: CompactorOptions = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(Duration::from_secs(42), configured.checkpoint_lifetime);
+
+        value.as_object_mut().unwrap().remove("checkpoint_lifetime");
+        let omitted: CompactorOptions = serde_json::from_value(value).unwrap();
+        assert_eq!(default_lifetime, omitted.checkpoint_lifetime);
+    }
+
+    #[test]
     fn test_gc_boundary_files_are_enabled_by_default_when_omitted() {
         fn without_boundary_setting<T: Serialize>(value: T) -> serde_json::Value {
             let mut value = serde_json::to_value(value).unwrap();
@@ -2245,6 +2223,7 @@ object_store_cache_options:
             min_compaction_sources: 3,
             max_compaction_sources: 9,
             include_size_threshold: 7.0,
+            sorted_run_consolidation_threshold: 5,
         };
 
         let map: HashMap<String, String> = options.into();
@@ -2253,6 +2232,7 @@ object_store_cache_options:
         assert_eq!(roundtripped.min_compaction_sources, 3);
         assert_eq!(roundtripped.max_compaction_sources, 9);
         assert_eq!(roundtripped.include_size_threshold, 7.0);
+        assert_eq!(roundtripped.sorted_run_consolidation_threshold, 5);
     }
 
     #[test]
@@ -2332,82 +2312,14 @@ object_store_cache_options:
     #[test]
     fn test_validate_accepts_default_settings() {
         assert!(Settings::default().validate().is_ok());
-        assert_eq!(
-            Settings::default().wal_replay,
-            WalReplaySettings {
-                max_concurrent_objects: 64,
-                max_inflight_bytes: 256 * 1024 * 1024,
-            }
-        );
     }
 
     #[test]
-    fn test_validate_rejects_invalid_wal_replay_settings() {
-        for wal_replay in [
-            WalReplaySettings {
-                max_concurrent_objects: 0,
-                ..WalReplaySettings::default()
-            },
-            WalReplaySettings {
-                max_inflight_bytes: 0,
-                ..WalReplaySettings::default()
-            },
-        ] {
-            let settings = Settings {
-                wal_replay,
-                ..Settings::default()
-            };
-            assert!(settings.validate().is_err());
-        }
-    }
-
-    #[test]
-    fn wal_replay_rejects_a_block_target_larger_than_its_working_partition() {
-        let settings = WalReplaySettings {
-            max_concurrent_objects: 1,
-            max_inflight_bytes: 64 * 1024,
-        };
-
-        assert!(settings.validate_wal_block_size(4096).is_err());
-        assert!(settings.validate_wal_block_size(1024).is_ok());
-    }
-
-    #[cfg(target_pointer_width = "64")]
-    #[test]
-    fn test_validate_rejects_wal_replay_byte_semaphore_overflow() {
-        let settings = Settings {
-            wal_replay: WalReplaySettings {
-                max_inflight_bytes: u32::MAX as usize + 1,
-                ..WalReplaySettings::default()
-            },
-            ..Settings::default()
-        };
-        assert!(settings.validate().is_err());
-    }
-
-    #[test]
-    fn test_wal_replay_settings_default_when_omitted() {
-        let mut settings = serde_json::to_value(Settings::default()).unwrap();
-        settings.as_object_mut().unwrap().remove("wal_replay");
-        let decoded: Settings = serde_json::from_value(settings).unwrap();
-        assert_eq!(decoded.wal_replay, WalReplaySettings::default());
-
+    fn test_reader_wal_poll_interval_defaults_when_omitted() {
         let mut reader = serde_json::to_value(DbReaderOptions::default()).unwrap();
-        reader.as_object_mut().unwrap().remove("wal_replay");
         reader.as_object_mut().unwrap().remove("wal_poll_interval");
         let decoded: DbReaderOptions = serde_json::from_value(reader).unwrap();
-        assert_eq!(decoded.wal_replay, WalReplaySettings::default());
         assert_eq!(decoded.wal_poll_interval, Duration::from_secs(1));
-
-        let partial: WalReplaySettings = serde_json::from_value(serde_json::json!({
-            "max_concurrent_objects": 8
-        }))
-        .unwrap();
-        assert_eq!(partial.max_concurrent_objects, 8);
-        assert_eq!(
-            partial.max_inflight_bytes,
-            WalReplaySettings::default().max_inflight_bytes
-        );
     }
 
     #[test]

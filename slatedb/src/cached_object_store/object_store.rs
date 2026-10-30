@@ -1213,11 +1213,11 @@ mod tests {
     use crate::db_state::SstType;
     use crate::instrumented_object_store::{InstrumentedObjectStore, ObjectStoreComponent};
     use crate::object_store_tag::{ObjectStoreCallTag, TableStoreKind};
-    use crate::object_stores::ObjectStoreType;
     use crate::retrying_object_store::RetryingObjectStore;
     use crate::test_utils::{
         gen_rand_bytes, ExtensionMarker, ExtensionObjectStore, FlakyObjectStore, GatedObjectStore,
     };
+    use crate::utils::ObjectStoreType;
     use slatedb_common::clock::DefaultSystemClock;
     use slatedb_common::metrics::MetricsRecorderHelper;
     use slatedb_common::DbRand;
@@ -1858,7 +1858,7 @@ mod tests {
         Arc<CachedObjectStore>,
     ) {
         use crate::instrumented_object_store::{InstrumentedObjectStore, ObjectStoreComponent};
-        use crate::object_stores::ObjectStoreType;
+        use crate::utils::ObjectStoreType;
         use slatedb_common::metrics::test_recorder_helper;
 
         let (recorder, helper) = test_recorder_helper();
@@ -2685,7 +2685,7 @@ mod tests {
         // Populate the cache with the correct head and part via a normal read.
         let main_tag = ObjectStoreCallTag::new(TableStoreKind::Main, SstType::Compacted);
         let got = store
-            .get_opts(&location, get_opts_tagged(main_tag))
+            .get_opts(&location, get_opts_tagged(main_tag.clone()))
             .await
             .unwrap()
             .bytes()
@@ -2706,7 +2706,7 @@ mod tests {
 
         // A normal read now serves the poisoned bytes (cache hit).
         let served = store
-            .get_opts(&location, get_opts_tagged(main_tag))
+            .get_opts(&location, get_opts_tagged(main_tag.clone()))
             .await
             .unwrap()
             .bytes()
@@ -2719,6 +2719,7 @@ mod tests {
             kind: TableStoreKind::Main,
             sst_type: SstType::Compacted,
             retry: Some(crate::error::RetryReason::CrcMismatch),
+            segment: Some(Bytes::new()),
         };
         let refetched = store
             .get_opts(&location, get_opts_tagged(retry_tag))
@@ -2812,7 +2813,7 @@ mod tests {
 
         // A WAL data read bypasses: it returns the bytes but caches nothing.
         let got = store
-            .get_opts(&location, get_opts_tagged(wal_tag))
+            .get_opts(&location, get_opts_tagged(wal_tag.clone()))
             .await
             .unwrap()
             .bytes()
@@ -2857,7 +2858,7 @@ mod tests {
             .put_opts(
                 &location,
                 PutPayload::from_bytes(payload.clone()),
-                put_opts_tagged(tag),
+                put_opts_tagged(tag.clone()),
             )
             .await
             .unwrap();

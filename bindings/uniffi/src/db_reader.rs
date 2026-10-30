@@ -144,10 +144,35 @@ impl DbReader {
 
     /// Best-effort eviction of block-cache entries for one SST.
     ///
-    /// If no block cache is configured, returns `Ok(())`.
+    /// If no block cache is configured, or if the SST is not reachable from
+    /// the current manifest, the call is a no-op that returns `Ok(())`.
     pub async fn evict_cached_sst(&self, sst_id: SsTableId) -> Result<(), Error> {
         let sst_id = sst_id.into_core()?;
-        self.inner.evict_cached_sst(sst_id).await?;
+        let manifest = self.inner.manifest();
+        let Some(view) = manifest.all_sst_views().find(|view| view.sst.id == sst_id) else {
+            return Ok(());
+        };
+        self.inner
+            .evict_cached_sst(&view.sst, &slatedb::CacheTarget::all())
+            .await?;
+        Ok(())
+    }
+
+    /// Sends this reader's cached data to disk.
+    ///
+    /// This moves data for this instance's scope id from memory to disk.
+    /// It frees memory now, and protects the data from an ungraceful
+    /// process exit later. A later instance with the same scope id can
+    /// read the data back from disk.
+    ///
+    /// This affects the whole scope, not only this instance's own reads
+    /// and writes. If another instance uses the same scope id, this call
+    /// also flushes that instance's data.
+    ///
+    /// Does nothing if no block cache is set, or if the cache has no disk
+    /// storage.
+    pub async fn flush_cache_to_disk(&self) -> Result<(), Error> {
+        self.inner.flush_cache_to_disk().await?;
         Ok(())
     }
 }

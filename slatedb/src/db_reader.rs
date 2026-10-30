@@ -9,7 +9,7 @@ use {
         db_cache_manager,
         db_common::extract_segment_prefix,
         db_iter::DbIteratorGuard,
-        db_state::{collect_touched_segments, SsTableId},
+        db_state::{collect_touched_segments, SsTableHandle, SsTableId},
         db_stats::DbStats,
         db_status::{ClosedResultWriter, DbStatus, DbStatusManager},
         dispatcher::{MessageHandler, MessageHandlerExecutor, MessageTickerDef},
@@ -420,11 +420,7 @@ impl DbReaderInner {
                     wal_store,
                     &status_manager,
                     Arc::clone(&system_clock),
-                    SlateDbWalReaderOptions {
-                        sst_batch_size: options.wal_replay.max_concurrent_objects,
-                        read_ahead_bytes: options.wal_replay.block_working_memory_limit(),
-                        ..SlateDbWalReaderOptions::default()
-                    },
+                    SlateDbWalReaderOptions::default(),
                 ),
             )
         });
@@ -2058,12 +2054,29 @@ impl DbCacheManagerOps for DbReader {
     ) -> Result<(), crate::Error> {
         self.inner.check_closed()?;
         let manifest = self.manifest();
-        db_cache_manager::warm_sst_impl(&self.inner.table_store, &manifest, sst_id, targets).await
+        db_cache_manager::warm_sst_impl(&self.inner.table_store, manifest.core(), sst_id, targets)
+            .await
     }
 
-    async fn evict_cached_sst(&self, sst_id: SsTableId) -> Result<(), crate::Error> {
+    async fn evict_cached_sst(
+        &self,
+        sst: &SsTableHandle,
+        targets: &[CacheTarget],
+    ) -> Result<(), crate::Error> {
         self.inner.check_closed()?;
-        db_cache_manager::evict_cached_sst_impl(&self.inner.table_store, sst_id).await
+        let manifest = self.manifest();
+        db_cache_manager::evict_cached_sst_impl(
+            &self.inner.table_store,
+            manifest.core(),
+            sst,
+            targets,
+        )
+        .await
+    }
+
+    async fn flush_cache_to_disk(&self) -> Result<(), crate::Error> {
+        self.inner.check_closed()?;
+        db_cache_manager::flush_cache_to_disk_impl(&self.inner.table_store).await
     }
 }
 
@@ -2097,7 +2110,6 @@ mod tests {
             },
             mem_table::{ImmutableMemtable, WritableKVTable},
             merge_operator::MergeOperatorType,
-            object_stores::ObjectStores,
             oracle::DbReaderOracle,
             paths::PathResolver,
             proptest_util::{rng::new_test_rng, sample},
@@ -3204,7 +3216,7 @@ mod tests {
                 manifest_poll_interval: Duration::from_millis(10),
                 ..DbReaderOptions::default()
             })
-            .with_db_cache(cache.clone())
+            .with_db_cache(cache.clone(), 1)
             .build()
             .await
             .unwrap();
@@ -4388,55 +4400,6 @@ mod tests {
         );
     }
 
-    /// Regression test for #2003: read-ahead was a fixed 1MiB, so a large WAL took one
-    /// GET per MiB. It now covers a whole WAL SST, so reads for one file stay a small
-    /// constant instead of growing with size.
-    #[tokio::test]
-    async fn replay_reads_a_large_wal_sst_in_a_bounded_number_of_requests() {
-        let recording_store = Arc::new(test_utils::RecordingObjectStore::new(Arc::new(
-            InMemory::new(),
-        )));
-        let object_store: Arc<dyn ObjectStore> = recording_store.clone();
-        let path = Path::from("/tmp/test_kv_store");
-        let test_provider = TestProvider::new(path.clone(), Arc::clone(&object_store));
-        let wal_store = test_provider.wal_store();
-
-        // One 16MiB WAL SST, far over the old 1MiB window. The old window read it in
-        // ~16 data GETs; the fix reads it in one.
-        let value = vec![b'x'; 4096];
-        let entries: Vec<RowEntry> = (0..4096u32)
-            .map(|i| RowEntry::new_value(format!("key-{i:08}").as_bytes(), &value, i as u64 + 1))
-            .collect();
-        write_wal_sst(Arc::clone(&wal_store), 1, entries)
-            .await
-            .unwrap();
-
-        let mut core = ManifestCore::new();
-        core.next_wal_sst_id = 2;
-        let status_manager = status_manager_for_core(&core);
-        let wal_reader = native_wal_reader(&wal_store, &status_manager);
-
-        recording_store.clear();
-        let mut iterator = wal_reader.iterator((1..2).into()).await.unwrap();
-        let mut rows = 0;
-        while let Some(batch) = iterator.next().await.unwrap() {
-            rows += batch.rows.len();
-        }
-        assert_eq!(rows, 4096, "replay should return every WAL row");
-
-        let wal_reads = recording_store
-            .get_sst_types(false)
-            .into_iter()
-            .filter(|sst_type| *sst_type == Some(SstType::Wal))
-            .count();
-        // Footer, index, and one data read. The old 1MiB window needed ~16 data reads
-        // for this file, so the bound is the regression.
-        assert!(
-            wal_reads <= 4,
-            "expected a bounded number of WAL reads for one file, got {wal_reads}"
-        );
-    }
-
     /// A checkpoint captures the WAL files that were durable when it was taken,
     /// so a pinned reader replays them by default. `skip_wal_replay` opts out of
     /// that read, at the cost of not seeing the checkpointed WAL writes.
@@ -4603,7 +4566,7 @@ mod tests {
             builder.add(entry).await?;
         }
         let encoded_sst = builder.build().await?;
-        wal_store.write_sst(wal_id, &encoded_sst).await?;
+        wal_store.write_sst(wal_id.into(), &encoded_sst).await?;
         Ok(())
     }
 
@@ -4916,7 +4879,7 @@ mod tests {
 
         fn view(seq: u64) -> SsTableView {
             SsTableView::identity(SsTableHandle::new(
-                SsTableId::Compacted(ulid::Ulid::from_parts(seq, 0)),
+                SsTableId::from(ulid::Ulid::from_parts(seq, 0)),
                 SST_FORMAT_VERSION_LATEST,
                 SsTableInfo::default(),
             ))
@@ -5273,7 +5236,7 @@ mod tests {
     impl TestProvider {
         fn table_store(&self) -> Arc<TableStore> {
             Arc::new(TableStore::new_with_fp_registry(
-                ObjectStores::new(Arc::clone(&self.object_store), None),
+                Arc::clone(&self.object_store),
                 SsTableFormat::default(),
                 PathResolver::from_root(self.path.clone()),
                 Arc::clone(&self.fp_registry),

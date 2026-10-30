@@ -20,24 +20,26 @@ use crate::wal::{WalError, WalFileRange, WalIterator, WalReader};
 
 #[derive(Clone, Debug)]
 pub struct SlateDbWalReaderOptions {
-    /// The number of WAL SST handles to preload while replaying.
-    pub sst_batch_size: usize,
+    /// The shared soft limit on bytes buffered across all WAL SST iterators. A fetch needed to
+    /// make forward progress may temporarily exceed this limit. The default is 128 MiB.
+    pub max_buffered_bytes: usize,
 
-    /// Retained for compatibility with the existing WAL reader configuration.
+    /// The speculative fetch-task limit shared by all WAL SST iterators. An SST may temporarily
+    /// exceed this budget when it must fetch a block to make progress. Defaults to 128.
     pub max_fetch_tasks: usize,
 
     /// The target number of bytes to fetch in a single request while iterating over WAL SSTs.
     /// Each fetch reads enough whole blocks to meet this target or reach the end of the file.
-    /// The default is 1 MiB.
+    /// The default is 4 MiB.
     pub read_ahead_bytes: usize,
 }
 
 impl Default for SlateDbWalReaderOptions {
     fn default() -> Self {
         Self {
-            sst_batch_size: 4,
-            max_fetch_tasks: 2,
-            read_ahead_bytes: 64 * 1024 * 1024,
+            max_buffered_bytes: 128 * 1024 * 1024,
+            max_fetch_tasks: 128,
+            read_ahead_bytes: 4 * 1024 * 1024,
         }
     }
 }
@@ -45,10 +47,9 @@ impl Default for SlateDbWalReaderOptions {
 impl From<SlateDbWalReaderOptions> for SlateDbWalIteratorOptions {
     fn from(options: SlateDbWalReaderOptions) -> Self {
         Self {
-            sst_batch_size: options.sst_batch_size,
-            sst_iter_options: super::sst_iterator::WalSstIteratorOptions {
-                target_bytes_to_fetch: options.read_ahead_bytes,
-            },
+            target_bytes_to_fetch: options.read_ahead_bytes,
+            max_buffered_bytes: options.max_buffered_bytes,
+            max_fetch_tasks: options.max_fetch_tasks,
         }
     }
 }
@@ -264,7 +265,11 @@ impl WalReader for SlateDbWalReader {
     }
 
     async fn last_wal_file_id(&self, replay_after_wal_id: u64) -> Result<u64, WalError> {
-        let last = self.wal_store.last_seen_wal_id(replay_after_wal_id).await?;
+        let last = self
+            .wal_store
+            .last_seen_wal_id(replay_after_wal_id.into())
+            .await?
+            .value();
         let manifest = self.manifest_reader.manifest().await?;
         if last < manifest.core().replay_after_wal_id {
             return Err(WalError::WalTruncated(last));
@@ -280,7 +285,6 @@ mod tests {
 
     use super::*;
     use crate::config::{FlushOptions, FlushType};
-    use crate::db_state::SsTableId;
     use crate::manifest::store::StoredManifest;
     use crate::manifest::ManifestCore;
     use crate::paths::PathResolver;
@@ -584,8 +588,16 @@ mod tests {
             .with_path(Path::from("/reader_normalizes_range_bounds"))
             .build()
             .unwrap();
-        wal_reader.wal_store.write_wal_fence(1).await.unwrap();
-        wal_reader.wal_store.write_wal_fence(2).await.unwrap();
+        wal_reader
+            .wal_store
+            .write_wal_fence(1.into())
+            .await
+            .unwrap();
+        wal_reader
+            .wal_store
+            .write_wal_fence(2.into())
+            .await
+            .unwrap();
 
         let mut iterator = wal_reader
             .iterator(WalFileRange(Bound::Excluded(1), Bound::Included(2)))
@@ -656,7 +668,7 @@ mod tests {
             .build()
             .unwrap();
         let tail = wal_reader.last_wal_file_id(0).await.unwrap();
-        let wal_path = PathResolver::from_root(path).sst_path(&SsTableId::Wal(tail));
+        let wal_path = PathResolver::from_root(path).wal_sst_path(&tail.into());
         object_store.delete(&wal_path).await.unwrap();
 
         let mut iterator = wal_reader
@@ -680,7 +692,7 @@ mod tests {
             TableStoreKind::Reader,
         ));
         let encoded_sst = wal_store.table_builder().build().await.unwrap();
-        wal_store.write_sst(1, &encoded_sst).await.unwrap();
+        wal_store.write_sst(1.into(), &encoded_sst).await.unwrap();
 
         let mut core = ManifestCore::new();
         core.next_wal_sst_id = 3;
