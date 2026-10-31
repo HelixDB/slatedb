@@ -882,6 +882,13 @@ impl DbCacheWrapper {
     }
 }
 
+/// Keeps `loader`'s storage reads in the calling query's metrics scope when
+/// the inner cache runs it on another task, as Foyer does on a miss.
+fn scoped_loader(loader: CacheLoader) -> CacheLoader {
+    let scoped = query_metrics::in_current_scope(async move { loader().await });
+    Box::new(move || Box::pin(scoped))
+}
+
 // The minimum interval between which the wrapper logs cache errors at error level. This is used to
 // ensure we don't spam the logs on non-transient errors from the cache.
 const ERROR_LOG_INTERVAL: TimeDelta = TimeDelta::seconds(1);
@@ -1046,7 +1053,7 @@ impl DbCache for DbCacheWrapper {
         loader: CacheLoader,
     ) -> Result<CacheFetch, crate::Error> {
         self.cache
-            .fetch_block(self.scoped_key(&key), loader)
+            .fetch_block(self.scoped_key(&key), scoped_loader(loader))
             .await
             .inspect_err(|err| self.record_get_err("block", err))
     }
@@ -1057,7 +1064,7 @@ impl DbCache for DbCacheWrapper {
         loader: CacheLoader,
     ) -> Result<CacheFetch, crate::Error> {
         self.cache
-            .fetch_index(self.scoped_key(&key), loader)
+            .fetch_index(self.scoped_key(&key), scoped_loader(loader))
             .await
             .inspect_err(|err| self.record_get_err("index", err))
     }
@@ -1068,7 +1075,7 @@ impl DbCache for DbCacheWrapper {
         loader: CacheLoader,
     ) -> Result<CacheFetch, crate::Error> {
         self.cache
-            .fetch_filter(self.scoped_key(&key), loader)
+            .fetch_filter(self.scoped_key(&key), scoped_loader(loader))
             .await
             .inspect_err(|err| self.record_get_err("filter", err))
     }
@@ -1079,7 +1086,7 @@ impl DbCache for DbCacheWrapper {
         loader: CacheLoader,
     ) -> Result<CacheFetch, crate::Error> {
         self.cache
-            .fetch_stats(self.scoped_key(&key), loader)
+            .fetch_stats(self.scoped_key(&key), scoped_loader(loader))
             .await
             .inspect_err(|err| self.record_get_err("stats", err))
     }

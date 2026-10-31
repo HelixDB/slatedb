@@ -96,6 +96,23 @@ where
     QUERY_METRICS.scope(observer, future).await
 }
 
+/// Runs `future` under the current task's query-metrics scope, if any.
+///
+/// A task-local scope does not follow work onto another task. Wrap a future
+/// before handing it to `tokio::spawn`, or to a cache that may run it on its
+/// own task, so its storage accesses still count toward the query that
+/// started it. The scope is captured when this is called, not when `future`
+/// is first polled.
+pub(crate) fn in_current_scope<F: Future>(future: F) -> impl Future<Output = F::Output> {
+    let observer = QUERY_METRICS.try_with(Clone::clone).ok();
+    async move {
+        match observer {
+            Some(observer) => QUERY_METRICS.scope(observer, future).await,
+            None => future.await,
+        }
+    }
+}
+
 pub(crate) fn record_cache_access(kind: QueryCacheKind, hit: bool) {
     let _ = QUERY_METRICS.try_with(|observer| observer.record_cache(kind, hit));
 }

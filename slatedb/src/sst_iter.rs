@@ -19,7 +19,7 @@ use crate::format::block::Block;
 use crate::reader::{ReadTrace, SstTraceLevel};
 use crate::{
     iter::{IterationOrder, RowEntryIterator},
-    partitioned_keyspace,
+    partitioned_keyspace, query_metrics,
     tablestore::TableStore,
     types::RowEntry,
     utils::panic_string,
@@ -489,8 +489,8 @@ impl<'a> InternalSstIterator<'a> {
                     let cache_blocks = self.options.cache_blocks;
                     let segment = self.options.segment.clone();
                     let blocks_end = blocks.end;
-                    self.fetch_tasks
-                        .push_back(FetchTask::InFlight(tokio::spawn(async move {
+                    self.fetch_tasks.push_back(FetchTask::InFlight(tokio::spawn(
+                        query_metrics::in_current_scope(async move {
                             table_store
                                 .read_blocks_using_index(
                                     &table,
@@ -500,7 +500,8 @@ impl<'a> InternalSstIterator<'a> {
                                     segment,
                                 )
                                 .await
-                        })));
+                        }),
+                    )));
                     self.next_block_idx_to_fetch = blocks_end;
                 }
             }
@@ -523,8 +524,8 @@ impl<'a> InternalSstIterator<'a> {
                     let cache_blocks = self.options.cache_blocks;
                     let segment = self.options.segment.clone();
                     let blocks_start = blocks.start;
-                    self.fetch_tasks
-                        .push_back(FetchTask::InFlight(tokio::spawn(async move {
+                    self.fetch_tasks.push_back(FetchTask::InFlight(tokio::spawn(
+                        query_metrics::in_current_scope(async move {
                             table_store
                                 .read_blocks_using_index(
                                     &table,
@@ -534,7 +535,8 @@ impl<'a> InternalSstIterator<'a> {
                                     segment,
                                 )
                                 .await
-                        })));
+                        }),
+                    )));
                     self.next_block_idx_to_fetch = blocks_start;
                 }
             }

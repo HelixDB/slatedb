@@ -2546,6 +2546,73 @@ mod tests {
         kv_store.close().await.unwrap();
     }
 
+    /// Per-query storage metrics follow block fetches onto spawned tasks and
+    /// into Foyer's cache loads. A cold read reports its cache misses and
+    /// object-store reads; the same read warm reports a hit for each of those
+    /// misses and no object-store reads.
+    #[cfg(feature = "foyer")]
+    #[rstest::rstest]
+    #[case::point_get(false)]
+    #[case::scan(true)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn query_metrics_count_spawned_block_fetches_and_cache_loads(#[case] scan: bool) {
+        use crate::query_metrics::{scope_query_metrics, QueryMetricsObserver};
+
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = Db::builder("/tmp/query_metrics_spawned_fetches", object_store)
+            .with_db_cache(Arc::new(crate::db_cache::foyer::FoyerCache::new()), 0)
+            // Leave flushed SSTs out of the cache so the first read is cold.
+            .with_block_cache_policy(BlockCachePolicy::default().with_flush_targets(&[]))
+            .build()
+            .await
+            .unwrap();
+        let mut batch = WriteBatch::new();
+        for i in 0..64 {
+            batch.put(format!("key{i:03}"), vec![b'v'; 512]);
+        }
+        db.write(batch).await.unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+
+        let read = |observer: QueryMetricsObserver| {
+            let db = &db;
+            scope_query_metrics(observer, async move {
+                if scan {
+                    // Scans skip block caching by default; cache them so the
+                    // second scan is warm, as the second point get is.
+                    let mut iter = db
+                        .scan_with_options(.., &ScanOptions::default().with_cache_blocks(true))
+                        .await
+                        .unwrap();
+                    let mut rows = 0;
+                    while iter.next().await.unwrap().is_some() {
+                        rows += 1;
+                    }
+                    assert_eq!(rows, 64);
+                } else {
+                    assert!(db.get(b"key032").await.unwrap().is_some());
+                }
+            })
+        };
+        let cold = QueryMetricsObserver::default();
+        read(cold.clone()).await;
+        let warm = QueryMetricsObserver::default();
+        read(warm.clone()).await;
+
+        let (cold, warm) = (cold.snapshot(), warm.snapshot());
+        // An index and at least one data block, each loaded from object storage.
+        assert!(cold.block_cache.misses >= 2, "{cold:?}");
+        assert_eq!(cold.block_cache.hits, 0, "{cold:?}");
+        assert!(cold.object_storage_reads >= 2, "{cold:?}");
+        assert_eq!(warm.block_cache.hits, cold.block_cache.misses, "{warm:?}");
+        assert_eq!(warm.block_cache.misses, 0, "{warm:?}");
+        assert_eq!(warm.object_storage_reads, 0, "{warm:?}");
+        db.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn test_multi_get_matches_repeated_get_with_duplicates() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
