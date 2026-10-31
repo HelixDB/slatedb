@@ -3055,7 +3055,7 @@ mod tests {
 
         let result = ctx.run_compaction(vec![l0], true, None).await.unwrap();
 
-        assert!(result.sst_views.is_empty());
+        assert!(result.sst_views().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3080,9 +3080,9 @@ mod tests {
 
         let result = ctx.run_compaction(vec![l0], false, None).await.unwrap();
 
-        assert_eq!(result.sst_views.len(), 1);
+        assert_eq!(result.sst_views().len(), 1);
         let mut iter = SstIterator::new(
-            SstView::Borrowed(&result.sst_views[0], BytesRange::from(..)),
+            SstView::Borrowed(&result.sst_views()[0], BytesRange::from(..)),
             table_store,
             SstIteratorOptions::default(),
         )

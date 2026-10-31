@@ -71,8 +71,7 @@ pub use ops::{DbCacheManagerOps, DbMetadataOps, DbReadOps, DbTransactionOps, DbW
 pub use paths::PathResolver;
 pub use prefix_extractor::{PrefixExtractor, PrefixTarget};
 pub use query_metrics::{
-    scope_query_metrics, QueryCacheKind, QueryCacheStatistics, QueryMetricsObserver,
-    QueryMetricsSnapshot,
+    scope_query_metrics, QueryCacheStatistics, QueryMetricsObserver, QueryMetricsSnapshot,
 };
 pub use slatedb_common::{DbRand, IdentifiedObjectMetadata, ObjectMetadata};
 #[cfg(test)]

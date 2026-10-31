@@ -13,7 +13,7 @@ tokio::task_local! {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum QueryCacheKind {
+pub(crate) enum QueryCacheKind {
     Block,
     Object,
 }
