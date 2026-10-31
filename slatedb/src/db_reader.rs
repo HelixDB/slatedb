@@ -154,6 +154,7 @@ pub(crate) struct DbReaderInner {
 #[derive(Debug)]
 enum DbReaderMessage {
     PollManifest,
+    PollWal,
 }
 
 #[derive(Clone)]
@@ -701,6 +702,12 @@ impl DbReaderInner {
             .report_manifest_and_memtable_segments(versioned_manifest, touched_segments);
     }
 
+    /// Whether a reader in `mode` replays new WAL files on
+    /// [`DbReaderOptions::wal_poll_interval`].
+    fn polls_wal(mode: DbReaderMode, options: &DbReaderOptions) -> bool {
+        !options.skip_wal_replay && !matches!(mode, DbReaderMode::Checkpoint(_))
+    }
+
     async fn maybe_replay_new_wals(&self) -> Result<(), SlateDBError> {
         if self.options.skip_wal_replay {
             return Ok(());
@@ -1110,6 +1117,63 @@ struct ManifestPoller {
 }
 
 impl ManifestPoller {
+    async fn poll_manifest(&mut self) -> Result<(), SlateDBError> {
+        match self.inner.mode {
+            DbReaderMode::ManagedCheckpoint => {
+                let mut manifest = StoredManifest::load(
+                    Arc::clone(&self.inner.manifest_store),
+                    self.inner.system_clock.clone(),
+                )
+                .await?;
+                self.delete_released_checkpoints(&mut manifest).await?;
+
+                let latest_manifest = manifest.manifest();
+                if self
+                    .inner
+                    .should_reestablish_checkpoint(&latest_manifest.core)
+                {
+                    let checkpoint = self.inner.create_checkpoint(&mut manifest).await?;
+                    self.inner.reestablish_checkpoint(checkpoint).await?;
+                    self.register_current_generation();
+                } else {
+                    self.inner.maybe_replay_new_wals().await?;
+                }
+
+                self.refresh_live_checkpoints(&mut manifest).await?;
+                self.inner.db_stats.reader_manifest_polls.increment(1);
+                Ok(())
+            }
+            DbReaderMode::FollowLatest => {
+                let result = self.inner.refresh_latest_manifest().await;
+                if let Err(error) = result {
+                    warn!("failed to refresh reader to latest manifest [error={error:?}]");
+                } else {
+                    self.inner.db_stats.reader_manifest_polls.increment(1);
+                }
+                Ok(())
+            }
+            // No polling is needed for a pinned checkpoint, so we just return Ok(()).
+            DbReaderMode::Checkpoint(_) => Ok(()),
+        }
+    }
+
+    /// Replays WAL files written since the last replay, without reloading the
+    /// manifest. A managed-checkpoint reader treats a replay failure like a
+    /// failed manifest poll; a follow-latest reader logs it and recovers on its
+    /// next manifest refresh.
+    async fn poll_wal(&mut self) -> Result<(), SlateDBError> {
+        match self.inner.mode {
+            DbReaderMode::ManagedCheckpoint => self.inner.maybe_replay_new_wals().await,
+            DbReaderMode::FollowLatest => {
+                if let Err(error) = self.inner.maybe_replay_new_wals().await {
+                    warn!("failed to replay new WAL files [error={error:?}]");
+                }
+                Ok(())
+            }
+            DbReaderMode::Checkpoint(_) => Ok(()),
+        }
+    }
+
     fn new(inner: Arc<DbReaderInner>) -> Self {
         let mut generations = HashMap::new();
         if inner.mode == DbReaderMode::ManagedCheckpoint {
@@ -1251,50 +1315,26 @@ impl Drop for ManifestPoller {
 #[async_trait]
 impl MessageHandler<DbReaderMessage> for ManifestPoller {
     fn tickers(&mut self) -> Vec<MessageTickerDef<DbReaderMessage>> {
-        vec![MessageTickerDef::new(
+        let manifest_ticker = MessageTickerDef::new(
             self.inner.options.manifest_poll_interval,
             Box::new(|| DbReaderMessage::PollManifest),
-        )]
+        );
+        if !DbReaderInner::polls_wal(self.inner.mode, &self.inner.options) {
+            return vec![manifest_ticker];
+        }
+        vec![
+            manifest_ticker,
+            MessageTickerDef::new(
+                self.inner.options.wal_poll_interval,
+                Box::new(|| DbReaderMessage::PollWal),
+            ),
+        ]
     }
 
     async fn handle(&mut self, message: DbReaderMessage) -> Result<(), SlateDBError> {
-        assert!(matches!(message, DbReaderMessage::PollManifest));
-        match self.inner.mode {
-            DbReaderMode::ManagedCheckpoint => {
-                let mut manifest = StoredManifest::load(
-                    Arc::clone(&self.inner.manifest_store),
-                    self.inner.system_clock.clone(),
-                )
-                .await?;
-                self.delete_released_checkpoints(&mut manifest).await?;
-
-                let latest_manifest = manifest.manifest();
-                if self
-                    .inner
-                    .should_reestablish_checkpoint(&latest_manifest.core)
-                {
-                    let checkpoint = self.inner.create_checkpoint(&mut manifest).await?;
-                    self.inner.reestablish_checkpoint(checkpoint).await?;
-                    self.register_current_generation();
-                } else {
-                    self.inner.maybe_replay_new_wals().await?;
-                }
-
-                self.refresh_live_checkpoints(&mut manifest).await?;
-                self.inner.db_stats.reader_manifest_polls.increment(1);
-                Ok(())
-            }
-            DbReaderMode::FollowLatest => {
-                let result = self.inner.refresh_latest_manifest().await;
-                if let Err(error) = result {
-                    warn!("failed to refresh reader to latest manifest [error={error:?}]");
-                } else {
-                    self.inner.db_stats.reader_manifest_polls.increment(1);
-                }
-                Ok(())
-            }
-            // No polling is needed for a pinned checkpoint, so we just return Ok(()).
-            DbReaderMode::Checkpoint(_) => Ok(()),
+        match message {
+            DbReaderMessage::PollManifest => self.poll_manifest().await,
+            DbReaderMessage::PollWal => self.poll_wal().await,
         }
     }
 
@@ -1340,6 +1380,11 @@ impl MessageHandler<DbReaderMessage> for ManifestPoller {
 
 impl DbReader {
     fn validate_options(mode: DbReaderMode, options: &DbReaderOptions) -> Result<(), SlateDBError> {
+        if DbReaderInner::polls_wal(mode, options) && options.wal_poll_interval.is_zero() {
+            return Err(SlateDBError::InvalidWalPollInterval(
+                options.wal_poll_interval,
+            ));
+        }
         if mode != DbReaderMode::ManagedCheckpoint {
             return Ok(());
         }
@@ -2263,6 +2308,74 @@ mod tests {
         assert!(wal_reader.last_wal_file_id_calls.load(Ordering::Relaxed) > 0);
         assert!(wal_reader.iterator_calls.load(Ordering::Relaxed) > 0);
         reader.close().await.unwrap();
+    }
+
+    /// A reader replays WAL writes on `wal_poll_interval`, while its manifest
+    /// poll is an hour away and the manifest has not changed.
+    #[rstest]
+    #[case::managed_checkpoint(DbReaderMode::ManagedCheckpoint)]
+    #[case::follow_latest(DbReaderMode::FollowLatest)]
+    #[tokio::test]
+    async fn reader_replays_new_wal_writes_on_the_wal_poll_interval(#[case] mode: DbReaderMode) {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_reader_wal_poll_interval");
+        let db = Db::open(path.clone(), Arc::clone(&object_store))
+            .await
+            .unwrap();
+        db.put(b"before", b"1").await.unwrap();
+        let reader = DbReader::builder(path, object_store)
+            .with_reader_mode(mode)
+            .with_options(DbReaderOptions {
+                manifest_poll_interval: Duration::from_secs(60 * 60),
+                checkpoint_lifetime: Duration::from_secs(3 * 60 * 60),
+                wal_poll_interval: Duration::from_millis(10),
+                ..DbReaderOptions::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            reader.get(b"before").await.unwrap(),
+            Some(Bytes::from_static(b"1"))
+        );
+
+        // `put` awaits durability: the write lands in a new WAL file and the
+        // manifest stays unchanged.
+        db.put(b"after", b"2").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while reader.get(b"after").await.unwrap().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("reader did not replay the new WAL on its WAL poll interval");
+
+        reader.close().await.unwrap();
+        db.close().await.unwrap();
+    }
+
+    #[rstest]
+    #[case::managed_checkpoint(DbReaderMode::ManagedCheckpoint, false, true)]
+    #[case::follow_latest(DbReaderMode::FollowLatest, false, true)]
+    #[case::skip_wal_replay(DbReaderMode::FollowLatest, true, false)]
+    #[case::pinned_checkpoint(DbReaderMode::Checkpoint(Uuid::nil()), false, false)]
+    fn zero_wal_poll_interval_is_rejected_only_when_the_reader_polls_the_wal(
+        #[case] mode: DbReaderMode,
+        #[case] skip_wal_replay: bool,
+        #[case] rejected: bool,
+    ) {
+        let options = DbReaderOptions {
+            wal_poll_interval: Duration::ZERO,
+            skip_wal_replay,
+            ..DbReaderOptions::default()
+        };
+        assert_eq!(
+            matches!(
+                DbReader::validate_options(mode, &options),
+                Err(SlateDBError::InvalidWalPollInterval(_))
+            ),
+            rejected
+        );
     }
 
     #[tokio::test]

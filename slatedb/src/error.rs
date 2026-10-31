@@ -264,7 +264,6 @@ pub(crate) enum SlateDBError {
     InvalidManifestPollInterval(Duration),
 
     #[error("invalid WAL poll interval. interval=`{0:?}`")]
-    #[allow(dead_code)]
     InvalidWalPollInterval(Duration),
 
     #[error("checkpoint lifetime must be at least double the manifest poll interval. lifetime=`{lifetime:?}`, interval=`{interval:?}`")]

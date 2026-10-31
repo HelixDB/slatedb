@@ -1195,9 +1195,11 @@ pub struct DbReaderOptions {
     /// [`crate::DbReaderMode::Checkpoint`] do not poll either source.
     pub manifest_poll_interval: Duration,
 
-    /// How frequently an open reader probes the exact next WAL ID after
-    /// consuming the manifest-known range. Must be nonzero. Runtime WAL
-    /// polling performs bounded range reads and never discovers WALs via LIST.
+    /// How frequently an open reader looks for WAL files written since its last
+    /// replay, independently of [`Self::manifest_poll_interval`]. Each poll
+    /// probes WAL object existence without reading the manifest or listing.
+    /// Must be nonzero. Readers using [`crate::DbReaderMode::Checkpoint`] or
+    /// [`Self::skip_wal_replay`] do not poll the WAL.
     #[serde(default = "default_reader_wal_poll_interval")]
     pub wal_poll_interval: Duration,
 
