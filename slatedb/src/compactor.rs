@@ -3211,11 +3211,12 @@ mod tests {
         .unwrap()
         .expect("Expected Some(iter) but got None");
 
-        // only the non-expired value "b" should be present; the terminal
-        // compaction can resolve it because no older run can contain a base.
+        // only the non-expired operand "b" should be present. It stays a merge:
+        // the older operand had another expiry, so the merge step could not
+        // prove "b" had no base before retention dropped the expired operand.
         assert_iterator(
             &mut iter,
-            vec![RowEntry::new_value(b"key1", &[b'b'; 32], 2).with_create_ts(20)],
+            vec![RowEntry::new_merge(b"key1", &[b'b'; 32], 2).with_create_ts(20)],
         )
         .await;
     }
@@ -3424,8 +3425,8 @@ mod tests {
         );
 
         // The terminal sorted run must not combine operations whose expiration
-        // timestamps differ. With no active snapshot, retention keeps only the
-        // newest canonical value.
+        // timestamps differ, and must not resolve the newer one: it still
+        // merges onto the older operand until that operand expires.
         let compacted = db_state.tree.compacted.first().unwrap().sst_views();
         assert_eq!(compacted.len(), 1);
         let handle = compacted.first().unwrap();
@@ -3440,20 +3441,30 @@ mod tests {
         .unwrap()
         .expect("Expected Some(iter) but got None");
 
-        // The retained value must be only the newer operand, not "ab".
         let mut key1_entries = vec![];
         while let Some(entry) = iter.next().await.unwrap() {
             if entry.key.as_ref() == b"key1" {
                 key1_entries.push(entry);
             }
         }
-        assert_eq!(key1_entries.len(), 1);
+        assert_eq!(key1_entries.len(), 2, "{key1_entries:?}");
         assert!(
-            matches!(&key1_entries[0].value, crate::types::ValueDeletable::Value(value) if value.as_ref() == b"b"),
-            "expected only the newer value 'b', got {:?}",
+            matches!(&key1_entries[0].value, crate::types::ValueDeletable::Merge(value) if value.as_ref() == b"b"),
+            "expected the newer operand 'b' to stay a merge, got {:?}",
             key1_entries[0].value,
         );
         assert_eq!(key1_entries[0].expire_ts, Some(200));
+        assert!(
+            matches!(&key1_entries[1].value, crate::types::ValueDeletable::Value(value) if value.as_ref() == b"a"),
+            "expected the older operand 'a' resolved, got {:?}",
+            key1_entries[1].value,
+        );
+        assert_eq!(key1_entries[1].expire_ts, Some(100));
+        // A read before either operand expires sees both.
+        assert_eq!(
+            db.get(b"key1").await.unwrap(),
+            Some(Bytes::from_static(b"ab"))
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
