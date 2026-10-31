@@ -263,7 +263,6 @@ pub struct WriteBatch {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum MergeConflictKind {
-    Commutative,
     Disjoint(DisjointMergeDiscriminators),
 }
 
@@ -473,24 +472,6 @@ impl WriteBatch {
         self.merge_with_conflict_kind(key, value, options, None);
     }
 
-    /// Merge a key-value pair whose operands are commutative.
-    ///
-    /// This remains crate-private because compatibility affects transaction
-    /// conflict detection, while public non-transactional batches do not run
-    /// write/write conflict checks.
-    pub(crate) fn merge_commutative<K, V>(&mut self, key: K, value: V)
-    where
-        K: AsRef<[u8]>,
-        V: AsRef<[u8]>,
-    {
-        self.merge_with_conflict_kind(
-            key,
-            value,
-            &MergeOptions::default(),
-            Some(MergeConflictKind::Commutative),
-        );
-    }
-
     pub(crate) fn merge_disjoint<K, V, D, I>(&mut self, key: K, value: V, discriminators: I)
     where
         K: AsRef<[u8]>,
@@ -557,9 +538,6 @@ impl WriteBatch {
             .and_then(|keys| keys.keys.remove(&key));
         let combined_kind = match (is_first_operation, existing_kind, conflict_kind) {
             (true, _, conflict_kind) => conflict_kind,
-            (false, Some(MergeConflictKind::Commutative), Some(MergeConflictKind::Commutative)) => {
-                Some(MergeConflictKind::Commutative)
-            }
             (
                 false,
                 Some(MergeConflictKind::Disjoint(mut existing)),
@@ -634,14 +612,6 @@ impl WriteBatch {
         self.compatible_merge_keys
             .as_ref()
             .and_then(|keys| keys.keys.get(key))
-    }
-
-    #[cfg(test)]
-    fn is_commutative_merge_key(&self, key: &[u8]) -> bool {
-        matches!(
-            self.merge_conflict_kind(key),
-            Some(MergeConflictKind::Commutative)
-        )
     }
 
     fn remove_compatible_merge_key(&mut self, key: &[u8]) {
@@ -1238,59 +1208,16 @@ mod tests {
     }
 
     #[test]
-    fn commutative_merge_classification_requires_only_commutative_operations() {
-        let mut only_commutative = WriteBatch::new();
-        only_commutative.merge_commutative(b"key", b"first");
-        only_commutative.merge_commutative(b"key", b"second");
-        assert!(only_commutative.is_commutative_merge_key(b"key"));
-        assert!(only_commutative.compatible_merge_keys.is_some());
-
-        let mut commutative_then_ordinary = WriteBatch::new();
-        commutative_then_ordinary.merge_commutative(b"key", b"first");
-        commutative_then_ordinary.merge(b"key", b"second");
-        assert!(!commutative_then_ordinary.is_commutative_merge_key(b"key"));
-        assert!(commutative_then_ordinary.compatible_merge_keys.is_none());
-
-        let mut ordinary_then_commutative = WriteBatch::new();
-        ordinary_then_commutative.merge(b"key", b"first");
-        ordinary_then_commutative.merge_commutative(b"key", b"second");
-        assert!(!ordinary_then_commutative.is_commutative_merge_key(b"key"));
-    }
-
-    #[test]
-    fn put_and_delete_make_commutative_merge_keys_exclusive() {
-        let mut put_after_merge = WriteBatch::new();
-        put_after_merge.merge_commutative(b"key", b"merge");
-        put_after_merge.put(b"key", b"put");
-        assert!(!put_after_merge.is_commutative_merge_key(b"key"));
-
-        let mut merge_after_put = WriteBatch::new();
-        merge_after_put.put(b"key", b"put");
-        merge_after_put.merge_commutative(b"key", b"merge");
-        assert!(!merge_after_put.is_commutative_merge_key(b"key"));
-
-        let mut delete_after_merge = WriteBatch::new();
-        delete_after_merge.merge_commutative(b"key", b"merge");
-        delete_after_merge.delete(b"key");
-        assert!(!delete_after_merge.is_commutative_merge_key(b"key"));
-
-        let mut merge_after_delete = WriteBatch::new();
-        merge_after_delete.delete(b"key");
-        merge_after_delete.merge_commutative(b"key", b"merge");
-        assert!(!merge_after_delete.is_commutative_merge_key(b"key"));
-    }
-
-    #[test]
-    fn commutative_merge_metadata_does_not_change_write_operations() {
+    fn disjoint_merge_metadata_does_not_change_write_operations() {
         let mut ordinary = WriteBatch::new();
         ordinary.merge(b"key", b"operand");
 
-        let mut commutative = WriteBatch::new();
-        commutative.merge_commutative(b"key", b"operand");
+        let mut disjoint = WriteBatch::new();
+        disjoint.merge_disjoint(b"key", b"operand", [Bytes::from_static(b"member")]);
 
-        assert_eq!(ordinary.ops, commutative.ops);
-        assert!(!ordinary.is_commutative_merge_key(b"key"));
-        assert!(commutative.is_commutative_merge_key(b"key"));
+        assert_eq!(ordinary.ops, disjoint.ops);
+        assert_eq!(ordinary.merge_conflict_kind(b"key"), None);
+        assert!(disjoint.merge_conflict_kind(b"key").is_some());
     }
 
     #[test]
@@ -1375,16 +1302,6 @@ mod tests {
         ordinary_then_disjoint.merge(b"key", b"first");
         ordinary_then_disjoint.merge_disjoint(b"key", b"second", discriminator());
         assert_eq!(ordinary_then_disjoint.merge_conflict_kind(b"key"), None);
-
-        let mut disjoint_then_commutative = WriteBatch::new();
-        disjoint_then_commutative.merge_disjoint(b"key", b"first", discriminator());
-        disjoint_then_commutative.merge_commutative(b"key", b"second");
-        assert_eq!(disjoint_then_commutative.merge_conflict_kind(b"key"), None);
-
-        let mut commutative_then_disjoint = WriteBatch::new();
-        commutative_then_disjoint.merge_commutative(b"key", b"first");
-        commutative_then_disjoint.merge_disjoint(b"key", b"second", discriminator());
-        assert_eq!(commutative_then_disjoint.merge_conflict_kind(b"key"), None);
     }
 
     #[test]
