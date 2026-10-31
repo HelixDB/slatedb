@@ -1209,8 +1209,9 @@ mod tests {
 
     #[test]
     fn disjoint_merge_metadata_does_not_change_write_operations() {
+        // Disjoint merges never expire, so compare against a non-expiring merge.
         let mut ordinary = WriteBatch::new();
-        ordinary.merge(b"key", b"operand");
+        ordinary.merge_with_options(b"key", b"operand", &MergeOptions { ttl: Ttl::NoExpiry });
 
         let mut disjoint = WriteBatch::new();
         disjoint.merge_disjoint(b"key", b"operand", [Bytes::from_static(b"member")]);
