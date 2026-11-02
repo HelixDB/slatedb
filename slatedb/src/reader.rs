@@ -232,7 +232,7 @@ impl Reader {
     ///
     /// Returns the minimum sequence number that satisfies all constraints, or None (read without filtering max seq)
     /// if no constraints apply.
-    fn prepare_max_seq(
+    pub(crate) fn prepare_max_seq(
         &self,
         max_seq_by_user: Option<u64>,
         durability_filter: DurabilityLevel,
@@ -370,6 +370,28 @@ impl Reader {
         read.instrument(read_trace.read_span()).await
     }
 
+    /// A point get inside another read request, such as a multi-get key that
+    /// needs merge resolution: bounded by the request's already-prepared
+    /// `max_seq` and not counted as a request of its own.
+    pub(crate) async fn get_key_value_in_request<K: AsRef<[u8]>>(
+        &self,
+        key: K,
+        options: &ReadOptions,
+        db_state: &(dyn DbStateReader + Sync + Send),
+        write_batch_iter: Option<WriteBatchIterator>,
+        max_seq: Option<u64>,
+    ) -> Result<Option<KeyValue>, SlateDBError> {
+        self.get_key_value_with_options_inner(
+            key,
+            options,
+            db_state,
+            write_batch_iter,
+            max_seq,
+            Self::read_trace(options.tracing_options.as_ref()),
+        )
+        .await
+    }
+
     async fn get_key_value_with_options_inner<K: AsRef<[u8]>>(
         &self,
         key: K,
@@ -473,22 +495,9 @@ impl Reader {
         Ok(result)
     }
 
-    pub(crate) async fn multi_get_unique_key_value_with_options(
-        &self,
-        keys: &[Bytes],
-        options: &ReadOptions,
-        db_state: &(dyn DbStateReader + Sync + Send),
-        max_seq: Option<u64>,
-    ) -> Result<Vec<Option<KeyValue>>, SlateDBError> {
-        self.db_stats.get_requests.increment(1);
-        if keys.is_empty() {
-            return Ok(Vec::new());
-        }
-        self.resolve_unique_key_values(keys, options, db_state, max_seq)
-            .await
-    }
-
-    async fn resolve_unique_key_values(
+    /// Resolves already-deduplicated keys without counting a get request;
+    /// the caller counts its own request once.
+    pub(crate) async fn resolve_unique_key_values(
         &self,
         unique_keys: &[Bytes],
         options: &ReadOptions,
@@ -569,14 +578,16 @@ impl Reader {
             .filter_map(|(idx, should_fallback)| should_fallback.then_some(idx))
         {
             // Resolve the key as a point get inside this multi-get's request:
-            // same read span, and no second `get_requests` count.
+            // same read span, no second `get_requests` count, and the same
+            // visibility bound as every other key, so a batch that commits
+            // mid-call cannot show for this key but not for the others.
             values[key_idx] = self
                 .get_key_value_with_options_inner(
                     unique_keys[key_idx].as_ref(),
                     options,
                     db_state,
                     None,
-                    max_seq,
+                    prepared_max_seq,
                     read_trace.clone(),
                 )
                 .await?;
@@ -1742,6 +1753,86 @@ mod tests {
         assert_eq!(
             lookup_metric_with_labels(&recorder, crate::db_stats::REQUEST_COUNT, &[("op", "get")]),
             Some(1)
+        );
+        Ok(())
+    }
+
+    /// A key that falls back to a point get reads at the bound its multi-get
+    /// fixed up front, so a batch that commits mid-call shows for every key or
+    /// for none.
+    #[tokio::test]
+    async fn multi_get_fallback_reads_at_the_request_bound() -> Result<(), SlateDBError> {
+        /// Commits seq 2 once the reader reaches the manifest layers, after the
+        /// memtable pass has resolved `plain` and deferred `merged`.
+        struct CommitsOnCore<'a> {
+            state: &'a TestDbState,
+            oracle: &'a DbReaderOracle,
+        }
+
+        impl DbStateReader for CommitsOnCore<'_> {
+            fn memtable(&self) -> Arc<KVTable> {
+                self.state.memtable()
+            }
+
+            fn imm_memtables(
+                &self,
+            ) -> Box<dyn Iterator<Item = Arc<ImmutableMemtable>> + Send + '_> {
+                self.state.imm_memtables()
+            }
+
+            fn core(&self) -> &ManifestCore {
+                self.oracle.advance_durable_seq(2);
+                self.state.core()
+            }
+        }
+
+        // given: seq 1 committed, and an uncommitted batch at seq 2 writing both keys
+        let mut state = TestDbState::new().await;
+        populate_db_state(
+            &mut state,
+            vec![
+                TestEntry::value(b"plain", b"old", 1),
+                TestEntry::merge(b"merged", b"old", 1),
+                TestEntry::value(b"plain", b"new", 2),
+                TestEntry::merge(b"merged", b"new", 2),
+            ],
+        )
+        .await?;
+        let oracle = Arc::new(DbReaderOracle::new(1, DbStatusManager::new(0)));
+        let reader = Reader::new(
+            state.table_store.clone(),
+            DbStats::new(&MetricsRecorderHelper::noop()),
+            Arc::new(MonotonicClock::new(
+                Arc::new(MockSystemClock::new()) as Arc<dyn SystemClock>,
+                0,
+            )),
+            oracle.clone(),
+            Some(Arc::new(StringConcatMergeOperator) as Arc<dyn MergeOperator + Send + Sync>),
+        );
+
+        // when: the batch commits while the multi-get is running
+        let values = reader
+            .multi_get_key_value_with_options(
+                &[Bytes::from_static(b"plain"), Bytes::from_static(b"merged")],
+                &ReadOptions::default(),
+                &CommitsOnCore {
+                    state: &state,
+                    oracle: &oracle,
+                },
+                None,
+            )
+            .await?
+            .into_iter()
+            .map(|kv| kv.map(|kv| kv.value))
+            .collect::<Vec<_>>();
+
+        // then: both keys read seq 1, not the batch
+        assert_eq!(
+            values,
+            vec![
+                Some(Bytes::from_static(b"old")),
+                Some(Bytes::from_static(b"old"))
+            ]
         );
         Ok(())
     }

@@ -44,6 +44,20 @@ impl DisjointMergeBatchEntry {
     }
 }
 
+/// How a transaction point read relates to the request that issued it.
+#[derive(Clone, Copy)]
+enum PointRead {
+    /// A get of its own: tracked for SSI, counted as a request, and bounded
+    /// by the transaction's snapshot.
+    Get,
+    /// A read the transaction makes for itself: bounded by the snapshot but
+    /// not tracked as a read.
+    Untracked,
+    /// A multi-get key that needs merge resolution: tracked and counted by its
+    /// multi-get, and bounded by the multi-get's prepared sequence number.
+    MultiGetKey(Option<u64>),
+}
+
 /// A database transaction that provides atomic read-write operations with
 /// configurable isolation levels. This is the main interface for transactional
 /// operations in SlateDB.
@@ -171,7 +185,7 @@ impl DbTransaction {
         key: K,
         options: &ReadOptions,
     ) -> Result<Option<KeyValue>, crate::Error> {
-        self.get_key_value_with_options_inner(key, options, true)
+        self.get_key_value_with_options_inner(key, options, PointRead::Get)
             .await
     }
 
@@ -179,12 +193,14 @@ impl DbTransaction {
         &self,
         key: K,
         options: &ReadOptions,
-        track_read: bool,
+        read: PointRead,
     ) -> Result<Option<KeyValue>, crate::Error> {
         self.db_inner.check_closed()?;
 
         // Track read key for SSI conflict detection if needed
-        if track_read && self.isolation_level == IsolationLevel::SerializableSnapshot {
+        if matches!(read, PointRead::Get)
+            && self.isolation_level == IsolationLevel::SerializableSnapshot
+        {
             let key_bytes = Bytes::copy_from_slice(key.as_ref());
             let mut read_keys = HashSet::new();
             read_keys.insert(key_bytes);
@@ -211,18 +227,26 @@ impl DbTransaction {
             ))
         };
 
-        let kv = self
-            .db_inner
-            .reader
-            .get_key_value_with_options(
-                key,
-                options,
-                &db_state,
-                write_batch_iter,
-                Some(self.started_seq),
-            )
-            .await
-            .map_err(crate::Error::from)?;
+        let reader = &self.db_inner.reader;
+        let kv = match read {
+            PointRead::Get | PointRead::Untracked => {
+                reader
+                    .get_key_value_with_options(
+                        key,
+                        options,
+                        &db_state,
+                        write_batch_iter,
+                        Some(self.started_seq),
+                    )
+                    .await
+            }
+            PointRead::MultiGetKey(max_seq) => {
+                reader
+                    .get_key_value_in_request(key, options, &db_state, write_batch_iter, max_seq)
+                    .await
+            }
+        }
+        .map_err(crate::Error::from)?;
         Ok(kv)
     }
 
@@ -263,7 +287,18 @@ impl DbTransaction {
             self.txn_manager.track_read_keys(&self.txn_id, read_keys);
         }
 
+        // One get request however the keys resolve: from the write batch, the
+        // reader or a point-get fallback.
+        self.db_inner.reader.db_stats.get_requests.increment(1);
         let db_state = self.db_inner.state.read().view();
+        // One visibility bound for every key, including keys that fall back
+        // to a point get, so a batch that commits mid-call cannot show for
+        // some keys and not others.
+        let max_seq = self.db_inner.reader.prepare_max_seq(
+            Some(self.started_seq),
+            options.durability_filter,
+            options.dirty,
+        );
 
         let mut key_to_idx = HashMap::<Bytes, usize>::with_capacity(keys.len());
         let mut unique_keys = Vec::<Bytes>::with_capacity(keys.len());
@@ -324,12 +359,7 @@ impl DbTransaction {
             let reader_values = self
                 .db_inner
                 .reader
-                .multi_get_key_value_with_options(
-                    &reader_keys,
-                    options,
-                    &db_state,
-                    Some(self.started_seq),
-                )
+                .resolve_unique_key_values(&reader_keys, options, &db_state, max_seq)
                 .await
                 .map_err(crate::Error::from)?;
             for (key_idx, value) in reader_key_indices.into_iter().zip(reader_values) {
@@ -344,7 +374,11 @@ impl DbTransaction {
             .filter_map(|(idx, should_fallback)| should_fallback.then_some(idx))
         {
             values[key_idx] = self
-                .get_key_value_with_options(unique_keys[key_idx].as_ref(), options)
+                .get_key_value_with_options_inner(
+                    unique_keys[key_idx].as_ref(),
+                    options,
+                    PointRead::MultiGetKey(max_seq),
+                )
                 .await?;
             resolved[key_idx] = true;
         }
@@ -371,7 +405,18 @@ impl DbTransaction {
         options: &ReadOptions,
     ) -> Result<Vec<Option<KeyValue>>, crate::Error> {
         self.db_inner.check_closed()?;
+        // One get request however the keys resolve: from the write batch, the
+        // reader or a point-get fallback.
+        self.db_inner.reader.db_stats.get_requests.increment(1);
         let db_state = self.db_inner.state.read().view();
+        // One visibility bound for every key, including keys that fall back
+        // to a point get, so a batch that commits mid-call cannot show for
+        // some keys and not others.
+        let max_seq = self.db_inner.reader.prepare_max_seq(
+            Some(self.started_seq),
+            options.durability_filter,
+            options.dirty,
+        );
         let mut resolved: SmallVec<[bool; 8]> = smallvec![false; keys.len()];
         let mut values: SmallVec<[Option<KeyValue>; 8]> = smallvec![None; keys.len()];
         let mut fallback_to_point_get: SmallVec<[bool; 8]> = smallvec![false; keys.len()];
@@ -410,12 +455,7 @@ impl DbTransaction {
             let reader_values = self
                 .db_inner
                 .reader
-                .multi_get_unique_key_value_with_options(
-                    &reader_keys,
-                    options,
-                    &db_state,
-                    Some(self.started_seq),
-                )
+                .resolve_unique_key_values(&reader_keys, options, &db_state, max_seq)
                 .await
                 .map_err(crate::Error::from)?;
             for (key_idx, value) in reader_key_indices.into_iter().zip(reader_values) {
@@ -429,7 +469,11 @@ impl DbTransaction {
             .filter_map(|(idx, should_fallback)| should_fallback.then_some(idx))
         {
             values[key_idx] = self
-                .get_key_value_with_options_inner(keys[key_idx].as_ref(), options, false)
+                .get_key_value_with_options_inner(
+                    keys[key_idx].as_ref(),
+                    options,
+                    PointRead::MultiGetKey(max_seq),
+                )
                 .await?;
         }
         Ok(values.into_vec())
@@ -937,7 +981,7 @@ impl DbTransaction {
             .as_ref()
             .ok_or(SlateDBError::MergeOperatorMissing)?;
         let existing_value = self
-            .get_key_value_with_options_inner(&key, &ReadOptions::default(), false)
+            .get_key_value_with_options_inner(&key, &ReadOptions::default(), PointRead::Untracked)
             .await?
             .map(|value| value.value);
         merge_operator
@@ -1588,6 +1632,43 @@ mod tests {
         txn.commit().await.unwrap();
         let value = db.get(b"counter").await.unwrap().unwrap();
         assert_eq!(u64::from_le_bytes(value.as_ref().try_into().unwrap()), 12);
+    }
+
+    /// A transaction multi-get is one get request whether its keys resolve
+    /// from the write batch, the reader or a point-get fallback.
+    #[rstest]
+    #[case::reader_and_fallback(&[b"counter".as_slice(), b"plain".as_slice()])]
+    #[case::fallback_only(&[b"counter".as_slice()])]
+    #[case::write_batch_only(&[b"pending".as_slice()])]
+    #[tokio::test]
+    async fn test_txn_multi_get_counts_one_get_request(#[case] keys: &[&[u8]]) {
+        use slatedb_common::metrics::{lookup_metric_with_labels, DefaultMetricsRecorder};
+
+        // given: a transaction with a pending merge and a pending put
+        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let metrics = Arc::new(DefaultMetricsRecorder::new());
+        let db = crate::Db::builder("test_txn_multi_get_counts_one_get_request", object_store)
+            .with_metrics_recorder(metrics.clone())
+            .with_merge_operator(Arc::new(CounterMergeOperator))
+            .build()
+            .await
+            .unwrap();
+        db.put(b"plain", b"value").await.unwrap();
+        let txn = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        txn.merge_disjoint(b"counter", [b"member"], 2_u64.to_le_bytes())
+            .unwrap();
+        txn.put(b"pending", b"value").unwrap();
+        let requests = || {
+            lookup_metric_with_labels(&metrics, crate::db_stats::REQUEST_COUNT, &[("op", "get")])
+                .unwrap_or(0)
+        };
+        let before = requests();
+
+        // when
+        txn.multi_get(keys).await.unwrap();
+
+        // then
+        assert_eq!(requests() - before, 1);
     }
 
     #[tokio::test]
