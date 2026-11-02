@@ -508,9 +508,20 @@ impl WalTableStore {
         const ROUND_SIZE: u32 = 8;
         const MAX_EXP: u32 = 48;
 
-        let mut lo_offset = None;
+        // Readers poll this every WAL poll interval, and most polls find no new
+        // WAL. Probing the next ID alone keeps an idle poll at one HEAD; only an
+        // existing next WAL starts the parallel rounds.
+        if !wal_object_exists(
+            &self.object_store,
+            &self.path(WalFileId::from(start_after.value() + 1)),
+        )
+        .await?
+        {
+            return Ok(start_after);
+        }
+        let mut lo_offset = Some(1);
         let mut hi_offset = None;
-        let mut next_exp = 0;
+        let mut next_exp = 1;
 
         while hi_offset.is_none() {
             if next_exp >= MAX_EXP {
@@ -867,6 +878,32 @@ mod tests {
                 .value(),
             start_after + n_above
         );
+    }
+
+    #[tokio::test]
+    async fn last_seen_wal_id_probes_once_when_no_wal_follows() {
+        let recording = Arc::new(RecordingObjectStore::new(Arc::new(InMemory::new())));
+        let object_store: Arc<dyn ObjectStore> = recording.clone();
+        let store = WalTableStore::new(
+            object_store.clone(),
+            SsTableFormat::default(),
+            Path::from("idle-probe-wal-store"),
+            TableStoreKind::Reader,
+        );
+        for wal_id in 1..=3u64 {
+            object_store
+                .put(&store.path(wal_id.into()), Bytes::new().into())
+                .await
+                .unwrap();
+        }
+
+        recording.clear();
+        assert_eq!(store.last_seen_wal_id(3.into()).await.unwrap().value(), 3);
+        assert_eq!(recording.get_kinds(true).len(), 1);
+
+        recording.clear();
+        assert_eq!(store.last_seen_wal_id(1.into()).await.unwrap().value(), 3);
+        assert!(recording.get_kinds(true).len() > 1);
     }
 
     #[tokio::test]
