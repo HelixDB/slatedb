@@ -130,7 +130,7 @@ impl SsTableInfoCodec for FlatBufferSsTableInfoCodec {
 
     fn decode(&self, bytes: &Bytes) -> Result<SsTableInfo, SlateDBError> {
         let info = flatbuffers::root_with_opts::<FbSsTableInfo>(&verifier_options(), bytes)?;
-        Self::sst_info_checked(&info)
+        Self::sst_info(&info)
     }
 
     fn clone_box(&self) -> Box<dyn SsTableInfoCodec> {
@@ -139,11 +139,9 @@ impl SsTableInfoCodec for FlatBufferSsTableInfoCodec {
 }
 
 impl FlatBufferSsTableInfoCodec {
-    pub(crate) fn sst_info(info: &FbSsTableInfo) -> SsTableInfo {
-        Self::sst_info_checked(info).expect("validated manifest contains invalid SST info enum")
-    }
-
-    fn sst_info_checked(info: &FbSsTableInfo) -> Result<SsTableInfo, SlateDBError> {
+    /// Decodes SST info, rejecting enum values this build cannot read, such as
+    /// a compression codec whose feature is disabled, as a corrupt SST.
+    pub(crate) fn sst_info(info: &FbSsTableInfo) -> Result<SsTableInfo, SlateDBError> {
         let first_entry: Option<Bytes> = info
             .first_entry()
             .map(|entry| Bytes::copy_from_slice(entry.bytes()));
@@ -276,7 +274,7 @@ impl FlatBufferManifestCodec {
             let format_version = man_sst
                 .format_version()
                 .unwrap_or(ORIGINAL_SST_FORMAT_VERSION);
-            let sst_info = FlatBufferSsTableInfoCodec::sst_info(&man_sst.info());
+            let sst_info = FlatBufferSsTableInfoCodec::sst_info(&man_sst.info())?;
             let handle = SsTableHandle::new(SsTableId::from(sst_ulid), format_version, sst_info);
             let l0_sst = SsTableView::new_projected(
                 sst_ulid,
@@ -293,7 +291,7 @@ impl FlatBufferManifestCodec {
                 let format_version = manifest_sst
                     .format_version()
                     .unwrap_or(ORIGINAL_SST_FORMAT_VERSION);
-                let info = FlatBufferSsTableInfoCodec::sst_info(&manifest_sst.info());
+                let info = FlatBufferSsTableInfoCodec::sst_info(&manifest_sst.info())?;
                 let handle = SsTableHandle::new(SsTableId::from(sst_ulid), format_version, info);
                 ssts.push(SsTableView::new_projected(
                     sst_ulid,
@@ -398,15 +396,15 @@ impl FlatBufferManifestCodec {
     pub(crate) fn manifest_v2(
         manifest: &ManifestV2,
     ) -> Result<Manifest, Box<dyn std::error::Error + Send + Sync>> {
-        let sst_lookup: std::collections::HashMap<Ulid, SsTableHandle> = manifest
+        let sst_lookup = manifest
             .ssts()
             .iter()
             .map(|fb_sst| {
                 let ulid = fb_sst.id().ulid();
-                let handle = FlatBufferCompactionsCodec::compacted_sst_v2(fb_sst);
-                (ulid, handle)
+                let handle = FlatBufferCompactionsCodec::compacted_sst_v2(fb_sst)?;
+                Ok((ulid, handle))
             })
-            .collect();
+            .collect::<Result<std::collections::HashMap<Ulid, SsTableHandle>, SlateDBError>>()?;
         let tree = Self::decode_lsm_tree_v2(
             manifest.last_compacted_l0_sst_view_id(),
             manifest.l0(),
@@ -630,7 +628,12 @@ impl FlatBufferCompactionsCodec {
         let worker = compaction.worker().and_then(Self::worker_spec);
         let mut output_ssts = compaction
             .output_ssts()
-            .map(|ssts| ssts.iter().map(Self::compacted_sst).collect())
+            .map(|ssts| {
+                ssts.iter()
+                    .map(Self::compacted_sst)
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?
             .unwrap_or_default();
         // The `ctx` union is schema-extensible, but the only variant we ever
         // write (and the only one the in-memory model (compactor_state.rs) supports) is
@@ -641,7 +644,8 @@ impl FlatBufferCompactionsCodec {
             FbCompactionContext::NONE => None,
             FbCompactionContext::TieredCompactionContext => compaction
                 .ctx_as_tiered_compaction_context()
-                .map(Self::compaction_context),
+                .map(Self::compaction_context)
+                .transpose()?,
             _ => {
                 warn!(
                     "unknown compaction context type: {:?}",
@@ -667,21 +671,38 @@ impl FlatBufferCompactionsCodec {
             .with_ctx(ctx))
     }
 
-    fn compaction_context(ctx: FbTieredCompactionContext) -> CompactorCompactionContext {
+    fn compaction_context(
+        ctx: FbTieredCompactionContext,
+    ) -> Result<CompactorCompactionContext, SlateDBError> {
         let subcompactions = ctx
             .subcompactions()
-            .map(|subs| subs.iter().map(Self::subcompaction).collect())
+            .map(|subs| {
+                subs.iter()
+                    .map(Self::subcompaction)
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?
             .unwrap_or_default();
-        CompactorCompactionContext::new(subcompactions, Some(ctx.retention_min_seq()))
+        Ok(CompactorCompactionContext::new(
+            subcompactions,
+            Some(ctx.retention_min_seq()),
+        ))
     }
 
-    fn subcompaction(subcompaction: FbSubcompaction) -> CompactorSubcompaction {
+    fn subcompaction(
+        subcompaction: FbSubcompaction,
+    ) -> Result<CompactorSubcompaction, SlateDBError> {
         let range = FlatBufferManifestCodec::decode_bytes_range(subcompaction.range());
         let output_ssts = subcompaction
             .output_ssts()
-            .map(|ssts| ssts.iter().map(Self::compacted_sst).collect())
+            .map(|ssts| {
+                ssts.iter()
+                    .map(Self::compacted_sst)
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?
             .unwrap_or_default();
-        CompactorSubcompaction::new(range).with_output_ssts(output_ssts)
+        Ok(CompactorSubcompaction::new(range).with_output_ssts(output_ssts))
     }
 
     fn worker_spec(
@@ -754,22 +775,22 @@ impl FlatBufferCompactionsCodec {
         }
     }
 
-    fn compacted_sst(compacted_sst: CompactedSsTable) -> SsTableHandle {
+    fn compacted_sst(compacted_sst: CompactedSsTable) -> Result<SsTableHandle, SlateDBError> {
         let id = SsTableId::from(compacted_sst.id().ulid());
         let format_version = compacted_sst
             .format_version()
             .unwrap_or(ORIGINAL_SST_FORMAT_VERSION);
-        let info = FlatBufferSsTableInfoCodec::sst_info(&compacted_sst.info());
-        SsTableHandle::new(id, format_version, info)
+        let info = FlatBufferSsTableInfoCodec::sst_info(&compacted_sst.info())?;
+        Ok(SsTableHandle::new(id, format_version, info))
     }
 
-    fn compacted_sst_v2(compacted_sst: CompactedSsTableV2) -> SsTableHandle {
+    fn compacted_sst_v2(compacted_sst: CompactedSsTableV2) -> Result<SsTableHandle, SlateDBError> {
         let id = SsTableId::from(compacted_sst.id().ulid());
         let format_version = compacted_sst
             .format_version()
             .unwrap_or(ORIGINAL_SST_FORMAT_VERSION);
-        let info = FlatBufferSsTableInfoCodec::sst_info(&compacted_sst.info());
-        SsTableHandle::new(id, format_version, info)
+        let info = FlatBufferSsTableInfoCodec::sst_info(&compacted_sst.info())?;
+        Ok(SsTableHandle::new(id, format_version, info))
     }
 
     pub(crate) fn create_from_compactions(compactions: &CompactorCompactions) -> Bytes {
@@ -1759,6 +1780,72 @@ mod tests {
         let clamped = index.clamp_allocated_size();
 
         assert_index_clamped(&clamped, &index);
+    }
+
+    /// A manifest naming a compression codec this build cannot read, such as
+    /// one whose feature is disabled, fails to decode instead of panicking.
+    #[rstest]
+    #[case::v1(1)]
+    #[case::v2(2)]
+    fn test_manifest_with_unknown_compression_codec_fails_to_decode(#[case] version: u16) {
+        use super::root_generated::{ManifestV1, ManifestV2, SsTableInfo as FbSsTableInfo};
+
+        // given: a manifest with one L0 SST, encoded with every default field written
+        let mut manifest = Manifest::initial(ManifestCore::new());
+        Arc::make_mut(&mut manifest.core.tree).l0 =
+            VecDeque::from([SsTableView::identity(SsTableHandle::new(
+                SsTableId::from(ulid::Ulid::new()),
+                SST_FORMAT_VERSION_LATEST,
+                SsTableInfo::default(),
+            ))]);
+        let mut builder = flatbuffers::FlatBufferBuilder::new();
+        builder.force_defaults(true);
+        let mut db_fb_builder = super::DbFlatBufferBuilder::new(builder);
+        let mut bytes = match version {
+            1 => db_fb_builder.create_manifest_v1(&manifest),
+            _ => db_fb_builder.create_manifest(&manifest),
+        }
+        .to_vec();
+
+        // when: the SST's compression codec byte names a codec no build knows
+        let codec_offset = {
+            let info = match version {
+                1 => {
+                    flatbuffers::root::<ManifestV1>(&bytes[2..])
+                        .unwrap()
+                        .l0()
+                        .get(0)
+                        .info()
+                        ._tab
+                }
+                _ => {
+                    flatbuffers::root::<ManifestV2>(&bytes[2..])
+                        .unwrap()
+                        .ssts()
+                        .get(0)
+                        .info()
+                        ._tab
+                }
+            };
+            let field = info.vtable().get(FbSsTableInfo::VT_COMPRESSION_FORMAT);
+            assert_ne!(field, 0, "compression format was not written");
+            2 + info.loc() + usize::from(field)
+        };
+        bytes[codec_offset] = u8::MAX;
+        let result = FlatBufferManifestCodec {}.decode(&Bytes::from(bytes));
+
+        // then
+        let error = result.unwrap_err().downcast::<SlateDBError>().unwrap();
+        assert!(
+            matches!(
+                *error,
+                SlateDBError::CorruptSst {
+                    reason: "unknown or unavailable compression codec",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
     }
 
     #[test]
