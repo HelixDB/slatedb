@@ -785,9 +785,12 @@ impl TableStore {
         // run of uncached blocks. The single-block path probes the cache before
         // building a loader, so hits skip the loader setup; a miss or a failed
         // probe still goes through the fetch. Fetch errors fall through to the
-        // direct load, which produces the authoritative error if any.
+        // direct load, which produces the authoritative error if any; that load
+        // skips the cache probe below, since this probe already counted the miss.
+        let mut probed = false;
         if cache_blocks && blocks.len() == 1 {
             if let Some(cache) = self.cache_for_reads() {
+                probed = true;
                 let block_num = blocks.start;
                 let offset = index.borrow().block_meta().get(block_num).offset();
                 let cache_key: CachedKey = (handle.id, offset).into();
@@ -815,7 +818,7 @@ impl TableStore {
         let mut uncached_ranges = Vec::new();
 
         // If block cache is available, try to retrieve cached blocks
-        if let Some(cache) = self.cache_for_reads() {
+        if let (Some(cache), false) = (self.cache_for_reads(), probed) {
             let index_borrow = index.borrow();
             // Attempt to get all requested blocks from cache concurrently
             let cached_blocks = join_all(blocks.clone().map(|block_num| async move {
@@ -852,7 +855,8 @@ impl TableStore {
                 uncached_ranges.push((blocks.start + start)..blocks.end);
             }
         } else {
-            // If no cache is available, treat all blocks as uncached
+            // No cache, or the single-block path already probed it: read every
+            // block directly.
             uncached_ranges.push(blocks.clone());
         }
         // Every block came from the cache: skip resolving the SST path.
@@ -2645,6 +2649,66 @@ mod tests {
         }
     }
 
+    /// A single-block read whose cache fetch fails loads the block directly
+    /// without probing the cache again, so the miss counts once.
+    #[tokio::test]
+    async fn failed_single_block_fetch_counts_one_miss() {
+        use crate::db_cache::stats::ACCESS_COUNT;
+        use crate::test_utils::FlakyObjectStore;
+        use slatedb_common::metrics::{
+            lookup_metric_with_labels, DefaultMetricsRecorder, MetricLevel, MetricsRecorderHelper,
+        };
+
+        // given: an SST whose index is cached, read through a store whose next
+        // ranged GET fails
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (format, handle, rows) = write_sst_with_every_section(&store).await;
+        let recorder = Arc::new(DefaultMetricsRecorder::new());
+        let wrapper = Arc::new(DbCacheWrapper::new(
+            Arc::new(TestCache::new()),
+            &MetricsRecorderHelper::new(recorder.clone(), MetricLevel::default()),
+            Arc::new(DefaultSystemClock::default()),
+            1,
+        ));
+        let healthy = TableStore::new(
+            store.clone(),
+            format.clone(),
+            Path::from(ROOT),
+            Some(wrapper.clone()),
+            TableStoreKind::Main,
+            BlockCachePolicy::default(),
+        );
+        let index = healthy
+            .read_index(&handle, true, None, &ReadTrace::new(None), None)
+            .await
+            .unwrap();
+        let flaky = TableStore::new(
+            Arc::new(FlakyObjectStore::new(store, 0).with_get_range_failures(1)),
+            format,
+            Path::from(ROOT),
+            Some(wrapper),
+            TableStoreKind::Main,
+            BlockCachePolicy::default(),
+        );
+
+        // when: the block's fetch fails and the read falls back to a direct load
+        let blocks = flaky
+            .read_blocks_using_index(&handle, index, 0..1, true, None)
+            .await
+            .unwrap();
+
+        // then: the read returns the block, and the data-block miss counted once
+        assert_blocks(&blocks, &rows[0..1]).await;
+        assert_eq!(
+            lookup_metric_with_labels(
+                &recorder,
+                ACCESS_COUNT,
+                &[("entry_kind", "data_block"), ("result", "miss")],
+            ),
+            Some(1)
+        );
+    }
+
     /// A hybrid cache whose disk tier holds an entry it cannot decode fails the
     /// probe, yet its fetch still runs the loader and keeps the entry in memory,
     /// so the next read is served by the cache rather than the object store.
@@ -2708,10 +2772,10 @@ mod tests {
         let (format, handle, _) = write_sst_with_every_section(&store).await;
         // (cache, errors per section read, errors per single-block read): a fetch
         // that recovers after the probe failed, or one that fails as well. A failed
-        // single-block fetch falls back to the multi-block path, which probes again.
+        // single-block fetch falls back to a direct load without probing again.
         let caches: [(Arc<dyn DbCache>, i64, i64); 2] = [
             (Arc::new(TestCache::with_failing_probes()), 1, 1),
-            (Arc::new(FailingCache), 2, 3),
+            (Arc::new(FailingCache), 2, 2),
         ];
         for (cache, section_errors, block_errors) in caches {
             // given: a reader behind the metric-recording wrapper of that cache
