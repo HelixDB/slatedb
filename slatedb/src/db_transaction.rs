@@ -805,6 +805,11 @@ impl DbTransaction {
     /// This metadata is used only for transaction conflict detection and is
     /// not persisted.
     ///
+    /// Disjoint merges never expire. A put or merge on the same key in this
+    /// transaction must not expire either: one that does, including through
+    /// the default TTL, fails the commit with an invalid-argument error. Pass
+    /// [`Ttl::NoExpiry`](crate::config::Ttl::NoExpiry) to combine them.
+    ///
     /// # Panics
     ///
     /// Panics when the discriminator set is empty or contains an empty value,
@@ -874,8 +879,9 @@ impl DbTransaction {
     /// conflict at commit, while valid disjoint writes retain their logical
     /// member compatibility.
     ///
-    /// Disjoint merges never expire. Callers that need TTL semantics must use
-    /// an exclusive merge with explicit [`MergeOptions`].
+    /// Disjoint merges never expire, with the same restriction on other
+    /// writes to the key as [`Self::merge_disjoint`]. Callers that need TTL
+    /// semantics must use an exclusive merge with explicit [`MergeOptions`].
     pub async fn merge_disjoint_checked<K, V, D, I>(
         &self,
         key: K,
@@ -1669,6 +1675,55 @@ mod tests {
 
         // then
         assert_eq!(requests() - before, 1);
+    }
+
+    /// Disjoint merges never expire, so a same-key put that expires through the
+    /// default TTL fails the commit and writes nothing, while a non-expiring
+    /// put combines with the merge.
+    #[rstest]
+    #[case::default_ttl(crate::config::Ttl::Default, None)]
+    #[case::no_expiry(crate::config::Ttl::NoExpiry, Some(12))]
+    #[tokio::test]
+    async fn test_txn_disjoint_merge_requires_non_expiring_same_key_writes(
+        #[case] put_ttl: crate::config::Ttl,
+        #[case] expected: Option<u64>,
+    ) {
+        // given: a DB with a default TTL
+        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = crate::Db::builder("test_txn_disjoint_merge_ttl", object_store)
+            .with_settings(crate::config::Settings {
+                default_ttl_millis: Some(60_000),
+                ..Default::default()
+            })
+            .with_merge_operator(Arc::new(CounterMergeOperator))
+            .build()
+            .await
+            .unwrap();
+
+        // when: one transaction puts and disjointly merges the same key
+        let txn = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        txn.put_with_options(
+            b"counter",
+            10_u64.to_le_bytes(),
+            &PutOptions { ttl: put_ttl },
+        )
+        .unwrap();
+        txn.merge_disjoint(b"counter", [b"member"], 2_u64.to_le_bytes())
+            .unwrap();
+        let committed = txn.commit().await;
+
+        // then
+        assert_eq!(
+            committed.as_ref().err().map(crate::Error::kind),
+            expected.is_none().then_some(crate::ErrorKind::Invalid),
+            "{committed:?}"
+        );
+        let value = db
+            .get(b"counter")
+            .await
+            .unwrap()
+            .map(|value| u64::from_le_bytes(value.as_ref().try_into().unwrap()));
+        assert_eq!(value, expected);
     }
 
     #[tokio::test]
