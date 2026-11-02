@@ -300,7 +300,35 @@ impl ReaderState {
     }
 }
 
+/// Replayed batches merge into the newest replayed memtable while the merged
+/// table stays under this size and under `max_memtable_bytes`. Without merging,
+/// a reader that polls the WAL every second adds a memtable per poll until the
+/// next L0 flush reaches the manifest, and every read merges all of them.
+/// Merging copies the newest table, so the cap also bounds the copy one poll
+/// makes.
+const REPLAY_MEMTABLE_MERGE_BYTES: usize = 4 * 1024 * 1024;
+
 impl ReplayMemtables {
+    /// Replaces the newest memtable with a copy that also holds `table`'s
+    /// newer rows. Older nodes stay shared, so snapshots of the previous state
+    /// keep their view.
+    fn merge_into_newest(&mut self, table: WritableKVTable, last_wal_id: u64) {
+        let head = self
+            .head
+            .as_ref()
+            .expect("merging needs a newest replayed memtable");
+        let newest = head.table.table();
+        let mut rows = newest.iter();
+        while let Some(row) = rows.next_sync() {
+            table.put(row);
+        }
+        table.record_touched_segments(newest.touched_segments());
+        self.head = Some(Arc::new(ReplayMemtableNode {
+            table: Arc::new(ImmutableMemtable::new(table, last_wal_id)),
+            older: head.older.clone(),
+        }));
+    }
+
     fn prepend(&mut self, table: Arc<ImmutableMemtable>) {
         self.head = Some(Arc::new(ReplayMemtableNode {
             table,
@@ -1047,9 +1075,25 @@ impl DbReaderInner {
                         &replayed_table.table,
                     )?;
                 }
-                let imm_memtable =
-                    ImmutableMemtable::new(replayed_table.table, replayed_table.last_wal_id);
-                into_tables.prepend(Arc::new(imm_memtable));
+                // Size the merge as WAL replay sizes its tables.
+                let merges = into_tables.front().is_some_and(|newest| {
+                    let newest = newest.table().metadata();
+                    let batch = replayed_table.table.metadata();
+                    let bytes = newest.entries_size_in_bytes + batch.entries_size_in_bytes;
+                    bytes <= REPLAY_MEMTABLE_MERGE_BYTES
+                        && table_store.estimate_encoded_size_compacted(
+                            newest.entry_num + batch.entry_num,
+                            bytes,
+                        ) < reader_options.max_memtable_bytes as usize
+                });
+                if merges {
+                    into_tables.merge_into_newest(replayed_table.table, replayed_table.last_wal_id);
+                } else {
+                    into_tables.prepend(Arc::new(ImmutableMemtable::new(
+                        replayed_table.table,
+                        replayed_table.last_wal_id,
+                    )));
+                }
             }
             if let Some(publish) = publish.as_mut() {
                 publish(into_tables, replay_after_wal_id, last_committed_seq);
@@ -2333,6 +2377,44 @@ mod tests {
         .await
         .expect("reader did not replay the new WAL on its WAL poll interval");
 
+        reader.close().await.unwrap();
+        db.close().await.unwrap();
+    }
+
+    /// Each WAL poll replays a small batch. They merge into one replayed
+    /// memtable instead of adding a memtable per poll, so reads do not slow down
+    /// as polls accumulate between L0 flushes.
+    #[tokio::test]
+    async fn wal_polls_merge_small_writes_into_one_replayed_memtable() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_reader_wal_poll_merges_memtables");
+        let db = Db::open(path.clone(), Arc::clone(&object_store))
+            .await
+            .unwrap();
+        let reader = DbReader::builder(path, object_store)
+            .with_options(DbReaderOptions {
+                manifest_poll_interval: Duration::from_secs(60 * 60),
+                checkpoint_lifetime: Duration::from_secs(3 * 60 * 60),
+                wal_poll_interval: Duration::from_millis(10),
+                ..DbReaderOptions::default()
+            })
+            .build()
+            .await
+            .unwrap();
+
+        for i in 0..5 {
+            let key = format!("key-{i}");
+            db.put(key.as_bytes(), b"value").await.unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while reader.get(key.as_bytes()).await.unwrap().is_none() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("reader did not replay the new WAL on its WAL poll interval");
+        }
+
+        assert_eq!(1, reader.inner.state.read().imm_memtable.len());
         reader.close().await.unwrap();
         db.close().await.unwrap();
     }
@@ -3825,6 +3907,9 @@ mod tests {
         assert_eq!(last_wal_id, 4);
         assert_eq!(last_committed_seq, 4);
 
+        // The fresh row merges into the newest replayed memtable; the older
+        // memtable stays behind it.
+        assert_eq!(into_tables.len(), 2);
         let newest_replayed = into_tables.front().unwrap();
         assert_eq!(newest_replayed.recent_flushed_wal_id(), 4);
 
@@ -3832,7 +3917,10 @@ mod tests {
         let mut newest_iter = newest_table.iter();
         test_utils::assert_iterator(
             &mut newest_iter,
-            vec![RowEntry::new_value(b"fresh_key", b"fresh_value", 4)],
+            vec![
+                RowEntry::new_value(b"fresh_key", b"fresh_value", 4),
+                RowEntry::new_value(b"stale_key", b"stale_value", 3),
+            ],
         )
         .await;
     }
@@ -3856,6 +3944,53 @@ mod tests {
         assert!(Arc::ptr_eq(shared_tail, &original_head));
         assert_eq!(1, original.len());
         assert_eq!(2, extended.len());
+    }
+
+    #[test]
+    fn merge_into_newest_keeps_older_tables_and_snapshots() {
+        let keys = |tables: &ReplayMemtables| {
+            tables
+                .iter()
+                .map(|imm| {
+                    let mut rows = imm.table().iter();
+                    let mut keys = Vec::new();
+                    while let Some(row) = rows.next_sync() {
+                        keys.push(row.key);
+                    }
+                    keys
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut tables: ReplayMemtables = [
+            immutable_memtable(2, vec![RowEntry::new_value(b"key-2", b"value", 2)]),
+            immutable_memtable(1, vec![RowEntry::new_value(b"key-1", b"value", 1)]),
+        ]
+        .into_iter()
+        .collect();
+        let snapshot = tables.clone();
+        let older = Arc::clone(tables.head.as_ref().unwrap().older.as_ref().unwrap());
+        let batch = WritableKVTable::new();
+        batch.put(RowEntry::new_value(b"key-3", b"value", 3));
+
+        tables.merge_into_newest(batch, 3);
+
+        assert_eq!(2, tables.len());
+        assert_eq!(3, tables.front().unwrap().recent_flushed_wal_id());
+        assert_eq!(
+            vec![
+                vec![Bytes::from("key-2"), Bytes::from("key-3")],
+                vec![Bytes::from("key-1")]
+            ],
+            keys(&tables)
+        );
+        assert!(Arc::ptr_eq(
+            tables.head.as_ref().unwrap().older.as_ref().unwrap(),
+            &older
+        ));
+        assert_eq!(
+            vec![vec![Bytes::from("key-2")], vec![Bytes::from("key-1")]],
+            keys(&snapshot)
+        );
     }
 
     #[tokio::test]
