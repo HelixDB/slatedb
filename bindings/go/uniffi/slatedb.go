@@ -10888,8 +10888,10 @@ func (_ FfiDestroyerReadOptions) Destroy(value ReadOptions) {
 type ReaderOptions struct {
 	// How often the reader polls for new manifests and WAL data, in milliseconds.
 	ManifestPollIntervalMs uint64
-	// How frequently an open reader probes the exact next WAL ID.
-	WalPollIntervalMs uint64
+	// How frequently an open reader probes for the next WAL, in milliseconds.
+	// `None` (default) uses SlateDB's default of one second. Zero is rejected
+	// when the reader opens.
+	WalPollIntervalMs *uint64
 	// Lifetime of an internally managed checkpoint, in milliseconds.
 	CheckpointLifetimeMs uint64
 	// Maximum size of one in-memory table used while replaying WAL data.
@@ -10905,7 +10907,7 @@ type ReaderOptions struct {
 
 func (r *ReaderOptions) Destroy() {
 	FfiDestroyerUint64{}.Destroy(r.ManifestPollIntervalMs)
-	FfiDestroyerUint64{}.Destroy(r.WalPollIntervalMs)
+	FfiDestroyerOptionalUint64{}.Destroy(r.WalPollIntervalMs)
 	FfiDestroyerUint64{}.Destroy(r.CheckpointLifetimeMs)
 	FfiDestroyerUint64{}.Destroy(r.MaxMemtableBytes)
 	FfiDestroyerBool{}.Destroy(r.SkipWalReplay)
@@ -10923,7 +10925,7 @@ func (c FfiConverterReaderOptions) Lift(rb RustBufferI) ReaderOptions {
 func (c FfiConverterReaderOptions) Read(reader io.Reader) ReaderOptions {
 	return ReaderOptions{
 		FfiConverterUint64INSTANCE.Read(reader),
-		FfiConverterUint64INSTANCE.Read(reader),
+		FfiConverterOptionalUint64INSTANCE.Read(reader),
 		FfiConverterUint64INSTANCE.Read(reader),
 		FfiConverterUint64INSTANCE.Read(reader),
 		FfiConverterBoolINSTANCE.Read(reader),
@@ -10941,7 +10943,7 @@ func (c FfiConverterReaderOptions) LowerExternal(value ReaderOptions) ExternalCR
 
 func (c FfiConverterReaderOptions) Write(writer io.Writer, value ReaderOptions) {
 	FfiConverterUint64INSTANCE.Write(writer, value.ManifestPollIntervalMs)
-	FfiConverterUint64INSTANCE.Write(writer, value.WalPollIntervalMs)
+	FfiConverterOptionalUint64INSTANCE.Write(writer, value.WalPollIntervalMs)
 	FfiConverterUint64INSTANCE.Write(writer, value.CheckpointLifetimeMs)
 	FfiConverterUint64INSTANCE.Write(writer, value.MaxMemtableBytes)
 	FfiConverterBoolINSTANCE.Write(writer, value.SkipWalReplay)
@@ -11813,13 +11815,14 @@ func (_ FfiDestroyerWalRows) Destroy(value WalRows) {
 // Options that control writes and commits.
 type WriteOptions struct {
 	// Whether the call waits for the write to become durable before returning.
-	AwaitDurable bool
+	// `None` (default) waits, as in SlateDB.
+	AwaitDurable *bool
 	// Optional caller-supplied sequence number. Zero uses SlateDB's sequence oracle.
 	Seqnum uint64
 }
 
 func (r *WriteOptions) Destroy() {
-	FfiDestroyerBool{}.Destroy(r.AwaitDurable)
+	FfiDestroyerOptionalBool{}.Destroy(r.AwaitDurable)
 	FfiDestroyerUint64{}.Destroy(r.Seqnum)
 }
 
@@ -11833,7 +11836,7 @@ func (c FfiConverterWriteOptions) Lift(rb RustBufferI) WriteOptions {
 
 func (c FfiConverterWriteOptions) Read(reader io.Reader) WriteOptions {
 	return WriteOptions{
-		FfiConverterBoolINSTANCE.Read(reader),
+		FfiConverterOptionalBoolINSTANCE.Read(reader),
 		FfiConverterUint64INSTANCE.Read(reader),
 	}
 }
@@ -11847,7 +11850,7 @@ func (c FfiConverterWriteOptions) LowerExternal(value WriteOptions) ExternalCRus
 }
 
 func (c FfiConverterWriteOptions) Write(writer io.Writer, value WriteOptions) {
-	FfiConverterBoolINSTANCE.Write(writer, value.AwaitDurable)
+	FfiConverterOptionalBoolINSTANCE.Write(writer, value.AwaitDurable)
 	FfiConverterUint64INSTANCE.Write(writer, value.Seqnum)
 }
 
@@ -13612,6 +13615,47 @@ type FfiDestroyerOptionalInt64 struct{}
 func (_ FfiDestroyerOptionalInt64) Destroy(value *int64) {
 	if value != nil {
 		FfiDestroyerInt64{}.Destroy(*value)
+	}
+}
+
+type FfiConverterOptionalBool struct{}
+
+var FfiConverterOptionalBoolINSTANCE = FfiConverterOptionalBool{}
+
+func (c FfiConverterOptionalBool) Lift(rb RustBufferI) *bool {
+	return LiftFromRustBuffer[*bool](c, rb)
+}
+
+func (_ FfiConverterOptionalBool) Read(reader io.Reader) *bool {
+	if readInt8(reader) == 0 {
+		return nil
+	}
+	temp := FfiConverterBoolINSTANCE.Read(reader)
+	return &temp
+}
+
+func (c FfiConverterOptionalBool) Lower(value *bool) C.RustBuffer {
+	return LowerIntoRustBuffer[*bool](c, value)
+}
+
+func (c FfiConverterOptionalBool) LowerExternal(value *bool) ExternalCRustBuffer {
+	return RustBufferFromC(LowerIntoRustBuffer[*bool](c, value))
+}
+
+func (_ FfiConverterOptionalBool) Write(writer io.Writer, value *bool) {
+	if value == nil {
+		writeInt8(writer, 0)
+	} else {
+		writeInt8(writer, 1)
+		FfiConverterBoolINSTANCE.Write(writer, *value)
+	}
+}
+
+type FfiDestroyerOptionalBool struct{}
+
+func (_ FfiDestroyerOptionalBool) Destroy(value *bool) {
+	if value != nil {
+		FfiDestroyerBool{}.Destroy(*value)
 	}
 }
 

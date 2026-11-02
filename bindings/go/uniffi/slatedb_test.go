@@ -161,6 +161,10 @@ func uint64Ptr(v uint64) *uint64 {
 	return &v
 }
 
+func boolPtr(v bool) *bool {
+	return &v
+}
+
 func trackWriteHandle(t *testing.T, handle *slatedb.WriteHandle) *slatedb.WriteHandle {
 	t.Helper()
 	if handle == nil {
@@ -679,7 +683,7 @@ func TestDbCrudAndMetadata(t *testing.T) {
 	}
 
 	putOptions := slatedb.PutOptions{Ttl: slatedb.TtlDefault{}}
-	writeOptions := slatedb.WriteOptions{AwaitDurable: true, Seqnum: 0}
+	writeOptions := slatedb.WriteOptions{AwaitDurable: boolPtr(true), Seqnum: 0}
 
 	firstWrite, err := handle.db.Put([]byte("alpha"), []byte("one"))
 	if err != nil {
@@ -965,7 +969,7 @@ func TestDbBatchWriteAndConsumption(t *testing.T) {
 		t.Fatalf("WriteBatch.PutWithOptions(): %v", err)
 	}
 
-	secondBatchWrite, err := handle.db.WriteWithOptions(secondBatch, slatedb.WriteOptions{AwaitDurable: true, Seqnum: 0})
+	secondBatchWrite, err := handle.db.WriteWithOptions(secondBatch, slatedb.WriteOptions{AwaitDurable: boolPtr(true), Seqnum: 0})
 	if err != nil {
 		t.Fatalf("WriteWithOptions(): %v", err)
 	}
@@ -1032,7 +1036,7 @@ func TestDbMerge(t *testing.T) {
 		[]byte("merge"),
 		[]byte(":two"),
 		slatedb.MergeOptions{Ttl: slatedb.TtlDefault{}},
-		slatedb.WriteOptions{AwaitDurable: true, Seqnum: 0},
+		slatedb.WriteOptions{AwaitDurable: boolPtr(true), Seqnum: 0},
 	)
 	if err != nil {
 		t.Fatalf("MergeWithOptions(): %v", err)
@@ -1506,7 +1510,7 @@ func TestDbReaderRefreshBehavior(t *testing.T) {
 		t.Helper()
 		if err := builder.WithOptions(slatedb.ReaderOptions{
 			ManifestPollIntervalMs: 100,
-			WalPollIntervalMs:      100,
+			WalPollIntervalMs:      uint64Ptr(100),
 			CheckpointLifetimeMs:   1000,
 			MaxMemtableBytes:       64 * 1024 * 1024,
 			SkipWalReplay:          false,
@@ -1532,6 +1536,35 @@ func TestDbReaderRefreshBehavior(t *testing.T) {
 }
 
 func TestDbReaderWalReplayBehavior(t *testing.T) {
+	t.Run("unset wal poll interval uses the default", func(t *testing.T) {
+		store := newMemoryStore(t)
+		dbHandle := openTestDB(t, store, nil)
+		if _, err := dbHandle.db.Put([]byte("wal-key"), []byte("wal-value")); err != nil {
+			t.Fatalf("Put(wal-key): %v", err)
+		}
+		if err := dbHandle.db.FlushWithOptions(slatedb.FlushOptions{FlushType: slatedb.FlushTypeWal}); err != nil {
+			t.Fatalf("FlushWithOptions(Wal): %v", err)
+		}
+		readerHandle := openTestReader(t, store, func(t *testing.T, builder *slatedb.DbReaderBuilder) {
+			t.Helper()
+			if err := builder.WithOptions(slatedb.ReaderOptions{
+				ManifestPollIntervalMs: 100,
+				CheckpointLifetimeMs:   1000,
+				MaxMemtableBytes:       64 * 1024 * 1024,
+			}); err != nil {
+				t.Fatalf("DbReaderBuilder.WithOptions(): %v", err)
+			}
+		})
+
+		value, err := readerHandle.reader.Get([]byte("wal-key"))
+		if err != nil {
+			t.Fatalf("Get(wal-key): %v", err)
+		}
+		if value == nil || !bytes.Equal(*value, []byte("wal-value")) {
+			t.Fatalf("Get(wal-key) = %v, want wal-value", value)
+		}
+	})
+
 	t.Run("default reader replays new wal data", func(t *testing.T) {
 		store := newMemoryStore(t)
 		dbHandle := openTestDB(t, store, nil)
@@ -1539,7 +1572,7 @@ func TestDbReaderWalReplayBehavior(t *testing.T) {
 			t.Helper()
 			if err := builder.WithOptions(slatedb.ReaderOptions{
 				ManifestPollIntervalMs: 100,
-				WalPollIntervalMs:      100,
+				WalPollIntervalMs:      uint64Ptr(100),
 				CheckpointLifetimeMs:   1000,
 				MaxMemtableBytes:       64 * 1024 * 1024,
 				SkipWalReplay:          false,
@@ -1586,7 +1619,7 @@ func TestDbReaderWalReplayBehavior(t *testing.T) {
 			t.Helper()
 			if err := builder.WithOptions(slatedb.ReaderOptions{
 				ManifestPollIntervalMs: 100,
-				WalPollIntervalMs:      100,
+				WalPollIntervalMs:      uint64Ptr(100),
 				CheckpointLifetimeMs:   1000,
 				MaxMemtableBytes:       64 * 1024 * 1024,
 				SkipWalReplay:          true,
@@ -1619,7 +1652,7 @@ func TestDbReaderWalReplayBehavior(t *testing.T) {
 			t.Helper()
 			if err := builder.WithOptions(slatedb.ReaderOptions{
 				ManifestPollIntervalMs: 100,
-				WalPollIntervalMs:      100,
+				WalPollIntervalMs:      uint64Ptr(100),
 				CheckpointLifetimeMs:   1000,
 				MaxMemtableBytes:       64 * 1024 * 1024,
 				SkipWalReplay:          true,
@@ -3287,7 +3320,7 @@ func TestDbTtl(t *testing.T) {
 	key, value := []byte("alpha"), []byte("one")
 
 	putOptions := slatedb.PutOptions{Ttl: slatedb.TtlExpireAtMillis{Field0: 1}}
-	writeOptions := slatedb.WriteOptions{AwaitDurable: true, Seqnum: 0}
+	writeOptions := slatedb.WriteOptions{AwaitDurable: boolPtr(true), Seqnum: 0}
 	write, err := handle.db.PutWithOptions(key, value, putOptions, writeOptions)
 	if err != nil {
 		t.Fatalf("Put(alpha): %v", err)
@@ -3347,7 +3380,7 @@ const batchSeedTtlMillis = 3_600_000
 func seedBatchRows(t *testing.T, db *slatedb.Db) {
 	t.Helper()
 
-	writeOptions := slatedb.WriteOptions{AwaitDurable: true, Seqnum: 0}
+	writeOptions := slatedb.WriteOptions{AwaitDurable: boolPtr(true), Seqnum: 0}
 	for _, row := range batchSeedRows {
 		putOptions := slatedb.PutOptions{Ttl: row.ttl}
 		write, err := db.PutWithOptions([]byte(row.key), []byte(row.value), putOptions, writeOptions)
@@ -3606,7 +3639,7 @@ func openBenchDB(b *testing.B) *slatedb.Db {
 		db.Destroy()
 	})
 
-	writeOptions := slatedb.WriteOptions{AwaitDurable: false, Seqnum: 0}
+	writeOptions := slatedb.WriteOptions{AwaitDurable: boolPtr(false), Seqnum: 0}
 	putOptions := slatedb.PutOptions{Ttl: slatedb.TtlDefault{}}
 	for i := 0; i < benchScanRows; i++ {
 		key := []byte(fmt.Sprintf("bench:%06d", i))

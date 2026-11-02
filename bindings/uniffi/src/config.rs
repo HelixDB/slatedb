@@ -208,9 +208,11 @@ pub struct ReaderOptions {
     /// How often the reader polls for new manifests and WAL data, in milliseconds.
     pub manifest_poll_interval_ms: u64,
 
-    /// How frequently an open reader probes the exact next WAL ID.
-    #[uniffi(default = 1000)]
-    pub wal_poll_interval_ms: u64,
+    /// How frequently an open reader probes for the next WAL, in milliseconds.
+    /// `None` (default) uses SlateDB's default of one second. Zero is rejected
+    /// when the reader opens.
+    #[uniffi(default = None)]
+    pub wal_poll_interval_ms: Option<u64>,
     /// Lifetime of an internally managed checkpoint, in milliseconds.
     pub checkpoint_lifetime_ms: u64,
     /// Maximum size of one in-memory table used while replaying WAL data.
@@ -229,7 +231,7 @@ impl Default for ReaderOptions {
     fn default() -> Self {
         Self {
             manifest_poll_interval_ms: 10_000,
-            wal_poll_interval_ms: 1_000,
+            wal_poll_interval_ms: None,
             checkpoint_lifetime_ms: 600_000,
             max_memtable_bytes: 64 * 1024 * 1024,
             skip_wal_replay: false,
@@ -240,14 +242,17 @@ impl Default for ReaderOptions {
 
 impl From<ReaderOptions> for slatedb::config::DbReaderOptions {
     fn from(value: ReaderOptions) -> Self {
+        let defaults = slatedb::config::DbReaderOptions::default();
         slatedb::config::DbReaderOptions {
             manifest_poll_interval: Duration::from_millis(value.manifest_poll_interval_ms),
-            wal_poll_interval: Duration::from_millis(value.wal_poll_interval_ms),
+            wal_poll_interval: value
+                .wal_poll_interval_ms
+                .map_or(defaults.wal_poll_interval, Duration::from_millis),
             checkpoint_lifetime: Duration::from_millis(value.checkpoint_lifetime_ms),
             max_memtable_bytes: value.max_memtable_bytes,
             skip_wal_replay: value.skip_wal_replay,
             object_store_max_retries: value.object_store_max_retries,
-            ..Default::default()
+            ..defaults
         }
     }
 }
@@ -336,29 +341,22 @@ impl TryFrom<ScanOptions> for slatedb::config::ScanOptions {
 }
 
 /// Options that control writes and commits.
-#[derive(Clone, Debug, uniffi::Record)]
+#[derive(Clone, Debug, Default, uniffi::Record)]
 pub struct WriteOptions {
     /// Whether the call waits for the write to become durable before returning.
-    #[uniffi(default = true)]
-    pub await_durable: bool,
+    /// `None` (default) waits, as in SlateDB.
+    #[uniffi(default = None)]
+    pub await_durable: Option<bool>,
     /// Optional caller-supplied sequence number. Zero uses SlateDB's sequence oracle.
     #[uniffi(default = 0)]
     pub seqnum: u64,
 }
 
-impl Default for WriteOptions {
-    fn default() -> Self {
-        Self {
-            await_durable: true,
-            seqnum: 0,
-        }
-    }
-}
-
 impl From<WriteOptions> for slatedb::config::WriteOptions {
     fn from(value: WriteOptions) -> Self {
+        let defaults = slatedb::config::WriteOptions::default();
         slatedb::config::WriteOptions {
-            await_durable: value.await_durable,
+            await_durable: value.await_durable.unwrap_or(defaults.await_durable),
             seqnum: value.seqnum,
         }
     }
@@ -586,7 +584,7 @@ impl From<GarbageCollectorOptions> for slatedb::config::GarbageCollectorOptions 
 
 #[cfg(test)]
 mod tests {
-    use super::{CloseOptions, FlushType, GarbageCollectorOptions, ReaderOptions};
+    use super::{CloseOptions, FlushType, GarbageCollectorOptions, ReaderOptions, WriteOptions};
     use std::time::Duration;
 
     #[test]
@@ -669,13 +667,27 @@ mod tests {
     fn reader_object_store_max_retries_threads_through() {
         let reader: slatedb::config::DbReaderOptions = ReaderOptions {
             object_store_max_retries: Some(5),
-            wal_poll_interval_ms: 250,
+            wal_poll_interval_ms: Some(250),
             ..ReaderOptions::default()
         }
         .into();
 
         assert_eq!(reader.object_store_max_retries, Some(5));
         assert_eq!(reader.wal_poll_interval, Duration::from_millis(250));
+    }
+
+    /// Leaving `await_durable` unset waits for durability, as SlateDB does.
+    #[test]
+    fn write_await_durable_defaults_to_slatedb() {
+        for (await_durable, expected) in [(None, true), (Some(true), true), (Some(false), false)] {
+            let options: slatedb::config::WriteOptions = WriteOptions {
+                await_durable,
+                seqnum: 0,
+            }
+            .into();
+
+            assert_eq!(options.await_durable, expected, "{await_durable:?}");
+        }
     }
 }
 
