@@ -61,7 +61,6 @@ mod tests {
     use crate::iter::RowEntryIterator;
     use crate::manifest::store::ManifestStore;
     use crate::manifest::Manifest;
-    use crate::object_stores::ObjectStores;
     use crate::proptest_util::{rng, sample};
     use crate::sst_iter::{SstIterator, SstIteratorOptions};
     use crate::tablestore::{TableStore, TableStoreKind};
@@ -448,14 +447,19 @@ mod tests {
         kv: (&Bytes, &Bytes),
     ) {
         let table_store = Arc::new(TableStore::new(
-            ObjectStores::new(Arc::clone(&object_store), None),
+            Arc::clone(&object_store),
             SsTableFormat::default(),
             path.clone(),
             None,
             TableStoreKind::Main,
             BlockCachePolicy::default(),
         ));
-        let sst_handle = SsTableView::identity(table_store.open_sst(table_id).await.unwrap());
+        let sst_handle = SsTableView::identity(
+            table_store
+                .open_sst(table_id, Some(Bytes::new()))
+                .await
+                .unwrap(),
+        );
 
         let mut sst_iter = SstIterator::for_key_with_stats_initialized(
             &sst_handle,

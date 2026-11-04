@@ -54,7 +54,7 @@ use crate::config::{
 use crate::db_common::extract_segment_prefix;
 use crate::db_iter::{DbIterator, DbRecencyIterator};
 use crate::db_snapshot::DbSnapshot;
-use crate::db_state::{collect_touched_segments, DbState, SsTableId};
+use crate::db_state::{collect_touched_segments, DbState, SsTableHandle, SsTableId};
 use crate::db_stats::DbStats;
 use crate::error::SlateDBError;
 use crate::manifest::{Manifest, VersionedManifest};
@@ -2177,12 +2177,29 @@ impl DbCacheManagerOps for Db {
     ) -> Result<(), crate::Error> {
         self.inner.check_closed()?;
         let manifest = self.manifest();
-        db_cache_manager::warm_sst_impl(&self.inner.table_store, &manifest, sst_id, targets).await
+        db_cache_manager::warm_sst_impl(&self.inner.table_store, manifest.core(), sst_id, targets)
+            .await
     }
 
-    async fn evict_cached_sst(&self, sst_id: SsTableId) -> Result<(), crate::Error> {
+    async fn evict_cached_sst(
+        &self,
+        sst: &SsTableHandle,
+        targets: &[CacheTarget],
+    ) -> Result<(), crate::Error> {
         self.inner.check_closed()?;
-        db_cache_manager::evict_cached_sst_impl(&self.inner.table_store, sst_id).await
+        let manifest = self.manifest();
+        db_cache_manager::evict_cached_sst_impl(
+            &self.inner.table_store,
+            manifest.core(),
+            sst,
+            targets,
+        )
+        .await
+    }
+
+    async fn flush_cache_to_disk(&self) -> Result<(), crate::Error> {
+        self.inner.check_closed()?;
+        db_cache_manager::flush_cache_to_disk_impl(&self.inner.table_store).await
     }
 }
 
@@ -2367,7 +2384,6 @@ mod tests {
     use crate::merge_operator::{
         MERGE_OPERATOR_COMPACT_PATH, MERGE_OPERATOR_FLUSH_PATH, MERGE_OPERATOR_READ_PATH,
     };
-    use crate::object_stores::ObjectStores;
     use crate::proptest_util::arbitrary;
     use crate::proptest_util::sample;
     use crate::seq_tracker::FindOption;
@@ -2378,6 +2394,7 @@ mod tests {
         OnDemandCompactionSchedulerSupplier, StringConcatMergeOperator,
     };
     use crate::types::RowEntry;
+    use crate::wal::slatedb::store::WalTableStore;
     use crate::wal::{SlateDbWalReaderBuilder, WalError, WalReader as _};
     use crate::{proptest_util, test_utils, CloseReason, CompactorBuilder, KeyValue};
     use async_trait::async_trait;
@@ -2527,6 +2544,73 @@ mod tests {
         kv_store.delete(key).await.unwrap();
         assert_eq!(None, kv_store.get(key).await.unwrap());
         kv_store.close().await.unwrap();
+    }
+
+    /// Per-query storage metrics follow block fetches onto spawned tasks and
+    /// into Foyer's cache loads. A cold read reports its cache misses and
+    /// object-store reads; the same read warm reports a hit for each of those
+    /// misses and no object-store reads.
+    #[cfg(feature = "foyer")]
+    #[rstest::rstest]
+    #[case::point_get(false)]
+    #[case::scan(true)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn query_metrics_count_spawned_block_fetches_and_cache_loads(#[case] scan: bool) {
+        use crate::query_metrics::{scope_query_metrics, QueryMetricsObserver};
+
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = Db::builder("/tmp/query_metrics_spawned_fetches", object_store)
+            .with_db_cache(Arc::new(crate::db_cache::foyer::FoyerCache::new()), 0)
+            // Leave flushed SSTs out of the cache so the first read is cold.
+            .with_block_cache_policy(BlockCachePolicy::default().with_flush_targets(&[]))
+            .build()
+            .await
+            .unwrap();
+        let mut batch = WriteBatch::new();
+        for i in 0..64 {
+            batch.put(format!("key{i:03}"), vec![b'v'; 512]);
+        }
+        db.write(batch).await.unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+
+        let read = |observer: QueryMetricsObserver| {
+            let db = &db;
+            scope_query_metrics(observer, async move {
+                if scan {
+                    // Scans skip block caching by default; cache them so the
+                    // second scan is warm, as the second point get is.
+                    let mut iter = db
+                        .scan_with_options(.., &ScanOptions::default().with_cache_blocks(true))
+                        .await
+                        .unwrap();
+                    let mut rows = 0;
+                    while iter.next().await.unwrap().is_some() {
+                        rows += 1;
+                    }
+                    assert_eq!(rows, 64);
+                } else {
+                    assert!(db.get(b"key032").await.unwrap().is_some());
+                }
+            })
+        };
+        let cold = QueryMetricsObserver::default();
+        read(cold.clone()).await;
+        let warm = QueryMetricsObserver::default();
+        read(warm.clone()).await;
+
+        let (cold, warm) = (cold.snapshot(), warm.snapshot());
+        // An index and at least one data block, each loaded from object storage.
+        assert!(cold.block_cache.misses >= 2, "{cold:?}");
+        assert_eq!(cold.block_cache.hits, 0, "{cold:?}");
+        assert!(cold.object_storage_reads >= 2, "{cold:?}");
+        assert_eq!(warm.block_cache.hits, cold.block_cache.misses, "{warm:?}");
+        assert_eq!(warm.block_cache.misses, 0, "{warm:?}");
+        assert_eq!(warm.object_storage_reads, 0, "{warm:?}");
+        db.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -2747,6 +2831,39 @@ mod tests {
         assert_eq!(iter.next().await.unwrap().unwrap().key.as_ref(), b"b");
         assert_eq!(iter.next().await.unwrap().unwrap().key.as_ref(), b"a");
         assert_eq!(iter.next().await.unwrap(), None);
+
+        kv_store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_seek_rejected_for_descending_scan() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let kv_store = Db::builder("/tmp/test_seek_descending_rejected", object_store)
+            .with_settings(test_db_options(0, 1024, None))
+            .build()
+            .await
+            .unwrap();
+
+        kv_store.put(b"a", b"v0").await.unwrap();
+        kv_store.put(b"b", b"v1").await.unwrap();
+        kv_store.put(b"c", b"v2").await.unwrap();
+
+        let scan_options = ScanOptions::default().with_order(IterationOrder::Descending);
+        let mut iter = kv_store.scan_with_options(.., &scan_options).await.unwrap();
+        let err = iter.seek(b"b").await.unwrap_err();
+        assert_eq!(err.kind(), crate::ErrorKind::Invalid);
+        assert!(
+            err.to_string().contains("descending"),
+            "unexpected error: {err}"
+        );
+
+        // the scan itself still works
+        assert_eq!(iter.next().await.unwrap().unwrap().key.as_ref(), b"c");
+
+        // ascending scans still seek
+        let mut iter = kv_store.scan(..).await.unwrap();
+        iter.seek(b"b").await.unwrap();
+        assert_eq!(iter.next().await.unwrap().unwrap().key.as_ref(), b"b");
 
         kv_store.close().await.unwrap();
     }
@@ -4071,7 +4188,13 @@ mod tests {
         let index = db
             .inner
             .table_store
-            .read_index(&view.sst, true)
+            .read_index(
+                &view.sst,
+                true,
+                Some(Bytes::new()),
+                &crate::reader::ReadTrace::new(None),
+                None,
+            )
             .await
             .unwrap();
         assert!(!index.borrow().block_meta().is_empty());
@@ -4609,7 +4732,7 @@ mod tests {
         let path = Path::from("/tmp/test_kv_store");
         let sst_format = SsTableFormat::default();
         let table_store = Arc::new(TableStore::new(
-            ObjectStores::new(object_store.clone(), None),
+            object_store.clone(),
             sst_format,
             path.clone(),
             None,
@@ -4714,7 +4837,7 @@ mod tests {
             ..SsTableFormat::default()
         };
         let table_store = Arc::new(TableStore::new(
-            ObjectStores::new(object_store.clone(), None),
+            object_store.clone(),
             sst_format,
             path,
             None,
@@ -4919,7 +5042,7 @@ mod tests {
             ..SsTableFormat::default()
         };
         let table_store = Arc::new(TableStore::new(
-            ObjectStores::new(object_store.clone(), None),
+            object_store.clone(),
             sst_format,
             path,
             None,
@@ -6595,23 +6718,24 @@ mod tests {
         db.close().await.unwrap();
 
         let manifest_store = ManifestStore::new(&Path::from(path), object_store.clone());
-        let table_store = Arc::new(TableStore::new(
-            ObjectStores::new(object_store.clone(), None),
+        let wal_store = WalTableStore::new(
+            object_store.clone(),
             SsTableFormat::default(),
             path,
-            None,
             TableStoreKind::Main,
-            BlockCachePolicy::default(),
-        ));
+        );
 
         // Get the next WAL SST ID based on what's currently in the object store
-        let next_wal_sst_id = table_store.next_wal_sst_id(0).await.unwrap();
+        let next_wal_sst_id = wal_store.next_wal_sst_id(0.into()).await.unwrap();
 
         // Get the latest manifest
         let manifest = manifest_store.read_latest_manifest().await.unwrap();
 
         // Assert that the manifest reflects only the flushed WAL
-        assert_eq!(manifest.manifest.core.next_wal_sst_id, next_wal_sst_id);
+        assert_eq!(
+            manifest.manifest.core.next_wal_sst_id,
+            next_wal_sst_id.value()
+        );
     }
 
     #[tokio::test]
@@ -6926,7 +7050,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(db.inner.state.read().state().core().next_wal_sst_id, 2);
-        let wal_ssts = db.inner.table_store.list_wal_ssts(..).await.unwrap();
+        let wal_store = WalTableStore::new(
+            object_store.clone(),
+            SsTableFormat::default(),
+            path,
+            TableStoreKind::Main,
+        );
+        let wal_ssts = wal_store.list_wal_ssts(..).await.unwrap();
         assert_eq!(wal_ssts.len(), 1);
         assert_eq!(wal_ssts[0].metadata.size, 0);
         db.put(b"1", b"1").await.unwrap();
@@ -7016,17 +7146,15 @@ mod tests {
         // Wait for W1 to write its fence WAL — at that point W1 has finished
         // fence_writers and has either entered or is about to enter the paused
         // replay_wal call.
-        let probe_table_store = Arc::new(TableStore::new(
-            ObjectStores::new(object_store.clone(), None),
+        let probe_wal_store = WalTableStore::new(
+            object_store.clone(),
             SsTableFormat::default(),
             path,
-            None,
             TableStoreKind::Main,
-            BlockCachePolicy::default(),
-        ));
+        );
         let mut w1_paused = false;
         for _ in 0..600 {
-            let wals = probe_table_store.list_wal_ssts(..).await.unwrap();
+            let wals = probe_wal_store.list_wal_ssts(..).await.unwrap();
             if !wals.is_empty() {
                 w1_paused = true;
                 break;
@@ -7074,9 +7202,9 @@ mod tests {
         }
     }
 
-    async fn wait_for_wal_sst_count(table_store: &TableStore, min_count: usize, context: &str) {
+    async fn wait_for_wal_sst_count(wal_store: &WalTableStore, min_count: usize, context: &str) {
         for _ in 0..6000 {
-            let wals = table_store.list_wal_ssts(..).await.unwrap();
+            let wals = wal_store.list_wal_ssts(..).await.unwrap();
             if wals.len() >= min_count {
                 return;
             }
@@ -7112,16 +7240,14 @@ mod tests {
             })
         };
 
-        let probe_table_store = TableStore::new(
-            ObjectStores::new(base_store.clone(), None),
+        let probe_wal_store = WalTableStore::new(
+            base_store.clone(),
             SsTableFormat::default(),
             path,
-            None,
             TableStoreKind::Main,
-            BlockCachePolicy::default(),
         );
         wait_for_wal_sst_count(
-            &probe_table_store,
+            &probe_wal_store,
             1,
             "W1 did not write its fence WAL in time",
         )
@@ -7146,10 +7272,7 @@ mod tests {
             2
         );
 
-        probe_table_store
-            .delete_sst(&SsTableId::Wal(1))
-            .await
-            .unwrap();
+        probe_wal_store.delete_sst(1.into()).await.unwrap();
         gated_store.head_gate.release();
 
         let err = match w1_handle.await.unwrap() {
@@ -7191,16 +7314,14 @@ mod tests {
             })
         };
 
-        let probe_table_store = TableStore::new(
-            ObjectStores::new(base_store.clone(), None),
+        let probe_wal_store = WalTableStore::new(
+            base_store.clone(),
             SsTableFormat::default(),
             path,
-            None,
             TableStoreKind::Main,
-            BlockCachePolicy::default(),
         );
         wait_for_wal_sst_count(
-            &probe_table_store,
+            &probe_wal_store,
             1,
             "W1 did not write its fence WAL in time",
         )
@@ -7214,10 +7335,7 @@ mod tests {
             .wait_for_arrivals(head_arrivals_before + 1)
             .await;
 
-        probe_table_store
-            .delete_sst(&SsTableId::Wal(1))
-            .await
-            .unwrap();
+        probe_wal_store.delete_sst(1.into()).await.unwrap();
         gated_store.head_gate.release();
 
         let err = match w1_handle.await.unwrap() {
@@ -7748,7 +7866,6 @@ mod tests {
             min_filter_keys,
             l0_sst_size_bytes,
             max_wal_flushes_before_l0_flush: 4096,
-            wal_replay: crate::config::WalReplaySettings::default(),
             compactor_options,
             compression_codec: None,
             object_store_cache_options: ObjectStoreCacheOptions::default(),
@@ -8599,7 +8716,7 @@ mod tests {
         // Build a read-only TableStore sharing the same underlying object store
         // and assert that the referenced L0 SST still exists.
         let table_store = TableStore::new(
-            ObjectStores::new(object_store.clone(), None),
+            object_store.clone(),
             SsTableFormat::default(),
             path.clone(),
             None,
@@ -9753,10 +9870,23 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        // A descending scan visits the SR's SSTs back to front, so the key's
+        // versions arrive out of sequence order unless the SR iterator
+        // reassembles them across the boundary.
+        let desc_options = ScanOptions::default().with_order(IterationOrder::Descending);
+        let data_scan_desc = db
+            .scan_with_options(b"k".as_slice().., &desc_options)
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap();
         info!("data: {:?}", data);
         info!("data (scan): {:?}", data_scan.value);
         assert_eq!(data, expected);
         assert_eq!(data_scan.value, expected);
+        assert_eq!(data_scan_desc.value, expected);
     }
 
     #[cfg(feature = "wal_disable")]
@@ -9911,10 +10041,23 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        // Same key, scanned the other way: the merge operands must still be
+        // applied newest last, which requires the SR iterator to pull the
+        // key's earlier SST before emitting anything.
+        let desc_options = ScanOptions::default().with_order(IterationOrder::Descending);
+        let data_scan_desc = db
+            .scan_with_options(b"k".as_slice().., &desc_options)
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap();
         info!("data: {:?}", data);
         info!("data (scan): {:?}", data_scan.value);
         assert_eq!(data, expected);
         assert_eq!(data_scan.value, expected);
+        assert_eq!(data_scan_desc.value, expected);
     }
 
     #[tokio::test]
@@ -10866,31 +11009,33 @@ mod tests {
         recovered.close().await.unwrap();
     }
 
+    /// An acknowledged WAL holding many blocks and one value far larger than
+    /// v0.17's replay fetch target must replay on a crash-reopen, for both a
+    /// replacement writer and a reader.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn acknowledged_wal_larger_than_full_object_limit_recovers_on_reopen() {
+    async fn acknowledged_large_wal_recovers_on_crash_reopen() {
+        const LARGE_VALUE_BYTES: usize = 20 * 1024 * 1024;
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let path = "/tmp/acknowledged_oversized_wal_range_replay";
-        let mut settings = test_db_options(0, 1024 * 1024, None);
+        let path = "/tmp/acknowledged_large_wal_recovers_on_crash_reopen";
+        let mut settings = test_db_options(0, 64 * 1024 * 1024, None);
         settings.flush_interval = Some(Duration::from_millis(10));
-        settings.wal_replay = crate::config::WalReplaySettings {
-            max_concurrent_objects: 4,
-            max_inflight_bytes: 128 * 1024,
-        };
         let source = Db::builder(path, object_store.clone())
             .with_settings(settings.clone())
             .build()
             .await
             .unwrap();
-        let wal_store = crate::wal::slatedb::store::WalTableStore::new(
+        let wal_store = WalTableStore::new(
             object_store.clone(),
             SsTableFormat::default(),
             path,
             TableStoreKind::Main,
         );
+        let large_value = Bytes::from(vec![7u8; LARGE_VALUE_BYTES]);
         let mut batch = WriteBatch::new();
         for id in 0..64 {
-            batch.put(format!("oversized-{id:03}"), vec![id as u8; 2048]);
+            batch.put(format!("multi-block-{id:03}"), vec![id as u8; 2048]);
         }
+        batch.put("large-value", large_value.clone());
 
         source
             .write(batch)
@@ -10904,25 +11049,54 @@ mod tests {
             .last_flushed_wal_id;
         assert!(last_flushed_wal_id > 0);
         let listed = wal_store
-            .list_wal_ssts_for_replay(1..last_flushed_wal_id + 1)
+            .list_wal_ssts(..=crate::wal::slatedb::store::WalFileId::from(last_flushed_wal_id))
             .await
             .unwrap();
-        assert!(listed.iter().any(|wal| wal.metadata.size > 96 * 1024));
+        assert!(listed
+            .iter()
+            .any(|wal| wal.metadata.size > LARGE_VALUE_BYTES as u64));
 
         // Keep the source open to model a crash. The replacement writer must
         // recover the acknowledged WAL rather than relying on clean shutdown.
-        let recovered = Db::builder(path, object_store)
+        let recovered = Db::builder(path, object_store.clone())
             .with_settings(settings)
             .build()
             .await
-            .expect("replacement writer could not range-replay the oversized WAL");
+            .expect("replacement writer could not replay the large WAL");
         for id in 0..64 {
             assert_eq!(
-                recovered.get(format!("oversized-{id:03}")).await.unwrap(),
+                recovered.get(format!("multi-block-{id:03}")).await.unwrap(),
                 Some(Bytes::from(vec![id as u8; 2048]))
             );
         }
+        assert_eq!(
+            recovered.get("large-value").await.unwrap(),
+            Some(large_value.clone())
+        );
+        recovered
+            .put_with_options(
+                b"write-after-replay",
+                b"value",
+                &PutOptions::default(),
+                &WriteOptions {
+                    await_durable: false,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write after large WAL replay should succeed");
+        recovered.flush().await.unwrap();
 
+        let reader = crate::DbReader::builder(path, object_store)
+            .build()
+            .await
+            .expect("reader could not replay the large WAL");
+        assert_eq!(reader.get("large-value").await.unwrap(), Some(large_value));
+        assert_eq!(
+            reader.get("multi-block-063").await.unwrap(),
+            Some(Bytes::from(vec![63u8; 2048]))
+        );
+        reader.close().await.unwrap();
         recovered.close().await.unwrap();
         drop(source);
     }
@@ -11855,13 +12029,13 @@ mod tests {
 
         // Open both databases as readers with the shared cache
         let reader_a = DbReaderBuilder::new("/tmp/test_reader_cache_a", object_store_a)
-            .with_db_cache(shared_cache.clone())
+            .with_db_cache(shared_cache.clone(), 1)
             .build()
             .await
             .unwrap();
 
         let reader_b = DbReaderBuilder::new("/tmp/test_reader_cache_b", object_store_b)
-            .with_db_cache(shared_cache.clone())
+            .with_db_cache(shared_cache.clone(), 2)
             .build()
             .await
             .unwrap();
@@ -11944,13 +12118,13 @@ mod tests {
 
         let db_a = Db::builder("/tmp/test_shared_hybrid_a", object_store_a)
             .with_settings(test_db_options(0, 1024, None))
-            .with_db_cache(shared_cache.clone())
+            .with_db_cache(shared_cache.clone(), 1)
             .build()
             .await
             .unwrap();
         let db_b = Db::builder("/tmp/test_shared_hybrid_b", object_store_b)
             .with_settings(test_db_options(0, 1024, None))
-            .with_db_cache(shared_cache.clone())
+            .with_db_cache(shared_cache.clone(), 2)
             .build()
             .await
             .unwrap();
@@ -11975,8 +12149,9 @@ mod tests {
         // cache, these entries could never reach disk: the disk engine drops
         // post-close writes and the final close below becomes a no-op.
         let mut keys = Vec::new();
+        let sst_id = SsTableId::from(ulid::Ulid::new());
         for b in 0u64..64 {
-            let k = CachedKey::from((SsTableId::Wal(u64::MAX - 2), b));
+            let k = CachedKey::from((sst_id, b));
             shared_cache.insert(k.clone(), probe_entry()).await;
             keys.push(k);
         }

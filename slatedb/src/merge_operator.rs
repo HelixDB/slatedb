@@ -316,6 +316,17 @@ pub(crate) struct MergeOperatorIterator<T: RowEntryIterator> {
     resolve_missing_base: bool,
 }
 
+/// How a run of one key's merge operands ended.
+enum OperandRunEnd {
+    /// A value or tombstone: the run's base.
+    Base(RowEntry),
+    /// The key had no entries left in the input.
+    KeyExhausted,
+    /// An older entry of the same key has another expiry. The key's history
+    /// continues past this run and may still hold operands or a base.
+    ExpiryBoundary,
+}
+
 /// Tracks metadata across multiple entries during merge operations.
 ///
 /// When merging entries for the same key, we need to aggregate metadata from all
@@ -456,14 +467,19 @@ impl<T: RowEntryIterator> MergeOperatorIterator<T> {
         let mut next = Some(first_entry);
 
         // this loop returns the "base value" (non merge operand) if it exists
-        let base = loop {
+        let run_end = loop {
             if let Some(entry) = next {
                 if !self.is_matching_entry(&entry, &key, first_expire_ts) {
+                    let run_end = if entry.key == key {
+                        OperandRunEnd::ExpiryBoundary
+                    } else {
+                        OperandRunEnd::KeyExhausted
+                    };
                     self.buffered_entry = Some(entry);
-                    break None;
+                    break run_end;
                 } else if !matches!(entry.value, ValueDeletable::Merge(_)) {
                     // found a Value or Tombstone, this is the base value
-                    break Some(entry);
+                    break OperandRunEnd::Base(entry);
                 } else {
                     batch.push(entry);
                 }
@@ -477,7 +493,7 @@ impl<T: RowEntryIterator> MergeOperatorIterator<T> {
                 // Keep cached operand scans cooperative.
                 tokio::task::coop::consume_budget().await;
             } else {
-                break None;
+                break OperandRunEnd::KeyExhausted;
             }
         };
 
@@ -486,9 +502,18 @@ impl<T: RowEntryIterator> MergeOperatorIterator<T> {
             results.push(self.process_batch(&key, &mut batch, &mut merge_tracker)?);
         }
 
+        // A missing base is authoritative only once the key's history is
+        // exhausted: past an expiry boundary, older entries remain.
+        let base_is_resolved = match run_end {
+            OperandRunEnd::Base(_) => true,
+            OperandRunEnd::KeyExhausted => self.resolve_missing_base,
+            OperandRunEnd::ExpiryBoundary => false,
+        };
+        let base = match run_end {
+            OperandRunEnd::Base(entry) => Some(entry),
+            OperandRunEnd::KeyExhausted | OperandRunEnd::ExpiryBoundary => None,
+        };
         let base_value = base.as_ref().and_then(|b| b.value.as_bytes());
-        let found_base = base.is_some();
-        let base_is_resolved = found_base || self.resolve_missing_base;
 
         // Fold the base entry's metadata into the tracker so that its
         // create_ts and expire_ts are reflected in the merged result.
@@ -859,6 +884,35 @@ mod tests {
         .with_resolved_missing_base();
 
         assert_iterator(&mut iterator, vec![RowEntry::new_tombstone(b"key", 2)]).await;
+    }
+
+    /// A terminal run resolves a key only once its history is exhausted. An
+    /// older operand with another expiry keeps the newer run an unresolved
+    /// merge, so reads still merge it onto the older operand.
+    #[tokio::test]
+    async fn expiry_boundary_keeps_the_newer_run_unresolved() {
+        let mut iterator = MergeOperatorIterator::<MockRowEntryIterator>::new(
+            Arc::new(MockMergeOperator {}),
+            vec![
+                RowEntry::new_merge(b"key", b"b", 2).with_expire_ts(200),
+                RowEntry::new_merge(b"key", b"a", 1).with_expire_ts(100),
+                RowEntry::new_merge(b"other", b"c", 3),
+            ]
+            .into(),
+            false,
+            None,
+        )
+        .with_resolved_missing_base();
+
+        assert_iterator(
+            &mut iterator,
+            vec![
+                RowEntry::new_merge(b"key", b"b", 2).with_expire_ts(200),
+                RowEntry::new_value(b"key", b"a", 1).with_expire_ts(100),
+                RowEntry::new_value(b"other", b"c", 3),
+            ],
+        )
+        .await;
     }
 
     #[tokio::test]

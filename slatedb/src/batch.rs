@@ -263,7 +263,6 @@ pub struct WriteBatch {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum MergeConflictKind {
-    Commutative,
     Disjoint(DisjointMergeDiscriminators),
 }
 
@@ -377,8 +376,8 @@ impl WriteBatch {
 
         assert!(!key.is_empty(), "key cannot be empty");
         assert!(
-            key.len() <= u16::MAX as usize,
-            "key size must be <= u16::MAX"
+            key.len() <= u32::MAX as usize,
+            "key size must be <= u32::MAX"
         );
         assert!(
             value.len() <= u32::MAX as usize,
@@ -390,7 +389,7 @@ impl WriteBatch {
     ///
     /// # Panics
     /// - if the key is empty
-    /// - if the key size is larger than u16::MAX
+    /// - if the key size is larger than u32::MAX
     /// - if the value size is larger than u32::MAX
     pub fn put<K, V>(&mut self, key: K, value: V)
     where
@@ -404,7 +403,7 @@ impl WriteBatch {
     ///
     /// # Panics
     /// - if the key is empty
-    /// - if the key size is larger than u16::MAX
+    /// - if the key size is larger than u32::MAX
     /// - if the value size is larger than u32::MAX
     pub fn put_with_options<K, V>(&mut self, key: K, value: V, options: &PutOptions)
     where
@@ -427,7 +426,7 @@ impl WriteBatch {
     ///
     /// # Panics
     /// - if the key is empty
-    /// - if the key size is larger than u16::MAX
+    /// - if the key size is larger than u32::MAX
     /// - if the value size is larger than u32::MAX
     pub fn put_bytes(&mut self, key: Bytes, value: Bytes) {
         self.put_bytes_with_options(key, value, &PutOptions::default())
@@ -438,7 +437,7 @@ impl WriteBatch {
     ///
     /// # Panics
     /// - if the key is empty
-    /// - if the key size is larger than u16::MAX
+    /// - if the key size is larger than u32::MAX
     /// - if the value size is larger than u32::MAX
     pub fn put_bytes_with_options(&mut self, key: Bytes, value: Bytes, options: &PutOptions) {
         self.assert_kv(&key, &value);
@@ -471,24 +470,6 @@ impl WriteBatch {
         V: AsRef<[u8]>,
     {
         self.merge_with_conflict_kind(key, value, options, None);
-    }
-
-    /// Merge a key-value pair whose operands are commutative.
-    ///
-    /// This remains crate-private because compatibility affects transaction
-    /// conflict detection, while public non-transactional batches do not run
-    /// write/write conflict checks.
-    pub(crate) fn merge_commutative<K, V>(&mut self, key: K, value: V)
-    where
-        K: AsRef<[u8]>,
-        V: AsRef<[u8]>,
-    {
-        self.merge_with_conflict_kind(
-            key,
-            value,
-            &MergeOptions::default(),
-            Some(MergeConflictKind::Commutative),
-        );
     }
 
     pub(crate) fn merge_disjoint<K, V, D, I>(&mut self, key: K, value: V, discriminators: I)
@@ -557,9 +538,6 @@ impl WriteBatch {
             .and_then(|keys| keys.keys.remove(&key));
         let combined_kind = match (is_first_operation, existing_kind, conflict_kind) {
             (true, _, conflict_kind) => conflict_kind,
-            (false, Some(MergeConflictKind::Commutative), Some(MergeConflictKind::Commutative)) => {
-                Some(MergeConflictKind::Commutative)
-            }
             (
                 false,
                 Some(MergeConflictKind::Disjoint(mut existing)),
@@ -634,14 +612,6 @@ impl WriteBatch {
         self.compatible_merge_keys
             .as_ref()
             .and_then(|keys| keys.keys.get(key))
-    }
-
-    #[cfg(test)]
-    fn is_commutative_merge_key(&self, key: &[u8]) -> bool {
-        matches!(
-            self.merge_conflict_kind(key),
-            Some(MergeConflictKind::Commutative)
-        )
     }
 
     fn remove_compatible_merge_key(&mut self, key: &[u8]) {
@@ -883,18 +853,6 @@ mod tests {
         value: None,
         options: PutOptions::default(),
     }])]
-    #[should_panic(expected = "key size must be <= u16::MAX")]
-    #[case(vec![WriteOpTestCase {
-        key: vec![b'k'; 65_536], // 2^16
-        value: None,
-        options: PutOptions::default(),
-    }])]
-    #[should_panic(expected = "value size must be <= u32::MAX")]
-    #[case(vec![WriteOpTestCase {
-        key: b"key".to_vec(),
-        value: Some(vec![b'x'; u32::MAX as usize + 1]), // 2^32
-        options: PutOptions::default(),
-    }])]
     #[should_panic(expected = "key cannot be empty")]
     #[case(vec![WriteOpTestCase {
         key: b"".to_vec(),
@@ -930,6 +888,61 @@ mod tests {
             }
         }
         assert_eq!(batch.ops, expected_ops);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn test_accepts_u32_max_key_and_value_sizes() {
+        let bytes = vec![0; u32::MAX as usize];
+        WriteBatch::new().assert_kv(&bytes, &bytes);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    #[should_panic(expected = "key size must be <= u32::MAX")]
+    fn test_put_rejects_key_larger_than_u32_max() {
+        // Keep this separate from test_put_delete_batch: put_with_options copies
+        // the key before validation. put_bytes rejects the owned, zero-filled
+        // buffer without copying 4 GiB.
+        let key = Bytes::from(vec![0; u32::MAX as usize + 1]);
+        WriteBatch::new().put_bytes(key, Bytes::from_static(b"value"));
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    #[should_panic(expected = "value size must be <= u32::MAX")]
+    fn test_put_rejects_value_larger_than_u32_max() {
+        // Keep this separate from test_put_delete_batch: put_with_options copies
+        // the value before validation. put_bytes rejects the owned, zero-filled
+        // buffer without copying 4 GiB.
+        let value = Bytes::from(vec![0; u32::MAX as usize + 1]);
+        WriteBatch::new().put_bytes(Bytes::from_static(b"key"), value);
+    }
+
+    #[rstest]
+    #[case(u16::MAX as usize)]
+    #[case(u16::MAX as usize + 1)]
+    #[case(1024 * 1024)]
+    fn test_large_key_batch_operations(#[case] key_size: usize) {
+        let key = vec![b'k'; key_size];
+        let value = Bytes::from_static(b"value");
+        let mut batch = WriteBatch::new();
+
+        batch.put(&key, &value);
+        assert_eq!(
+            only_op(&batch, &key),
+            &WriteOp::Put(value.clone(), PutOptions::default())
+        );
+
+        batch.delete(&key);
+        assert_eq!(only_op(&batch, &key), &WriteOp::Delete);
+
+        let mut batch = WriteBatch::new();
+        batch.merge(&key, &value);
+        assert_eq!(
+            only_op(&batch, &key),
+            &WriteOp::Merge(value, MergeOptions::default())
+        );
     }
 
     #[test]
@@ -1195,59 +1208,17 @@ mod tests {
     }
 
     #[test]
-    fn commutative_merge_classification_requires_only_commutative_operations() {
-        let mut only_commutative = WriteBatch::new();
-        only_commutative.merge_commutative(b"key", b"first");
-        only_commutative.merge_commutative(b"key", b"second");
-        assert!(only_commutative.is_commutative_merge_key(b"key"));
-        assert!(only_commutative.compatible_merge_keys.is_some());
-
-        let mut commutative_then_ordinary = WriteBatch::new();
-        commutative_then_ordinary.merge_commutative(b"key", b"first");
-        commutative_then_ordinary.merge(b"key", b"second");
-        assert!(!commutative_then_ordinary.is_commutative_merge_key(b"key"));
-        assert!(commutative_then_ordinary.compatible_merge_keys.is_none());
-
-        let mut ordinary_then_commutative = WriteBatch::new();
-        ordinary_then_commutative.merge(b"key", b"first");
-        ordinary_then_commutative.merge_commutative(b"key", b"second");
-        assert!(!ordinary_then_commutative.is_commutative_merge_key(b"key"));
-    }
-
-    #[test]
-    fn put_and_delete_make_commutative_merge_keys_exclusive() {
-        let mut put_after_merge = WriteBatch::new();
-        put_after_merge.merge_commutative(b"key", b"merge");
-        put_after_merge.put(b"key", b"put");
-        assert!(!put_after_merge.is_commutative_merge_key(b"key"));
-
-        let mut merge_after_put = WriteBatch::new();
-        merge_after_put.put(b"key", b"put");
-        merge_after_put.merge_commutative(b"key", b"merge");
-        assert!(!merge_after_put.is_commutative_merge_key(b"key"));
-
-        let mut delete_after_merge = WriteBatch::new();
-        delete_after_merge.merge_commutative(b"key", b"merge");
-        delete_after_merge.delete(b"key");
-        assert!(!delete_after_merge.is_commutative_merge_key(b"key"));
-
-        let mut merge_after_delete = WriteBatch::new();
-        merge_after_delete.delete(b"key");
-        merge_after_delete.merge_commutative(b"key", b"merge");
-        assert!(!merge_after_delete.is_commutative_merge_key(b"key"));
-    }
-
-    #[test]
-    fn commutative_merge_metadata_does_not_change_write_operations() {
+    fn disjoint_merge_metadata_does_not_change_write_operations() {
+        // Disjoint merges never expire, so compare against a non-expiring merge.
         let mut ordinary = WriteBatch::new();
-        ordinary.merge(b"key", b"operand");
+        ordinary.merge_with_options(b"key", b"operand", &MergeOptions { ttl: Ttl::NoExpiry });
 
-        let mut commutative = WriteBatch::new();
-        commutative.merge_commutative(b"key", b"operand");
+        let mut disjoint = WriteBatch::new();
+        disjoint.merge_disjoint(b"key", b"operand", [Bytes::from_static(b"member")]);
 
-        assert_eq!(ordinary.ops, commutative.ops);
-        assert!(!ordinary.is_commutative_merge_key(b"key"));
-        assert!(commutative.is_commutative_merge_key(b"key"));
+        assert_eq!(ordinary.ops, disjoint.ops);
+        assert_eq!(ordinary.merge_conflict_kind(b"key"), None);
+        assert!(disjoint.merge_conflict_kind(b"key").is_some());
     }
 
     #[test]
@@ -1332,16 +1303,6 @@ mod tests {
         ordinary_then_disjoint.merge(b"key", b"first");
         ordinary_then_disjoint.merge_disjoint(b"key", b"second", discriminator());
         assert_eq!(ordinary_then_disjoint.merge_conflict_kind(b"key"), None);
-
-        let mut disjoint_then_commutative = WriteBatch::new();
-        disjoint_then_commutative.merge_disjoint(b"key", b"first", discriminator());
-        disjoint_then_commutative.merge_commutative(b"key", b"second");
-        assert_eq!(disjoint_then_commutative.merge_conflict_kind(b"key"), None);
-
-        let mut commutative_then_disjoint = WriteBatch::new();
-        commutative_then_disjoint.merge_commutative(b"key", b"first");
-        commutative_then_disjoint.merge_disjoint(b"key", b"second", discriminator());
-        assert_eq!(commutative_then_disjoint.merge_conflict_kind(b"key"), None);
     }
 
     #[test]

@@ -9,7 +9,6 @@ license.workspace = true
 homepage.workspace = true
 
 [dependencies]
-ahash = { workspace = true }
 async-channel = { workspace = true }
 async-trait = { workspace = true }
 atomic = { workspace = true }
@@ -146,6 +145,7 @@ harness = false
 [[bench]]
 name = "scan_prefix_bench"
 harness = false
+required-features = ["foyer"]
 
 [[bench]]
 name = "scan_prefix_large_sorted_run_bench"
@@ -177,3 +177,7 @@ required-features = ["test-util"]
 
 [lints]
 workspace = true
+
+[[test]]
+name = "foyer_cache_flush"
+required-features = ["foyer"]

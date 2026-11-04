@@ -43,15 +43,6 @@ pub(crate) enum SlateDBError {
         path: Option<Path>,
     },
 
-    #[error(
-        "WAL replay memory limit exceeded: {kind} requires {required_bytes} bytes, limit is {limit_bytes} bytes"
-    )]
-    WalReplayMemoryLimitExceeded {
-        kind: &'static str,
-        required_bytes: usize,
-        limit_bytes: usize,
-    },
-
     #[error("empty RowEntry key")]
     EmptyKey,
 
@@ -243,6 +234,9 @@ pub(crate) enum SlateDBError {
     #[error("cannot seek to a key less than the last returned key")]
     SeekKeyLessThanLastReturnedKey,
 
+    #[error("seek is not supported for descending scans")]
+    SeekNotSupportedForDescendingScan,
+
     #[error(
         "parent path must be different from the clone's path. parent_path=`{0}`, clone_path=`{0}`"
     )]
@@ -270,7 +264,6 @@ pub(crate) enum SlateDBError {
     InvalidManifestPollInterval(Duration),
 
     #[error("invalid WAL poll interval. interval=`{0:?}`")]
-    #[allow(dead_code)]
     InvalidWalPollInterval(Duration),
 
     #[error("checkpoint lifetime must be at least double the manifest poll interval. lifetime=`{lifetime:?}`, interval=`{interval:?}`")]
@@ -278,9 +271,6 @@ pub(crate) enum SlateDBError {
         lifetime: Duration,
         interval: Duration,
     },
-
-    #[error("invalid sst batch size. size=`{0}`")]
-    InvalidSSTBatchSize(usize),
 
     #[error("invalid configuration: {0}")]
     InvalidConfiguration(String),
@@ -743,7 +733,6 @@ impl From<SlateDBError> for Error {
             }
             SlateDBError::InvalidObjectStorePath(_) => Error::invalid(msg),
             SlateDBError::UnknownConfigurationFormat(_) => Error::invalid(msg),
-            SlateDBError::InvalidSSTBatchSize(_) => Error::invalid(msg),
             SlateDBError::InvalidConfiguration(_) => Error::invalid(msg),
             SlateDBError::InvalidCheckpointLifetime(_) => Error::invalid(msg),
             SlateDBError::InvalidManifestPollInterval(_)
@@ -752,6 +741,7 @@ impl From<SlateDBError> for Error {
             SlateDBError::DbReaderSnapshotUnsupportedInFollowLatest => Error::invalid(msg),
             SlateDBError::SeekKeyOutOfRange { .. } => Error::invalid(msg),
             SlateDBError::SeekKeyLessThanLastReturnedKey => Error::invalid(msg),
+            SlateDBError::SeekNotSupportedForDescendingScan => Error::invalid(msg),
             SlateDBError::IdenticalClonePaths { .. } => Error::invalid(msg),
             SlateDBError::DuplicatedCloneSourcePath(_) => Error::invalid(msg),
             SlateDBError::InvalidCloneSourceWithWal { .. } => Error::invalid(msg),
@@ -805,7 +795,6 @@ impl From<SlateDBError> for Error {
             SlateDBError::EmptyManifest => Error::data(msg),
             SlateDBError::EmptyBlock => Error::data(msg),
             SlateDBError::CorruptSst { .. } => Error::data(msg),
-            SlateDBError::WalReplayMemoryLimitExceeded { .. } => Error::data(msg),
             SlateDBError::EmptyKey => Error::data(msg),
             SlateDBError::EmptyBlockMeta => Error::data(msg),
             SlateDBError::InvalidFilterBlock => Error::data(msg),

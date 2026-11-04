@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.16.0"
+version = "0.17.0"
 edition = "2021"
 repository = "https://github.com/slatedb/slatedb"
 license = "Apache-2.0"
@@ -31,7 +31,6 @@ overflow-checks = true
 [workspace.dependencies]
 
 # dependencies
-ahash = "0.8"
 anyhow = "1.0.99"
 async-channel = "2"
 async-trait = "0.1.82"
@@ -51,7 +50,7 @@ fail-parallel = "0.6.0"
 figment = "0.10.19"
 flate2 = "1.1.2"
 flatbuffers = "25.2.10"
-foyer = "0.22.3"
+foyer = "0.22.6"
 futures = "0.3.30"
 humantime = "2.1.0"
 log = "0.4.27"
@@ -59,7 +58,7 @@ lru = "0.18"
 lz4_flex = "0.11.5"
 moka = "0.12.8"
 mixtrics = "0.2"
-object_store = "0.14.0"
+object_store = "0.14.2"
 ouroboros = "0.18"
 parking_lot = "0.12.4"
 pyo3 = "0.25.1"
@@ -71,9 +70,9 @@ serde = "1.0"
 serde_json = "1.0.142"
 siphasher = "1"
 smallvec = "1.15.1"
-slatedb = { path = "slatedb", version = "0.16.0" }
-slatedb-common = { path = "slatedb-common", version = "0.16.0" }
-slatedb-txn-obj = { path = "slatedb-txn-obj", version = "0.16.0" }
+slatedb = { path = "slatedb", version = "0.17.0" }
+slatedb-common = { path = "slatedb-common", version = "0.17.0" }
+slatedb-txn-obj = { path = "slatedb-txn-obj", version = "0.17.0" }
 snap = "1.1.1"
 sysinfo = "0.35.2"
 thiserror = "1.0.63"
@@ -86,6 +85,7 @@ thread_local = "1.1.9"
 uniffi = "0.31.0"
 ulid = "1.2.1"
 uuid = "1.18.0"
+url = "2.5.8"
 walkdir = "2.3.3"
 zstd = "0.13.2"
 

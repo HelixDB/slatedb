@@ -5,14 +5,15 @@
 //!
 //! There are currently two built-in cache implementations:
 //! - [Foyer](crate::db_cache::foyer::FoyerCache): Requires the `foyer` feature flag. (Enabled by default)
-//! - [Moka](crate::db_cache::moka::MokaCache): Requires the `moka` feature flag. (Enabled by default)
+//! - [Moka](crate::db_cache::moka::MokaCache): Requires the `moka` feature flag.
 //!
 //! ## Usage
 //!
 //! To use the cache, you need to configure the [DbOptions](crate::config::DbOptions) with the desired cache implementation.
 
 use std::ops::{Bound, RangeBounds};
-use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "foyer")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -132,19 +133,6 @@ pub struct SlateDbCacheUsageSnapshot {
     pub object_store: CacheUsageSnapshot,
 }
 
-/// Atomic counter to generate unique scope IDs for `DbCacheWrapper` instances.
-/// Scope `0` belongs exclusively to cache keys serialized before scoping was
-/// introduced, so live wrappers start at `1` and can never alias those entries.
-static NEXT_CACHE_SCOPE_ID: AtomicU64 = AtomicU64::new(1);
-
-fn next_cache_scope_id() -> u64 {
-    NEXT_CACHE_SCOPE_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            current.checked_add(1)
-        })
-        .expect("cache scope IDs exhausted")
-}
-
 /// A `FnOnce` returning a future that produces a [`CachedEntry`] on cache miss.
 ///
 /// Used by [`DbCache::fetch_block`] and friends to load an entry into the cache. The closure
@@ -152,6 +140,42 @@ fn next_cache_scope_id() -> u64 {
 /// receive the same result.
 pub type CacheLoader =
     Box<dyn FnOnce() -> BoxFuture<'static, Result<CachedEntry, crate::Error>> + Send + 'static>;
+
+/// The result of a cache lookup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CacheLookup {
+    /// The fetch loaded the entry from object storage.
+    Miss,
+    /// The cache supplied the entry, including through a concurrent fetch.
+    Hit,
+}
+
+/// A fetched entry and the result of its cache lookup.
+#[derive(Clone)]
+pub struct CacheFetch {
+    /// The entry that the fetch returned.
+    pub entry: CachedEntry,
+    /// Whether the cache supplied the entry or the fetch loaded it.
+    pub lookup: CacheLookup,
+}
+
+impl CacheFetch {
+    /// Create a result for an entry that the cache supplied.
+    pub fn hit(entry: CachedEntry) -> Self {
+        Self {
+            entry,
+            lookup: CacheLookup::Hit,
+        }
+    }
+
+    /// Create a result for an entry that the fetch loaded.
+    pub fn miss(entry: CachedEntry) -> Self {
+        Self {
+            entry,
+            lookup: CacheLookup::Miss,
+        }
+    }
+}
 
 /// A trait for slatedb's in-memory cache.
 ///
@@ -241,7 +265,7 @@ pub type CacheLoader =
 ///     let object_store = Arc::new(InMemory::new());
 ///     let cache = Arc::new(MyCache::new(128u64 * 1024 * 1024));
 ///     let db = Db::builder("/path/to/db", object_store)
-///         .with_db_cache(cache)
+///         .with_db_cache(cache, 0)
 ///         .build()
 ///         .await;
 /// }
@@ -280,7 +304,26 @@ pub trait DbCache: Send + Sync {
         Ok(())
     }
 
+    /// Move every entry for this db_cache_id from memory to disk.
+    async fn flush_scope(&self, db_cache_id: u64) -> Result<(), crate::Error> {
+        let _ = db_cache_id;
+        Ok(())
+    }
+
+    async fn flush_to_disk(&self) -> Result<(), crate::Error> {
+        Ok(())
+    }
+
     /// Fetch a data-block entry, invoking `loader` on cache miss.
+    ///
+    /// Custom implementations must report the lookup result in [`CacheFetch::lookup`].
+    /// Return [`CacheLookup::Miss`] when this fetch loads the entry from object storage.
+    /// Return [`CacheLookup::Hit`] when memory, disk, or a concurrent fetch supplies the entry.
+    /// SlateDB uses this result to mark the read's tracing span as cached.
+    /// Hit and miss counters come from the `get_*` probe that SlateDB makes
+    /// before every fetch, not from this result.
+    /// It does not track whether the supplied loader runs.
+    /// This contract also applies to [`Self::fetch_index`], [`Self::fetch_filter`], and [`Self::fetch_stats`].
     ///
     /// Implementations should deduplicate concurrent fetches: if multiple callers request the
     /// same key while it is being loaded, only one should run `loader` and the rest should
@@ -291,13 +334,13 @@ pub trait DbCache: Send + Sync {
         &self,
         key: CachedKey,
         loader: CacheLoader,
-    ) -> Result<CachedEntry, crate::Error> {
+    ) -> Result<CacheFetch, crate::Error> {
         if let Some(entry) = self.get_block(&key).await? {
-            return Ok(entry);
+            return Ok(CacheFetch::hit(entry));
         }
         let entry = loader().await?;
         self.insert(key, entry.clone()).await;
-        Ok(entry)
+        Ok(CacheFetch::miss(entry))
     }
 
     /// Fetch an index entry, invoking `loader` on cache miss. See [`Self::fetch_block`].
@@ -305,13 +348,13 @@ pub trait DbCache: Send + Sync {
         &self,
         key: CachedKey,
         loader: CacheLoader,
-    ) -> Result<CachedEntry, crate::Error> {
+    ) -> Result<CacheFetch, crate::Error> {
         if let Some(entry) = self.get_index(&key).await? {
-            return Ok(entry);
+            return Ok(CacheFetch::hit(entry));
         }
         let entry = loader().await?;
         self.insert(key, entry.clone()).await;
-        Ok(entry)
+        Ok(CacheFetch::miss(entry))
     }
 
     /// Fetch a filter entry, invoking `loader` on cache miss. See [`Self::fetch_block`].
@@ -319,13 +362,13 @@ pub trait DbCache: Send + Sync {
         &self,
         key: CachedKey,
         loader: CacheLoader,
-    ) -> Result<CachedEntry, crate::Error> {
+    ) -> Result<CacheFetch, crate::Error> {
         if let Some(entry) = self.get_filter(&key).await? {
-            return Ok(entry);
+            return Ok(CacheFetch::hit(entry));
         }
         let entry = loader().await?;
         self.insert(key, entry.clone()).await;
-        Ok(entry)
+        Ok(CacheFetch::miss(entry))
     }
 
     /// Fetch a stats entry, invoking `loader` on cache miss. See [`Self::fetch_block`].
@@ -333,13 +376,13 @@ pub trait DbCache: Send + Sync {
         &self,
         key: CachedKey,
         loader: CacheLoader,
-    ) -> Result<CachedEntry, crate::Error> {
+    ) -> Result<CacheFetch, crate::Error> {
         if let Some(entry) = self.get_stats(&key).await? {
-            return Ok(entry);
+            return Ok(CacheFetch::hit(entry));
         }
         let entry = loader().await?;
         self.insert(key, entry.clone()).await;
-        Ok(entry)
+        Ok(CacheFetch::miss(entry))
     }
 }
 
@@ -360,6 +403,16 @@ pub enum CacheTarget {
 }
 
 impl CacheTarget {
+    /// Every target: all data blocks, the index, the filters, and the stats.
+    pub fn all() -> [Self; 4] {
+        [
+            Self::data::<&[u8], _>(..),
+            Self::Index,
+            Self::Filters,
+            Self::Stats,
+        ]
+    }
+
     /// Convenience constructor for [`CacheTarget::Data`] that accepts any
     /// [`RangeBounds`], mirroring the `Db::scan` signature. Pass `..` to
     /// select all data blocks.
@@ -378,27 +431,49 @@ impl CacheTarget {
     }
 }
 
+/// A [`DbCache`] paired with the `db_cache_id` to use for it.
+///
+/// Built by [`with_db_cache`](crate::db::builder::DbBuilder::with_db_cache) to keep the
+/// cache and its id together internally, instead of passing them around as two separate,
+/// easily-mismatched fields.
+pub(crate) struct DbCacheAndScope {
+    pub cache: Arc<dyn DbCache>,
+    pub db_cache_id: u64,
+}
+
+impl DbCacheAndScope {
+    pub(crate) fn new(cache: Arc<dyn DbCache>, db_cache_id: u64) -> Self {
+        Self { cache, db_cache_id }
+    }
+}
+
 /// A key used to identify a cached entry.
 ///
 /// The key is composed of a scope ID (set per [`DbCacheWrapper`] instance), an SSTable ID,
-/// and a block ID. The fields are private to this module, so the implementation details of the
-/// cache are not exposed publicly.
+/// and a block ID. `db_cache_id` is readable through [`Self::db_cache_id`]; the other fields stay
+/// private to this module, so the SST/block layout is not exposed publicly.
 #[non_exhaustive]
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct CachedKey {
-    /// Scope identifier set per `DbCacheWrapper`. This ensures that multiple `Db` instances
-    /// sharing the same underlying cache do not collide on WAL or compacted file entries.
-    /// Scope `0` is reserved for legacy keys created before scoping existed; new wrappers
-    /// always receive unique scope IDs starting at `1`.
-    pub(crate) scope_id: u64,
+    /// Scope identifier set per `DbCacheWrapper`, so multiple `Db` instances sharing
+    /// one cache don't collide on WAL or compacted entries.
+    pub(crate) db_cache_id: u64,
     pub(crate) sst_id: SsTableId,
     pub(crate) block_id: u64,
 }
 
 impl CachedKey {
-    fn with_scope(&self, scope_id: u64) -> Self {
+    /// Returns the scope id this key belongs to.
+    ///
+    /// A [`DbCache`] implementation reads this to tell which keys belong
+    /// to the scope passed to [`DbCache::flush_scope`].
+    pub fn db_cache_id(&self) -> u64 {
+        self.db_cache_id
+    }
+
+    fn with_scope(&self, db_cache_id: u64) -> Self {
         Self {
-            scope_id,
+            db_cache_id,
             sst_id: self.sst_id,
             block_id: self.block_id,
         }
@@ -408,7 +483,7 @@ impl CachedKey {
 impl From<(SsTableId, u64)> for CachedKey {
     fn from((sst_id, block_id): (SsTableId, u64)) -> Self {
         Self {
-            scope_id: 0,
+            db_cache_id: 0,
             sst_id,
             block_id,
         }
@@ -693,15 +768,27 @@ impl DbCache for SplitCache {
         Ok(())
     }
 
+    async fn flush_scope(&self, db_cache_id: u64) -> Result<(), crate::Error> {
+        let block_result = match &self.block_cache {
+            Some(cache) => cache.flush_scope(db_cache_id).await,
+            None => Ok(()),
+        };
+        let meta_result = match &self.meta_cache {
+            Some(cache) => cache.flush_scope(db_cache_id).await,
+            None => Ok(()),
+        };
+        block_result.and(meta_result)
+    }
+
     async fn fetch_block(
         &self,
         key: CachedKey,
         loader: CacheLoader,
-    ) -> Result<CachedEntry, crate::Error> {
+    ) -> Result<CacheFetch, crate::Error> {
         if let Some(cache) = &self.block_cache {
             cache.fetch_block(key, loader).await
         } else {
-            loader().await
+            loader().await.map(CacheFetch::miss)
         }
     }
 
@@ -709,11 +796,11 @@ impl DbCache for SplitCache {
         &self,
         key: CachedKey,
         loader: CacheLoader,
-    ) -> Result<CachedEntry, crate::Error> {
+    ) -> Result<CacheFetch, crate::Error> {
         if let Some(cache) = &self.meta_cache {
             cache.fetch_index(key, loader).await
         } else {
-            loader().await
+            loader().await.map(CacheFetch::miss)
         }
     }
 
@@ -721,11 +808,11 @@ impl DbCache for SplitCache {
         &self,
         key: CachedKey,
         loader: CacheLoader,
-    ) -> Result<CachedEntry, crate::Error> {
+    ) -> Result<CacheFetch, crate::Error> {
         if let Some(cache) = &self.meta_cache {
             cache.fetch_filter(key, loader).await
         } else {
-            loader().await
+            loader().await.map(CacheFetch::miss)
         }
     }
 
@@ -733,11 +820,11 @@ impl DbCache for SplitCache {
         &self,
         key: CachedKey,
         loader: CacheLoader,
-    ) -> Result<CachedEntry, crate::Error> {
+    ) -> Result<CacheFetch, crate::Error> {
         if let Some(cache) = &self.meta_cache {
             cache.fetch_stats(key, loader).await
         } else {
-            loader().await
+            loader().await.map(CacheFetch::miss)
         }
     }
 }
@@ -754,17 +841,25 @@ impl DbCache for SplitCache {
 /// fails too counts a second error.
 ///
 /// ## Scoping
-/// When multiple `Db` instances share the same underlying cache object, this wrapper assigns a
-/// unique `scope_id` so their entries do not collide. All cache operations transparently rewrite
-/// keys to include the wrapper's `scope_id`, isolating WAL and compacted SST entries per wrapper.
+/// When multiple `Db`/`DbReader` instances share the same underlying cache object, this
+/// wrapper assigns a `db_cache_id` so their entries do not collide. All cache operations
+/// transparently rewrite keys to include the wrapper's `db_cache_id`, isolating WAL and
+/// compacted SST entries per wrapper.
+///
+/// `db_cache_id` is supplied by the caller at construction time (see [`Self::new`]),
+/// not derived by SlateDB: pass the same id across a legitimate reopen of the same
+/// logical database to recover its warm entries, and different ids for logically
+/// different databases sharing the cache.
 pub(crate) struct DbCacheWrapper {
     stats: DbCacheStats,
     system_clock: Arc<dyn SystemClock>,
     cache: Arc<dyn DbCache>,
-    /// Unique identifier applied to every key passed through this wrapper. This prevents different
-    /// `DbCacheWrapper` instances that share the same cache from clobbering each other's entries.
-    /// Legacy keys use scope `0`; new wrappers are assigned distinct, non-zero scopes.
-    scope_id: u64,
+    /// Identifier applied to every key passed through this wrapper, supplied by
+    /// the caller of [`Self::new`]. This prevents different `DbCacheWrapper`
+    /// instances backed by different logical `Db`s from clobbering each other's entries
+    /// in a cache they share. `0` is a valid choice when only one instance will ever
+    /// use this cache.
+    db_cache_id: u64,
     // Records the last time that the wrapper logged an error from the wrapped cache at error
     // level. Used to ensure we only log at error level once every ERROR_LOG_INTERVAL.
     last_err_log_time: Mutex<Option<DateTime<Utc>>>,
@@ -775,15 +870,23 @@ impl DbCacheWrapper {
         cache: Arc<dyn DbCache>,
         recorder: &MetricsRecorderHelper,
         system_clock: Arc<dyn SystemClock>,
+        db_cache_id: u64,
     ) -> Self {
         Self {
             stats: DbCacheStats::new(recorder),
             cache,
-            scope_id: next_cache_scope_id(),
+            db_cache_id,
             last_err_log_time: Mutex::new(None),
             system_clock,
         }
     }
+}
+
+/// Keeps `loader`'s storage reads in the calling query's metrics scope when
+/// the inner cache runs it on another task, as Foyer does on a miss.
+fn scoped_loader(loader: CacheLoader) -> CacheLoader {
+    let scoped = query_metrics::in_current_scope(async move { loader().await });
+    Box::new(move || Box::pin(scoped))
 }
 
 // The minimum interval between which the wrapper logs cache errors at error level. This is used to
@@ -792,7 +895,7 @@ const ERROR_LOG_INTERVAL: TimeDelta = TimeDelta::seconds(1);
 
 impl DbCacheWrapper {
     fn scoped_key(&self, key: &CachedKey) -> CachedKey {
-        key.with_scope(self.scope_id)
+        key.with_scope(self.db_cache_id)
     }
 
     fn record_hit(&self, block_type: &str) {
@@ -919,7 +1022,7 @@ impl DbCache for DbCacheWrapper {
 
     async fn insert(&self, key: CachedKey, value: CachedEntry) {
         let scoped_key = self.scoped_key(&key);
-        self.cache.insert(scoped_key, value).await
+        self.cache.insert(scoped_key, value).await;
     }
 
     #[allow(dead_code)]
@@ -940,13 +1043,17 @@ impl DbCache for DbCacheWrapper {
         self.cache.close().await
     }
 
+    async fn flush_to_disk(&self) -> Result<(), crate::Error> {
+        self.cache.flush_scope(self.db_cache_id).await
+    }
+
     async fn fetch_block(
         &self,
         key: CachedKey,
         loader: CacheLoader,
-    ) -> Result<CachedEntry, crate::Error> {
+    ) -> Result<CacheFetch, crate::Error> {
         self.cache
-            .fetch_block(self.scoped_key(&key), loader)
+            .fetch_block(self.scoped_key(&key), scoped_loader(loader))
             .await
             .inspect_err(|err| self.record_get_err("block", err))
     }
@@ -955,9 +1062,9 @@ impl DbCache for DbCacheWrapper {
         &self,
         key: CachedKey,
         loader: CacheLoader,
-    ) -> Result<CachedEntry, crate::Error> {
+    ) -> Result<CacheFetch, crate::Error> {
         self.cache
-            .fetch_index(self.scoped_key(&key), loader)
+            .fetch_index(self.scoped_key(&key), scoped_loader(loader))
             .await
             .inspect_err(|err| self.record_get_err("index", err))
     }
@@ -966,9 +1073,9 @@ impl DbCache for DbCacheWrapper {
         &self,
         key: CachedKey,
         loader: CacheLoader,
-    ) -> Result<CachedEntry, crate::Error> {
+    ) -> Result<CacheFetch, crate::Error> {
         self.cache
-            .fetch_filter(self.scoped_key(&key), loader)
+            .fetch_filter(self.scoped_key(&key), scoped_loader(loader))
             .await
             .inspect_err(|err| self.record_get_err("filter", err))
     }
@@ -977,9 +1084,9 @@ impl DbCache for DbCacheWrapper {
         &self,
         key: CachedKey,
         loader: CacheLoader,
-    ) -> Result<CachedEntry, crate::Error> {
+    ) -> Result<CacheFetch, crate::Error> {
         self.cache
-            .fetch_stats(self.scoped_key(&key), loader)
+            .fetch_stats(self.scoped_key(&key), scoped_loader(loader))
             .await
             .inspect_err(|err| self.record_get_err("stats", err))
     }
@@ -1044,11 +1151,19 @@ impl DbCache for UnownedDbCache {
         Ok(())
     }
 
+    async fn flush_scope(&self, db_cache_id: u64) -> Result<(), crate::Error> {
+        self.inner.flush_scope(db_cache_id).await
+    }
+
+    async fn flush_to_disk(&self) -> Result<(), crate::Error> {
+        self.inner.flush_to_disk().await
+    }
+
     async fn fetch_block(
         &self,
         key: CachedKey,
         loader: CacheLoader,
-    ) -> Result<CachedEntry, crate::Error> {
+    ) -> Result<CacheFetch, crate::Error> {
         self.inner.fetch_block(key, loader).await
     }
 
@@ -1056,7 +1171,7 @@ impl DbCache for UnownedDbCache {
         &self,
         key: CachedKey,
         loader: CacheLoader,
-    ) -> Result<CachedEntry, crate::Error> {
+    ) -> Result<CacheFetch, crate::Error> {
         self.inner.fetch_index(key, loader).await
     }
 
@@ -1064,7 +1179,7 @@ impl DbCache for UnownedDbCache {
         &self,
         key: CachedKey,
         loader: CacheLoader,
-    ) -> Result<CachedEntry, crate::Error> {
+    ) -> Result<CacheFetch, crate::Error> {
         self.inner.fetch_filter(key, loader).await
     }
 
@@ -1072,9 +1187,32 @@ impl DbCache for UnownedDbCache {
         &self,
         key: CachedKey,
         loader: CacheLoader,
-    ) -> Result<CachedEntry, crate::Error> {
+    ) -> Result<CacheFetch, crate::Error> {
         self.inner.fetch_stats(key, loader).await
     }
+}
+
+/// Tracks whether this caller ran the loader.
+#[cfg(feature = "foyer")]
+#[derive(Clone)]
+struct LoaderRan(Arc<AtomicBool>);
+
+#[cfg(feature = "foyer")]
+impl LoaderRan {
+    fn was_called(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(feature = "foyer")]
+fn instrumented_loader(loader: CacheLoader) -> (CacheLoader, LoaderRan) {
+    let flag = Arc::new(AtomicBool::new(false));
+    let flag_for_closure = flag.clone();
+    let wrapped: CacheLoader = Box::new(move || {
+        flag_for_closure.store(true, Ordering::Relaxed);
+        loader()
+    });
+    (wrapped, LoaderRan(flag))
 }
 
 pub mod stats {
@@ -1145,7 +1283,7 @@ pub mod stats {
 
 #[cfg(test)]
 pub(crate) mod test_utils {
-    use crate::db_cache::{CacheLoader, CachedEntry, CachedKey, DbCache};
+    use crate::db_cache::{CacheFetch, CacheLoader, CachedEntry, CachedKey, DbCache};
     use async_trait::async_trait;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1185,6 +1323,12 @@ pub(crate) mod test_utils {
         fn entry_count(&self) -> u64 {
             0
         }
+        async fn flush_scope(&self, _: u64) -> Result<(), crate::Error> {
+            Err(
+                crate::error::SlateDBError::from(Arc::new(std::io::Error::other("injected error")))
+                    .into(),
+            )
+        }
     }
 
     pub(crate) struct TestCache {
@@ -1196,6 +1340,7 @@ pub(crate) mod test_utils {
         /// When set, every `get_*` probe fails while `fetch_*` still serves,
         /// loads and inserts entries.
         failing_probes: bool,
+        spilled: Mutex<HashMap<CachedKey, CachedEntry>>,
     }
 
     impl TestCache {
@@ -1207,6 +1352,7 @@ pub(crate) mod test_utils {
                 inserts: AtomicU64::new(0),
                 fetches: AtomicU64::new(0),
                 failing_probes: false,
+                spilled: Mutex::new(HashMap::new()),
             }
         }
 
@@ -1256,14 +1402,14 @@ pub(crate) mod test_utils {
             &self,
             key: CachedKey,
             loader: CacheLoader,
-        ) -> Result<CachedEntry, crate::Error> {
+        ) -> Result<CacheFetch, crate::Error> {
             self.fetches.fetch_add(1, Ordering::Relaxed);
             if let Some(entry) = self.get(&key) {
-                return Ok(entry);
+                return Ok(CacheFetch::hit(entry));
             }
             let entry = loader().await?;
             self.insert(key, entry.clone()).await;
-            Ok(entry)
+            Ok(CacheFetch::miss(entry))
         }
 
         pub(crate) fn clear(&self) {
@@ -1281,6 +1427,10 @@ pub(crate) mod test_utils {
                 );
             }
             Ok(self.get(key))
+        }
+
+        pub(crate) fn spilled_keys(&self) -> Vec<CachedKey> {
+            self.spilled.lock().unwrap().keys().cloned().collect()
         }
     }
 
@@ -1322,7 +1472,7 @@ pub(crate) mod test_utils {
             &self,
             key: CachedKey,
             loader: CacheLoader,
-        ) -> Result<CachedEntry, crate::Error> {
+        ) -> Result<CacheFetch, crate::Error> {
             self.fetch(key, loader).await
         }
 
@@ -1330,7 +1480,7 @@ pub(crate) mod test_utils {
             &self,
             key: CachedKey,
             loader: CacheLoader,
-        ) -> Result<CachedEntry, crate::Error> {
+        ) -> Result<CacheFetch, crate::Error> {
             self.fetch(key, loader).await
         }
 
@@ -1338,7 +1488,7 @@ pub(crate) mod test_utils {
             &self,
             key: CachedKey,
             loader: CacheLoader,
-        ) -> Result<CachedEntry, crate::Error> {
+        ) -> Result<CacheFetch, crate::Error> {
             self.fetch(key, loader).await
         }
 
@@ -1346,8 +1496,24 @@ pub(crate) mod test_utils {
             &self,
             key: CachedKey,
             loader: CacheLoader,
-        ) -> Result<CachedEntry, crate::Error> {
+        ) -> Result<CacheFetch, crate::Error> {
             self.fetch(key, loader).await
+        }
+
+        async fn flush_scope(&self, db_cache_id: u64) -> Result<(), crate::Error> {
+            let mut items = self.items.lock().unwrap();
+            let matching: Vec<CachedKey> = items
+                .keys()
+                .filter(|k| k.db_cache_id == db_cache_id)
+                .cloned()
+                .collect();
+            let mut spilled = self.spilled.lock().unwrap();
+            for key in matching {
+                if let Some(value) = items.remove(&key) {
+                    spilled.insert(key, value);
+                }
+            }
+            Ok(())
         }
     }
 }
@@ -1356,7 +1522,8 @@ pub(crate) mod test_utils {
 mod tests {
 
     use crate::db_cache::{
-        CacheUsageSnapshot, CachedEntry, CachedKey, DbCache, DbCacheWrapper, SplitCache,
+        CacheFetch, CacheLoader, CacheLookup, CacheUsageSnapshot, CachedEntry, CachedKey, DbCache,
+        DbCacheWrapper, SplitCache,
     };
     use crate::db_state::SsTableId;
     use crate::filter_policy::{BloomFilterPolicy, FilterPolicy, NamedFilter};
@@ -1365,6 +1532,12 @@ mod tests {
 
     use crate::flatbuffer_types::test_utils::assert_index_clamped;
 
+    #[cfg(feature = "foyer")]
+    use super::foyer::FoyerCache;
+    #[cfg(feature = "foyer")]
+    use super::foyer_hybrid::FoyerHybridCache;
+    #[cfg(feature = "moka")]
+    use super::moka::MokaCache;
     use crate::db_cache::test_utils::TestCache;
 
     #[test]
@@ -1421,6 +1594,8 @@ mod tests {
     use crate::format::sst::{EncodedSsTable, SsTableFormat};
     use crate::test_utils::build_test_sst;
     use crate::types::{RowEntry, ValueDeletable};
+    #[cfg(feature = "foyer")]
+    use foyer::HybridCacheBuilder;
     use rstest::{fixture, rstest};
     use slatedb_common::metrics::{
         lookup_metric_with_labels, DefaultMetricsRecorder, MetricLevel, MetricsRecorderHelper,
@@ -1428,7 +1603,228 @@ mod tests {
     use std::sync::Arc;
     use ulid::Ulid;
 
-    const SST_ID: SsTableId = SsTableId::Compacted(Ulid::from_parts(0u64, 0u128));
+    const SST_ID: SsTableId = SsTableId::new(Ulid::from_parts(0u64, 0u128));
+
+    #[tokio::test]
+    async fn test_wrapper_passes_fetch_lookup_through_without_counting() {
+        struct ReportedLookupCache {
+            lookup: CacheLookup,
+            entry: CachedEntry,
+        }
+
+        #[async_trait::async_trait]
+        impl DbCache for ReportedLookupCache {
+            async fn get_block(&self, _: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
+                panic!("The wrapper must call fetch_block.");
+            }
+            async fn get_index(&self, _: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
+                panic!("The wrapper must call fetch_index.");
+            }
+            async fn get_filter(&self, _: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
+                panic!("The wrapper must call fetch_filter.");
+            }
+            async fn get_stats(&self, _: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
+                panic!("The wrapper must call fetch_stats.");
+            }
+            async fn insert(&self, _: CachedKey, _: CachedEntry) {}
+            async fn remove(&self, _: &CachedKey) {}
+            fn entry_count(&self) -> u64 {
+                0
+            }
+            async fn fetch_block(
+                &self,
+                _: CachedKey,
+                _: CacheLoader,
+            ) -> Result<CacheFetch, crate::Error> {
+                Ok(CacheFetch {
+                    entry: self.entry.clone(),
+                    lookup: self.lookup,
+                })
+            }
+            async fn fetch_index(
+                &self,
+                key: CachedKey,
+                loader: CacheLoader,
+            ) -> Result<CacheFetch, crate::Error> {
+                self.fetch_block(key, loader).await
+            }
+            async fn fetch_filter(
+                &self,
+                key: CachedKey,
+                loader: CacheLoader,
+            ) -> Result<CacheFetch, crate::Error> {
+                self.fetch_block(key, loader).await
+            }
+            async fn fetch_stats(
+                &self,
+                key: CachedKey,
+                loader: CacheLoader,
+            ) -> Result<CacheFetch, crate::Error> {
+                self.fetch_block(key, loader).await
+            }
+        }
+
+        for lookup in [CacheLookup::Miss, CacheLookup::Hit] {
+            for method in ["data_block", "index", "filter", "stats"] {
+                let recorder = Arc::new(DefaultMetricsRecorder::new());
+                let helper = MetricsRecorderHelper::new(recorder.clone(), MetricLevel::default());
+                let mut builder = BlockBuilder::new_latest(4096);
+                assert!(builder
+                    .add(RowEntry::new_value(b"key", b"value", 0))
+                    .unwrap());
+                let block = Arc::new(builder.build().unwrap());
+                let cache = DbCacheWrapper::new(
+                    Arc::new(ReportedLookupCache {
+                        lookup,
+                        entry: CachedEntry::with_block(block.clone()),
+                    }),
+                    &helper,
+                    Arc::new(DefaultSystemClock::default()),
+                    1,
+                );
+                let key = CachedKey::from((SST_ID, 0));
+                let loader: CacheLoader =
+                    Box::new(|| panic!("This cache supplies its own result."));
+                let fetch = match method {
+                    "data_block" => cache.fetch_block(key, loader).await,
+                    "index" => cache.fetch_index(key, loader).await,
+                    "filter" => cache.fetch_filter(key, loader).await,
+                    "stats" => cache.fetch_stats(key, loader).await,
+                    _ => unreachable!(),
+                }
+                .unwrap();
+                assert_eq!(fetch.lookup, lookup);
+                assert!(Arc::ptr_eq(&fetch.entry.block().unwrap(), &block));
+                // The `get_*` probe that precedes every fetch already counted
+                // this access, so the fetch itself records nothing.
+                for entry_kind in ["data_block", "index", "filter", "stats"] {
+                    for result in ["hit", "miss"] {
+                        assert_eq!(
+                            lookup_metric_with_labels(
+                                &recorder,
+                                super::stats::ACCESS_COUNT,
+                                &[("entry_kind", entry_kind), ("result", result)],
+                            ),
+                            Some(0),
+                            "method={method}, lookup={lookup:?}, entry_kind={entry_kind}, result={result}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[rstest]
+    #[case::test_cache(Arc::new(TestCache::new()), true)]
+    #[case::split_cache(Arc::new(SplitCache::new()), false)]
+    #[case::split_cache_with_delegates(
+        Arc::new(
+            SplitCache::new()
+                .with_block_cache(Some(Arc::new(TestCache::new())))
+                .with_meta_cache(Some(Arc::new(TestCache::new())))
+        ),
+        true
+    )]
+    #[cfg_attr(feature = "foyer", case::foyer(Arc::new(FoyerCache::new()), true))]
+    #[cfg_attr(
+        feature = "foyer",
+        case::foyer_hybrid(
+            Arc::new(FoyerHybridCache::new_with_cache(
+                HybridCacheBuilder::new()
+                    .memory(1024 * 1024)
+                    .with_weighter(|_, v: &CachedEntry| v.size())
+                    .storage()
+                    .build()
+                    .await
+                    .unwrap()
+            )),
+            true
+        )
+    )]
+    #[cfg_attr(feature = "moka", case::moka(Arc::new(MokaCache::new()), true))]
+    #[tokio::test]
+    async fn test_fetch_lookup_outcomes(
+        #[case] cache: Arc<dyn DbCache>,
+        #[case] retains_entries: bool,
+    ) {
+        for (offset, method) in ["data_block", "index", "filter", "stats"]
+            .into_iter()
+            .enumerate()
+        {
+            let key = CachedKey::from((SST_ID, offset as u64));
+            let mut builder = BlockBuilder::new_latest(4096);
+            assert!(builder
+                .add(RowEntry::new_value(b"key", b"value", 0))
+                .unwrap());
+            let block = Arc::new(builder.build().unwrap());
+            for attempt in 0..2 {
+                let entry = CachedEntry::with_block(block.clone());
+                let loader: CacheLoader = Box::new(move || Box::pin(async move { Ok(entry) }));
+                let fetch = match method {
+                    "data_block" => cache.fetch_block(key.clone(), loader).await,
+                    "index" => cache.fetch_index(key.clone(), loader).await,
+                    "filter" => cache.fetch_filter(key.clone(), loader).await,
+                    "stats" => cache.fetch_stats(key.clone(), loader).await,
+                    _ => unreachable!(),
+                }
+                .unwrap();
+                assert_eq!(
+                    fetch.lookup,
+                    if attempt == 0 || !retains_entries {
+                        CacheLookup::Miss
+                    } else {
+                        CacheLookup::Hit
+                    }
+                );
+                assert_eq!(fetch.entry.block().unwrap().size(), block.size());
+            }
+        }
+    }
+
+    #[cfg(feature = "foyer")]
+    #[tokio::test]
+    async fn test_concurrent_fetch_lookup() {
+        let cache = FoyerCache::new();
+        let key = CachedKey::from((SST_ID, 0));
+        let loader_started = Arc::new(tokio::sync::Notify::new());
+        let release_loader = Arc::new(tokio::sync::Notify::new());
+        let loader: CacheLoader = {
+            let loader_started = loader_started.clone();
+            let release_loader = release_loader.clone();
+            Box::new(move || {
+                Box::pin(async move {
+                    loader_started.notify_one();
+                    release_loader.notified().await;
+                    let mut builder = BlockBuilder::new_latest(4096);
+                    assert!(builder
+                        .add(RowEntry::new_value(b"key", b"value", 0))
+                        .unwrap());
+                    Ok(CachedEntry::with_block(Arc::new(builder.build().unwrap())))
+                })
+            })
+        };
+        let first = cache.fetch_block(key.clone(), loader);
+        tokio::pin!(first);
+        assert!(futures::poll!(&mut first).is_pending());
+        loader_started.notified().await;
+
+        let second = cache.fetch_block(
+            key,
+            Box::new(|| panic!("The concurrent fetch must share the first loader.")),
+        );
+        tokio::pin!(second);
+        assert!(futures::poll!(&mut second).is_pending());
+        release_loader.notify_one();
+
+        let first = first.await.unwrap();
+        let second = second.await.unwrap();
+        assert_eq!(first.lookup, CacheLookup::Miss);
+        assert_eq!(second.lookup, CacheLookup::Hit);
+        assert!(Arc::ptr_eq(
+            &first.entry.block().unwrap(),
+            &second.entry.block().unwrap()
+        ));
+    }
 
     #[rstest]
     #[tokio::test]
@@ -1770,12 +2166,14 @@ mod tests {
             .fetch_block(key.clone(), loader)
             .await
             .unwrap()
+            .entry
             .block()
             .unwrap();
         let cached = cache
             .fetch_block(key.clone(), failing())
             .await
             .unwrap()
+            .entry
             .block()
             .unwrap();
         // and: a fetch whose loader fails
@@ -1808,6 +2206,7 @@ mod tests {
             failing_cache,
             &helper,
             Arc::new(DefaultSystemClock::default()),
+            1,
         );
         let key = CachedKey::from((SST_ID, 12345u64));
 
@@ -1830,17 +2229,10 @@ mod tests {
         let recorder_b = MetricsRecorderHelper::noop();
         let system_clock = Arc::new(DefaultSystemClock::default());
         let shared_cache: Arc<dyn DbCache> = Arc::new(TestCache::new());
-        let cache_a = DbCacheWrapper::new(shared_cache.clone(), &recorder_a, system_clock.clone());
-        let cache_b = DbCacheWrapper::new(shared_cache.clone(), &recorder_b, system_clock);
-        assert_ne!(
-            cache_a.scope_id, 0,
-            "live wrappers must not use legacy scope 0"
-        );
-        assert_ne!(
-            cache_b.scope_id, 0,
-            "live wrappers must not use legacy scope 0"
-        );
-        assert_ne!(cache_a.scope_id, cache_b.scope_id);
+        let cache_a =
+            DbCacheWrapper::new(shared_cache.clone(), &recorder_a, system_clock.clone(), 1);
+        let cache_b = DbCacheWrapper::new(shared_cache.clone(), &recorder_b, system_clock, 2);
+        assert_ne!(cache_a.db_cache_id, cache_b.db_cache_id);
 
         let policy = BloomFilterPolicy::new(1);
         let mut builder = policy.builder();
@@ -1881,8 +2273,9 @@ mod tests {
         let recorder_b = MetricsRecorderHelper::noop();
         let system_clock = Arc::new(DefaultSystemClock::default());
         let shared_cache: Arc<dyn DbCache> = Arc::new(TestCache::new());
-        let cache_a = DbCacheWrapper::new(shared_cache.clone(), &recorder_a, system_clock.clone());
-        let cache_b = DbCacheWrapper::new(shared_cache.clone(), &recorder_b, system_clock);
+        let cache_a =
+            DbCacheWrapper::new(shared_cache.clone(), &recorder_a, system_clock.clone(), 1);
+        let cache_b = DbCacheWrapper::new(shared_cache.clone(), &recorder_b, system_clock, 2);
 
         let sst = build_test_sst(&SsTableFormat::default(), 1).await;
         let index = Arc::new(sst.index);
@@ -1908,8 +2301,9 @@ mod tests {
         let recorder_b = MetricsRecorderHelper::noop();
         let system_clock = Arc::new(DefaultSystemClock::default());
         let shared_cache: Arc<dyn DbCache> = Arc::new(TestCache::new());
-        let cache_a = DbCacheWrapper::new(shared_cache.clone(), &recorder_a, system_clock.clone());
-        let cache_b = DbCacheWrapper::new(shared_cache.clone(), &recorder_b, system_clock);
+        let cache_a =
+            DbCacheWrapper::new(shared_cache.clone(), &recorder_a, system_clock.clone(), 1);
+        let cache_b = DbCacheWrapper::new(shared_cache.clone(), &recorder_b, system_clock, 2);
 
         let mut builder = BlockBuilder::new_latest(4096);
         assert!(builder.add(RowEntry::new_value(b"k1", b"v1", 0)).unwrap());
@@ -1930,6 +2324,92 @@ mod tests {
         assert_eq!(2, shared_cache.entry_count());
     }
 
+    #[tokio::test]
+    async fn test_cache_wrapper_flush_scope_only_affects_its_own_scope() {
+        let recorder_a = MetricsRecorderHelper::noop();
+        let recorder_b = MetricsRecorderHelper::noop();
+        let system_clock = Arc::new(DefaultSystemClock::default());
+        let shared_cache = Arc::new(TestCache::new());
+        let cache_a =
+            DbCacheWrapper::new(shared_cache.clone(), &recorder_a, system_clock.clone(), 1);
+        let cache_b = DbCacheWrapper::new(shared_cache.clone(), &recorder_b, system_clock, 2);
+
+        let mut builder = BlockBuilder::new_latest(4096);
+        assert!(builder.add(RowEntry::new_value(b"k1", b"v1", 0)).unwrap());
+        let block = Arc::new(builder.build().unwrap());
+        let key = CachedKey::from((SST_ID, 4u64));
+
+        cache_a
+            .insert(key.clone(), CachedEntry::with_block(block.clone()))
+            .await;
+        cache_b
+            .insert(key.clone(), CachedEntry::with_block(block))
+            .await;
+        assert_eq!(2, shared_cache.entry_count());
+
+        cache_a.flush_to_disk().await.unwrap();
+
+        assert!(cache_a.get_block(&key).await.unwrap().is_none());
+        assert!(cache_b.get_block(&key).await.unwrap().is_some());
+        assert_eq!(1, shared_cache.entry_count());
+        assert_eq!(1, shared_cache.spilled_keys().len());
+    }
+
+    #[tokio::test]
+    async fn test_split_cache_flush_scope_attempts_meta_cache_despite_block_cache_error() {
+        let meta = Arc::new(TestCache::new());
+        let split = SplitCache::new()
+            .with_block_cache(Some(Arc::new(super::test_utils::FailingCache)))
+            .with_meta_cache(Some(meta.clone()))
+            .build();
+        let key = CachedKey::from((SST_ID, 6u64));
+        meta.insert(
+            key.clone(),
+            CachedEntry::with_sst_stats(Arc::new(crate::sst_stats::SstStats::default())),
+        )
+        .await;
+
+        let result = split.flush_scope(0).await;
+
+        assert!(result.is_err(), "block cache's error should surface");
+        assert!(
+            meta.spilled_keys().contains(&key),
+            "meta cache's flush should still run despite the block cache's error"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_wrapper_recovers_same_scope_for_same_db_cache_id() {
+        let recorder_1 = MetricsRecorderHelper::noop();
+        let recorder_2 = MetricsRecorderHelper::noop();
+        let system_clock = Arc::new(DefaultSystemClock::default());
+        let shared_cache: Arc<dyn DbCache> = Arc::new(TestCache::new());
+
+        // given: a wrapper (simulating a `Db` reopen passed the same caller-supplied
+        // db_cache_id) populates an entry...
+        let first_open =
+            DbCacheWrapper::new(shared_cache.clone(), &recorder_1, system_clock.clone(), 1);
+        let key = CachedKey::from((SST_ID, 5u64));
+        let mut builder = BlockBuilder::new_latest(4096);
+        assert!(builder.add(RowEntry::new_value(b"k1", b"v1", 0)).unwrap());
+        let block = Arc::new(builder.build().unwrap());
+        first_open
+            .insert(key.clone(), CachedEntry::with_block(block))
+            .await;
+        drop(first_open); // simulates `Db::close()`
+
+        // when: a brand-new wrapper is constructed with the *same* db_cache_id...
+        let reopened = DbCacheWrapper::new(shared_cache, &recorder_2, system_clock, 1);
+
+        // then: it recovers the same scope, so it sees the earlier instance's entry —
+        // this is what lets a caller that reuses a db_cache_id across a `Db` reopen see
+        // disk entries an earlier instance evacuated there before closing.
+        assert!(
+            reopened.get_block(&key).await.unwrap().is_some(),
+            "reopening with the same db_cache_id should recover the previous instance's entries"
+        );
+    }
+
     #[fixture]
     fn cache() -> (DbCacheWrapper, Arc<DefaultMetricsRecorder>) {
         let recorder = Arc::new(DefaultMetricsRecorder::new());
@@ -1943,6 +2423,7 @@ mod tests {
             Arc::new(cache),
             &helper,
             Arc::new(DefaultSystemClock::default()),
+            1,
         );
         (wrapper, recorder)
     }
@@ -1982,6 +2463,8 @@ mod tests {
         /// instead, the loader's entry comes back and the marker assertion fails.
         struct ProbeCache {
             close_called: AtomicBool,
+            flush_scope_called: AtomicBool,
+            flush_to_disk_called: AtomicBool,
             marker: CachedEntry,
         }
 
@@ -2008,39 +2491,49 @@ mod tests {
                 self.close_called.store(true, Ordering::SeqCst);
                 Ok(())
             }
+            async fn flush_scope(&self, _: u64) -> Result<(), crate::Error> {
+                self.flush_scope_called.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn flush_to_disk(&self) -> Result<(), crate::Error> {
+                self.flush_to_disk_called.store(true, Ordering::SeqCst);
+                Ok(())
+            }
             async fn fetch_block(
                 &self,
                 _: CachedKey,
                 _: CacheLoader,
-            ) -> Result<CachedEntry, crate::Error> {
-                Ok(self.marker.clone())
+            ) -> Result<CacheFetch, crate::Error> {
+                Ok(CacheFetch::hit(self.marker.clone()))
             }
             async fn fetch_index(
                 &self,
                 _: CachedKey,
                 _: CacheLoader,
-            ) -> Result<CachedEntry, crate::Error> {
-                Ok(self.marker.clone())
+            ) -> Result<CacheFetch, crate::Error> {
+                Ok(CacheFetch::hit(self.marker.clone()))
             }
             async fn fetch_filter(
                 &self,
                 _: CachedKey,
                 _: CacheLoader,
-            ) -> Result<CachedEntry, crate::Error> {
-                Ok(self.marker.clone())
+            ) -> Result<CacheFetch, crate::Error> {
+                Ok(CacheFetch::hit(self.marker.clone()))
             }
             async fn fetch_stats(
                 &self,
                 _: CachedKey,
                 _: CacheLoader,
-            ) -> Result<CachedEntry, crate::Error> {
-                Ok(self.marker.clone())
+            ) -> Result<CacheFetch, crate::Error> {
+                Ok(CacheFetch::hit(self.marker.clone()))
             }
         }
 
         let marker_block = build_block(b"marker");
         let probe = Arc::new(ProbeCache {
             close_called: AtomicBool::new(false),
+            flush_scope_called: AtomicBool::new(false),
+            flush_to_disk_called: AtomicBool::new(false),
             marker: CachedEntry::with_block(marker_block.clone()),
         });
         let unowned = UnownedDbCache::new(probe.clone());
@@ -2058,7 +2551,7 @@ mod tests {
         ];
         for entry in fetched {
             assert!(
-                Arc::ptr_eq(&entry.block().unwrap(), &marker_block),
+                Arc::ptr_eq(&entry.entry.block().unwrap(), &marker_block),
                 "fetch was not forwarded to the inner cache's override"
             );
         }
@@ -2067,6 +2560,18 @@ mod tests {
         assert!(
             !probe.close_called.load(Ordering::SeqCst),
             "close() must not propagate to a cache slatedb does not own"
+        );
+
+        unowned.flush_scope(0).await.unwrap();
+        assert!(
+            probe.flush_scope_called.load(Ordering::SeqCst),
+            "flush_scope was not forwarded to the inner cache"
+        );
+
+        unowned.flush_to_disk().await.unwrap();
+        assert!(
+            probe.flush_to_disk_called.load(Ordering::SeqCst),
+            "flush_to_disk was not forwarded to the inner cache"
         );
     }
 }

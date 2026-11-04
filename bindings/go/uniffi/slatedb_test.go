@@ -161,6 +161,10 @@ func uint64Ptr(v uint64) *uint64 {
 	return &v
 }
 
+func boolPtr(v bool) *bool {
+	return &v
+}
+
 func trackWriteHandle(t *testing.T, handle *slatedb.WriteHandle) *slatedb.WriteHandle {
 	t.Helper()
 	if handle == nil {
@@ -522,7 +526,7 @@ func TestDbLifecycleAndStatus(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewSplitCache: %v", err)
 		}
-		if err := builder.WithDbCache(dbCache); err != nil {
+		if err := builder.WithDbCache(dbCache, 0); err != nil {
 			t.Fatalf("WithMergeOperator(): %v", err)
 		}
 	})
@@ -679,7 +683,7 @@ func TestDbCrudAndMetadata(t *testing.T) {
 	}
 
 	putOptions := slatedb.PutOptions{Ttl: slatedb.TtlDefault{}}
-	writeOptions := slatedb.WriteOptions{AwaitDurable: true, Seqnum: 0}
+	writeOptions := slatedb.WriteOptions{AwaitDurable: boolPtr(true), Seqnum: 0}
 
 	firstWrite, err := handle.db.Put([]byte("alpha"), []byte("one"))
 	if err != nil {
@@ -965,7 +969,7 @@ func TestDbBatchWriteAndConsumption(t *testing.T) {
 		t.Fatalf("WriteBatch.PutWithOptions(): %v", err)
 	}
 
-	secondBatchWrite, err := handle.db.WriteWithOptions(secondBatch, slatedb.WriteOptions{AwaitDurable: true, Seqnum: 0})
+	secondBatchWrite, err := handle.db.WriteWithOptions(secondBatch, slatedb.WriteOptions{AwaitDurable: boolPtr(true), Seqnum: 0})
 	if err != nil {
 		t.Fatalf("WriteWithOptions(): %v", err)
 	}
@@ -1032,7 +1036,7 @@ func TestDbMerge(t *testing.T) {
 		[]byte("merge"),
 		[]byte(":two"),
 		slatedb.MergeOptions{Ttl: slatedb.TtlDefault{}},
-		slatedb.WriteOptions{AwaitDurable: true, Seqnum: 0},
+		slatedb.WriteOptions{AwaitDurable: boolPtr(true), Seqnum: 0},
 	)
 	if err != nil {
 		t.Fatalf("MergeWithOptions(): %v", err)
@@ -1339,6 +1343,56 @@ func TestDbReaderPointReads(t *testing.T) {
 	}
 }
 
+func TestDbReaderDbCacheConfiguration(t *testing.T) {
+	store := newMemoryStore(t)
+	dbHandle := openTestDB(t, store, nil)
+
+	if _, err := dbHandle.db.Put([]byte("cached"), []byte("value")); err != nil {
+		t.Fatalf("Put(cached): %v", err)
+	}
+	if err := dbHandle.db.FlushWithOptions(slatedb.FlushOptions{FlushType: slatedb.FlushTypeMemTable}); err != nil {
+		t.Fatalf("FlushWithOptions(MemTable): %v", err)
+	}
+
+	sharedCache, err := slatedb.DbCacheNewMokaCache(slatedb.MokaCacheOptions{MaxCapacity: 1024 * 1024})
+	if err != nil {
+		t.Fatalf("NewMokaCache: %v", err)
+	}
+	defer sharedCache.Destroy()
+
+	withSharedCache := func(t *testing.T, builder *slatedb.DbReaderBuilder) {
+		t.Helper()
+		if err := builder.WithDbCache(sharedCache, 0); err != nil {
+			t.Fatalf("DbReaderBuilder.WithDbCache(): %v", err)
+		}
+	}
+	firstReader := openTestReader(t, store, withSharedCache)
+	secondReader := openTestReader(t, store, withSharedCache)
+	for name, handle := range map[string]*testReader{"first": firstReader, "second": secondReader} {
+		value, err := handle.reader.Get([]byte("cached"))
+		if err != nil {
+			t.Fatalf("%s DbReader.Get(cached): %v", name, err)
+		}
+		if value == nil || !bytes.Equal(*value, []byte("value")) {
+			t.Fatalf("%s DbReader.Get(cached): got %v, want %q", name, value, "value")
+		}
+	}
+
+	uncachedReader := openTestReader(t, store, func(t *testing.T, builder *slatedb.DbReaderBuilder) {
+		t.Helper()
+		if err := builder.WithDbCacheDisabled(); err != nil {
+			t.Fatalf("DbReaderBuilder.WithDbCacheDisabled(): %v", err)
+		}
+	})
+	value, err := uncachedReader.reader.Get([]byte("cached"))
+	if err != nil {
+		t.Fatalf("uncached DbReader.Get(cached): %v", err)
+	}
+	if value == nil || !bytes.Equal(*value, []byte("value")) {
+		t.Fatalf("uncached DbReader.Get(cached): got %v, want %q", value, "value")
+	}
+}
+
 func TestDbReaderScanVariants(t *testing.T) {
 	store := newMemoryStore(t)
 	dbHandle := openTestDB(t, store, nil)
@@ -1456,7 +1510,7 @@ func TestDbReaderRefreshBehavior(t *testing.T) {
 		t.Helper()
 		if err := builder.WithOptions(slatedb.ReaderOptions{
 			ManifestPollIntervalMs: 100,
-			WalPollIntervalMs:      100,
+			WalPollIntervalMs:      uint64Ptr(100),
 			CheckpointLifetimeMs:   1000,
 			MaxMemtableBytes:       64 * 1024 * 1024,
 			SkipWalReplay:          false,
@@ -1482,6 +1536,35 @@ func TestDbReaderRefreshBehavior(t *testing.T) {
 }
 
 func TestDbReaderWalReplayBehavior(t *testing.T) {
+	t.Run("unset wal poll interval uses the default", func(t *testing.T) {
+		store := newMemoryStore(t)
+		dbHandle := openTestDB(t, store, nil)
+		if _, err := dbHandle.db.Put([]byte("wal-key"), []byte("wal-value")); err != nil {
+			t.Fatalf("Put(wal-key): %v", err)
+		}
+		if err := dbHandle.db.FlushWithOptions(slatedb.FlushOptions{FlushType: slatedb.FlushTypeWal}); err != nil {
+			t.Fatalf("FlushWithOptions(Wal): %v", err)
+		}
+		readerHandle := openTestReader(t, store, func(t *testing.T, builder *slatedb.DbReaderBuilder) {
+			t.Helper()
+			if err := builder.WithOptions(slatedb.ReaderOptions{
+				ManifestPollIntervalMs: 100,
+				CheckpointLifetimeMs:   1000,
+				MaxMemtableBytes:       64 * 1024 * 1024,
+			}); err != nil {
+				t.Fatalf("DbReaderBuilder.WithOptions(): %v", err)
+			}
+		})
+
+		value, err := readerHandle.reader.Get([]byte("wal-key"))
+		if err != nil {
+			t.Fatalf("Get(wal-key): %v", err)
+		}
+		if value == nil || !bytes.Equal(*value, []byte("wal-value")) {
+			t.Fatalf("Get(wal-key) = %v, want wal-value", value)
+		}
+	})
+
 	t.Run("default reader replays new wal data", func(t *testing.T) {
 		store := newMemoryStore(t)
 		dbHandle := openTestDB(t, store, nil)
@@ -1489,7 +1572,7 @@ func TestDbReaderWalReplayBehavior(t *testing.T) {
 			t.Helper()
 			if err := builder.WithOptions(slatedb.ReaderOptions{
 				ManifestPollIntervalMs: 100,
-				WalPollIntervalMs:      100,
+				WalPollIntervalMs:      uint64Ptr(100),
 				CheckpointLifetimeMs:   1000,
 				MaxMemtableBytes:       64 * 1024 * 1024,
 				SkipWalReplay:          false,
@@ -1536,7 +1619,7 @@ func TestDbReaderWalReplayBehavior(t *testing.T) {
 			t.Helper()
 			if err := builder.WithOptions(slatedb.ReaderOptions{
 				ManifestPollIntervalMs: 100,
-				WalPollIntervalMs:      100,
+				WalPollIntervalMs:      uint64Ptr(100),
 				CheckpointLifetimeMs:   1000,
 				MaxMemtableBytes:       64 * 1024 * 1024,
 				SkipWalReplay:          true,
@@ -1569,7 +1652,7 @@ func TestDbReaderWalReplayBehavior(t *testing.T) {
 			t.Helper()
 			if err := builder.WithOptions(slatedb.ReaderOptions{
 				ManifestPollIntervalMs: 100,
-				WalPollIntervalMs:      100,
+				WalPollIntervalMs:      uint64Ptr(100),
 				CheckpointLifetimeMs:   1000,
 				MaxMemtableBytes:       64 * 1024 * 1024,
 				SkipWalReplay:          true,
@@ -2122,6 +2205,104 @@ func TestAdminClone(t *testing.T) {
 		if !bytes.Equal(*got, want) {
 			t.Fatalf("Get(k%d): got %q, want %q", i, *got, want)
 		}
+	}
+}
+
+func TestAdminDeleteDb(t *testing.T) {
+	store := newMemoryStore(t)
+
+	parentPath := "admin-delete-parent"
+	parentBuilder := slatedb.NewDbBuilder(parentPath, store)
+	parent, err := parentBuilder.Build()
+	parentBuilder.Destroy()
+	if err != nil {
+		t.Fatalf("Build() parent: %v", err)
+	}
+	if _, err := parent.Put([]byte("key"), []byte("value")); err != nil {
+		t.Fatalf("Put(key): %v", err)
+	}
+	if err := parent.Flush(); err != nil {
+		t.Fatalf("Flush(): %v", err)
+	}
+	if err := parent.Shutdown(); err != nil {
+		t.Fatalf("Shutdown() parent: %v", err)
+	}
+	parent.Destroy()
+
+	openAdmin := func(path string) *slatedb.Admin {
+		builder := slatedb.NewAdminBuilder(path, store)
+		defer builder.Destroy()
+		admin, err := builder.Build()
+		if err != nil {
+			t.Fatalf("AdminBuilder.Build(%s): %v", path, err)
+		}
+		t.Cleanup(admin.Destroy)
+		return admin
+	}
+	parentAdmin := openAdmin(parentPath)
+	cloneAdmin := openAdmin("admin-delete-clone")
+
+	cloneBuilder, err := cloneAdmin.CreateCloneBuilderFromSource(slatedb.CloneSourceSpec{Path: parentPath})
+	if err != nil {
+		t.Fatalf("CreateCloneBuilderFromSource(): %v", err)
+	}
+	defer cloneBuilder.Destroy()
+	if err := cloneBuilder.Build(); err != nil {
+		t.Fatalf("CloneBuilder.Build(): %v", err)
+	}
+
+	manifest, err := cloneAdmin.ReadManifest(nil)
+	if err != nil || manifest == nil || len(manifest.ExternalDbs) != 1 || manifest.ExternalDbs[0].FinalCheckpointId == nil {
+		t.Fatalf("ReadManifest() of the clone: %+v, %v; want one external db with a final checkpoint", manifest, err)
+	}
+	pin := *manifest.ExternalDbs[0].FinalCheckpointId
+	pinned := func() bool {
+		checkpoints, err := parentAdmin.ListCheckpoints(nil)
+		if err != nil {
+			t.Fatalf("ListCheckpoints(): %v", err)
+		}
+		for _, checkpoint := range checkpoints {
+			if checkpoint.Id == pin {
+				return true
+			}
+		}
+		return false
+	}
+	if !pinned() {
+		t.Fatalf("the parent does not list the clone's checkpoint %s", pin)
+	}
+
+	listed, err := cloneAdmin.DeleteDb(false)
+	if err != nil {
+		t.Fatalf("DeleteDb(false): %v", err)
+	}
+	if len(listed) == 0 {
+		t.Fatalf("DeleteDb(false): listed no paths")
+	}
+	if !pinned() {
+		t.Fatalf("a dry run released the clone's checkpoint %s", pin)
+	}
+
+	deleted, err := cloneAdmin.DeleteDb(true)
+	if err != nil {
+		t.Fatalf("DeleteDb(true): %v", err)
+	}
+	if len(deleted) < len(listed) {
+		t.Fatalf("DeleteDb(true): deleted %d paths, the dry run listed %d", len(deleted), len(listed))
+	}
+	if pinned() {
+		t.Fatalf("the parent still lists the deleted clone's checkpoint %s", pin)
+	}
+
+	remaining, err := cloneAdmin.DeleteDb(false)
+	if err != nil {
+		t.Fatalf("DeleteDb(false) after delete: %v", err)
+	}
+	if len(remaining) != 0 {
+		t.Fatalf("DeleteDb(false) after delete: %d paths remain: %v", len(remaining), remaining)
+	}
+	if _, err := cloneAdmin.DeleteDb(true); err != nil {
+		t.Fatalf("second DeleteDb(true): %v", err)
 	}
 }
 
@@ -3139,7 +3320,7 @@ func TestDbTtl(t *testing.T) {
 	key, value := []byte("alpha"), []byte("one")
 
 	putOptions := slatedb.PutOptions{Ttl: slatedb.TtlExpireAtMillis{Field0: 1}}
-	writeOptions := slatedb.WriteOptions{AwaitDurable: true, Seqnum: 0}
+	writeOptions := slatedb.WriteOptions{AwaitDurable: boolPtr(true), Seqnum: 0}
 	write, err := handle.db.PutWithOptions(key, value, putOptions, writeOptions)
 	if err != nil {
 		t.Fatalf("Put(alpha): %v", err)
@@ -3199,7 +3380,7 @@ const batchSeedTtlMillis = 3_600_000
 func seedBatchRows(t *testing.T, db *slatedb.Db) {
 	t.Helper()
 
-	writeOptions := slatedb.WriteOptions{AwaitDurable: true, Seqnum: 0}
+	writeOptions := slatedb.WriteOptions{AwaitDurable: boolPtr(true), Seqnum: 0}
 	for _, row := range batchSeedRows {
 		putOptions := slatedb.PutOptions{Ttl: row.ttl}
 		write, err := db.PutWithOptions([]byte(row.key), []byte(row.value), putOptions, writeOptions)
@@ -3458,7 +3639,7 @@ func openBenchDB(b *testing.B) *slatedb.Db {
 		db.Destroy()
 	})
 
-	writeOptions := slatedb.WriteOptions{AwaitDurable: false, Seqnum: 0}
+	writeOptions := slatedb.WriteOptions{AwaitDurable: boolPtr(false), Seqnum: 0}
 	putOptions := slatedb.PutOptions{Ttl: slatedb.TtlDefault{}}
 	for i := 0; i < benchScanRows; i++ {
 		key := []byte(fmt.Sprintf("bench:%06d", i))

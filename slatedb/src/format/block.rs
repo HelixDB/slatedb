@@ -27,13 +27,6 @@ impl Block {
 
     #[rustfmt::skip]
     pub(crate) fn decode(bytes: Bytes) -> Result<Self, SlateDBError> {
-        Self::decode_with_memory_limit(bytes, usize::MAX)
-    }
-
-    pub(crate) fn decode_with_memory_limit(
-        bytes: Bytes,
-        memory_limit: usize,
-    ) -> Result<Self, SlateDBError> {
         let data = bytes.as_ref();
         if data.len() < SIZEOF_U16 {
             return Err(corrupt_block("block is missing its offset count"));
@@ -49,17 +42,6 @@ impl Block {
         let offsets_size = entry_offsets_len
             .checked_mul(SIZEOF_U16)
             .ok_or_else(|| corrupt_block("block offset table size overflow"))?;
-        let required_memory = data
-            .len()
-            .checked_add(offsets_size)
-            .ok_or_else(|| corrupt_block("decoded block memory size overflow"))?;
-        if required_memory > memory_limit {
-            return Err(SlateDBError::WalReplayMemoryLimitExceeded {
-                kind: "decoded WAL block",
-                required_bytes: required_memory,
-                limit_bytes: memory_limit,
-            });
-        }
         let trailer_size = offsets_size
             .checked_add(SIZEOF_U16)
             .ok_or_else(|| corrupt_block("block trailer size overflow"))?;

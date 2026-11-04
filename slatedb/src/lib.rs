@@ -58,6 +58,7 @@ pub use error::{CloseReason, Error, ErrorCode, ErrorKind};
 pub use filter::BloomFilter;
 pub use filter_policy::{
     BloomFilterPolicy, Filter, FilterBuilder, FilterContext, FilterPolicy, FilterQuery,
+    FilterTarget,
 };
 pub use format::sst::BlockTransformer;
 pub use garbage_collector::stats as garbage_collector_stats;
@@ -70,8 +71,7 @@ pub use ops::{DbCacheManagerOps, DbMetadataOps, DbReadOps, DbTransactionOps, DbW
 pub use paths::PathResolver;
 pub use prefix_extractor::{PrefixExtractor, PrefixTarget};
 pub use query_metrics::{
-    scope_query_metrics, QueryCacheKind, QueryCacheStatistics, QueryMetricsObserver,
-    QueryMetricsSnapshot,
+    scope_query_metrics, QueryCacheStatistics, QueryMetricsObserver, QueryMetricsSnapshot,
 };
 pub use slatedb_common::{DbRand, IdentifiedObjectMetadata, ObjectMetadata};
 #[cfg(test)]
@@ -151,7 +151,6 @@ mod mem_table;
 mod memtable_flusher;
 mod merge_iterator;
 mod merge_operator;
-mod object_stores;
 mod ops;
 mod oracle;
 mod partitioned_keyspace;
@@ -160,7 +159,6 @@ mod peeking_iterator;
 #[cfg(test)]
 mod proptest_util;
 mod reader;
-mod replay_task_scope;
 mod retention_iterator;
 mod retrying_object_store;
 mod segment_iterator;

@@ -8,7 +8,7 @@ use crate::config::{
 };
 use crate::db::WriteHandle;
 use crate::db_cache::CacheTarget;
-use crate::db_state::SsTableId;
+use crate::db_state::{SsTableHandle, SsTableId};
 use crate::db_status::DbStatus;
 use crate::manifest::VersionedManifest;
 use crate::transaction_manager::IsolationLevel;
@@ -515,25 +515,6 @@ pub trait DbTransactionOps: DbReadOps {
         self.merge_with_options(key, value, &MergeOptions::default())
     }
 
-    /// Buffers a merge operand that is compatible with concurrent
-    /// commutative merges for the same key.
-    ///
-    /// See [`DbTransaction::merge_commutative`](crate::DbTransaction::merge_commutative)
-    /// for the algebraic caller contract and the precise conflict, isolation,
-    /// atomicity, and persistence guarantees.
-    ///
-    /// The default implementation conservatively delegates to [`Self::merge`]
-    /// so third-party transaction implementations remain source-compatible and
-    /// retain ordinary write/write conflicts unless they explicitly override
-    /// this method.
-    fn merge_commutative<K, V>(&self, key: K, operand: V) -> Result<(), crate::Error>
-    where
-        K: AsRef<[u8]>,
-        V: AsRef<[u8]>,
-    {
-        self.merge(key, operand)
-    }
-
     /// Buffers a merge operand that is compatible only with concurrent merges
     /// whose logical discriminator sets are disjoint.
     ///
@@ -752,12 +733,34 @@ pub trait DbCacheManagerOps {
         targets: &[CacheTarget],
     ) -> Result<(), crate::Error>;
 
-    /// Best-effort eviction of block-cache entries for one SST.
+    /// Best-effort removal of the cache entries of an SST named by `targets`.
     ///
-    /// If no block cache is configured, logs a warning and returns `Ok(())`.
-    /// Does not check whether the SST is still live in the current manifest —
-    /// callers own that policy.
-    async fn evict_cached_sst(&self, sst_id: SsTableId) -> Result<(), crate::Error>;
+    /// A [`CacheTarget::Data`] target removes the blocks whose key span
+    /// overlaps its range, which reads the SST index. The other targets each
+    /// remove one entry. [`CacheTarget::all`] removes everything.
+    ///
+    /// The handle names the entries, so the SST need not be in the current
+    /// manifest. Callers own the decision of what is safe to evict.
+    async fn evict_cached_sst(
+        &self,
+        sst: &SsTableHandle,
+        targets: &[CacheTarget],
+    ) -> Result<(), crate::Error>;
+
+    /// Send this instance's cached data to disk.
+    ///
+    /// This moves data for this instance's `db_cache_id` from memory to disk.
+    /// It frees memory now, and protects the data from an ungraceful
+    /// process exit later. A later instance with the same `db_cache_id` can
+    /// read the data back from disk.
+    ///
+    /// This affects the whole scope, not only this instance's own reads
+    /// and writes. If another instance uses the same `db_cache_id`, this call
+    /// also flushes that instance's data.
+    ///
+    /// Does nothing if no block cache is set, or if the cache has no disk
+    /// storage.
+    async fn flush_cache_to_disk(&self) -> Result<(), crate::Error>;
 }
 
 #[cfg(test)]

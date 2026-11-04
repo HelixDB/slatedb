@@ -139,28 +139,6 @@ impl CachedObjectStore {
         clock: Arc<dyn SystemClock>,
         rand: Arc<DbRand>,
     ) -> Result<Option<Arc<Self>>, SlateDBError> {
-        Self::from_config_with_cache_put_config(
-            object_store,
-            options,
-            CachePutConfig {
-                cache_on_flush: options.cache_puts,
-                cache_on_compaction: options.cache_puts,
-            },
-            recorder,
-            clock,
-            rand,
-        )
-        .await
-    }
-
-    async fn from_config_with_cache_put_config(
-        object_store: Arc<dyn ObjectStore>,
-        options: &ObjectStoreCacheOptions,
-        cache_put_config: CachePutConfig,
-        recorder: &MetricsRecorderHelper,
-        clock: Arc<dyn SystemClock>,
-        rand: Arc<DbRand>,
-    ) -> Result<Option<Arc<Self>>, SlateDBError> {
         let cache_root_folder = match &options.root_folder {
             None => return Ok(None),
             Some(f) => f,
@@ -179,7 +157,10 @@ impl CachedObjectStore {
             object_store,
             cache_storage,
             options.part_size_bytes,
-            cache_put_config,
+            CachePutConfig {
+                cache_on_flush: options.cache_on_flush,
+                cache_on_compaction: options.cache_on_compaction,
+            },
             stats,
         )?;
         cached.start_evictor().await;
@@ -198,7 +179,6 @@ impl CachedObjectStore {
                 root_folder: Some(root_folder.into()),
                 ..ObjectStoreCacheOptions::default()
             },
-            cache_put_config: CachePutConfig::default(),
             metrics_recorder: Arc::new(NoopMetricsRecorder::new()),
             metric_level: MetricLevel::default(),
         }
@@ -751,7 +731,6 @@ impl CachedObjectStore {
 pub struct CachedObjectStoreBuilder {
     object_store: Arc<dyn ObjectStore>,
     options: ObjectStoreCacheOptions,
-    cache_put_config: CachePutConfig,
     metrics_recorder: Arc<dyn MetricsRecorder>,
     metric_level: MetricLevel,
 }
@@ -778,7 +757,7 @@ impl CachedObjectStoreBuilder {
     ///
     /// The default is false.
     pub fn with_cache_on_flush(mut self, cache_on_flush: bool) -> Self {
-        self.cache_put_config.cache_on_flush = cache_on_flush;
+        self.options.cache_on_flush = cache_on_flush;
         self
     }
 
@@ -787,7 +766,7 @@ impl CachedObjectStoreBuilder {
     ///
     /// The default is false.
     pub fn with_cache_on_compaction(mut self, cache_on_compaction: bool) -> Self {
-        self.cache_put_config.cache_on_compaction = cache_on_compaction;
+        self.options.cache_on_compaction = cache_on_compaction;
         self
     }
 
@@ -829,10 +808,9 @@ impl CachedObjectStoreBuilder {
     /// Builds the `CachedObjectStore` and starts its evictor.
     pub async fn build(self) -> Result<Arc<CachedObjectStore>, crate::Error> {
         let recorder = MetricsRecorderHelper::new(self.metrics_recorder, self.metric_level);
-        let cached = CachedObjectStore::from_config_with_cache_put_config(
+        let cached = CachedObjectStore::from_config(
             self.object_store,
             &self.options,
-            self.cache_put_config,
             &recorder,
             Arc::new(DefaultSystemClock::new()),
             Arc::new(DbRand::default()),
@@ -1209,15 +1187,14 @@ mod tests {
     use crate::cached_object_store::storage::{LocalCacheStorage, PartID};
     use crate::cached_object_store::storage_fs::FsCacheEntry;
     use crate::cached_object_store::storage_fs::FsCacheStorage;
-    use crate::config::ObjectStoreCacheOptions;
     use crate::db_state::SstType;
     use crate::instrumented_object_store::{InstrumentedObjectStore, ObjectStoreComponent};
     use crate::object_store_tag::{ObjectStoreCallTag, TableStoreKind};
-    use crate::object_stores::ObjectStoreType;
     use crate::retrying_object_store::RetryingObjectStore;
     use crate::test_utils::{
         gen_rand_bytes, ExtensionMarker, ExtensionObjectStore, FlakyObjectStore, GatedObjectStore,
     };
+    use crate::utils::ObjectStoreType;
     use slatedb_common::clock::DefaultSystemClock;
     use slatedb_common::metrics::MetricsRecorderHelper;
     use slatedb_common::DbRand;
@@ -1858,7 +1835,7 @@ mod tests {
         Arc<CachedObjectStore>,
     ) {
         use crate::instrumented_object_store::{InstrumentedObjectStore, ObjectStoreComponent};
-        use crate::object_stores::ObjectStoreType;
+        use crate::utils::ObjectStoreType;
         use slatedb_common::metrics::test_recorder_helper;
 
         let (recorder, helper) = test_recorder_helper();
@@ -2533,48 +2510,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cache_puts_config_admits_flush_and_compaction_writes() {
-        let upstream: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        let options = ObjectStoreCacheOptions {
-            root_folder: Some(new_test_cache_folder()),
-            part_size_bytes: 1024,
-            cache_puts: true,
-            ..ObjectStoreCacheOptions::default()
-        };
-        let store = CachedObjectStore::from_config(
-            upstream,
-            &options,
-            &MetricsRecorderHelper::noop(),
-            Arc::new(DefaultSystemClock::new()),
-            Arc::new(DbRand::default()),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-
-        for (location, tag) in [
-            (
-                Path::from("compacted/flush.sst"),
-                ObjectStoreCallTag::new(TableStoreKind::Main, SstType::Compacted),
-            ),
-            (
-                Path::from("compacted/compaction.sst"),
-                ObjectStoreCallTag::new(TableStoreKind::Compactor, SstType::Compacted),
-            ),
-        ] {
-            store
-                .put_opts(
-                    &location,
-                    PutPayload::from_bytes(gen_rand_bytes(2048)),
-                    put_opts_tagged(tag),
-                )
-                .await
-                .unwrap();
-            assert_eq!(cached_part_count(&store, &location).await, 2);
-        }
-    }
-
-    #[tokio::test]
     async fn test_untagged_put_is_not_cached() {
         let upstream: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let store = policy_test_store(
@@ -2685,7 +2620,7 @@ mod tests {
         // Populate the cache with the correct head and part via a normal read.
         let main_tag = ObjectStoreCallTag::new(TableStoreKind::Main, SstType::Compacted);
         let got = store
-            .get_opts(&location, get_opts_tagged(main_tag))
+            .get_opts(&location, get_opts_tagged(main_tag.clone()))
             .await
             .unwrap()
             .bytes()
@@ -2706,7 +2641,7 @@ mod tests {
 
         // A normal read now serves the poisoned bytes (cache hit).
         let served = store
-            .get_opts(&location, get_opts_tagged(main_tag))
+            .get_opts(&location, get_opts_tagged(main_tag.clone()))
             .await
             .unwrap()
             .bytes()
@@ -2719,6 +2654,7 @@ mod tests {
             kind: TableStoreKind::Main,
             sst_type: SstType::Compacted,
             retry: Some(crate::error::RetryReason::CrcMismatch),
+            segment: Some(Bytes::new()),
         };
         let refetched = store
             .get_opts(&location, get_opts_tagged(retry_tag))
@@ -2812,7 +2748,7 @@ mod tests {
 
         // A WAL data read bypasses: it returns the bytes but caches nothing.
         let got = store
-            .get_opts(&location, get_opts_tagged(wal_tag))
+            .get_opts(&location, get_opts_tagged(wal_tag.clone()))
             .await
             .unwrap()
             .bytes()
@@ -2857,7 +2793,7 @@ mod tests {
             .put_opts(
                 &location,
                 PutPayload::from_bytes(payload.clone()),
-                put_opts_tagged(tag),
+                put_opts_tagged(tag.clone()),
             )
             .await
             .unwrap();

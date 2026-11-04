@@ -44,6 +44,20 @@ impl DisjointMergeBatchEntry {
     }
 }
 
+/// How a transaction point read relates to the request that issued it.
+#[derive(Clone, Copy)]
+enum PointRead {
+    /// A get of its own: tracked for SSI, counted as a request, and bounded
+    /// by the transaction's snapshot.
+    Get,
+    /// A read the transaction makes for itself: bounded by the snapshot but
+    /// not tracked as a read.
+    Untracked,
+    /// A multi-get key that needs merge resolution: tracked and counted by its
+    /// multi-get, and bounded by the multi-get's prepared sequence number.
+    MultiGetKey(Option<u64>),
+}
+
 /// A database transaction that provides atomic read-write operations with
 /// configurable isolation levels. This is the main interface for transactional
 /// operations in SlateDB.
@@ -171,7 +185,7 @@ impl DbTransaction {
         key: K,
         options: &ReadOptions,
     ) -> Result<Option<KeyValue>, crate::Error> {
-        self.get_key_value_with_options_inner(key, options, true)
+        self.get_key_value_with_options_inner(key, options, PointRead::Get)
             .await
     }
 
@@ -179,12 +193,14 @@ impl DbTransaction {
         &self,
         key: K,
         options: &ReadOptions,
-        track_read: bool,
+        read: PointRead,
     ) -> Result<Option<KeyValue>, crate::Error> {
         self.db_inner.check_closed()?;
 
         // Track read key for SSI conflict detection if needed
-        if track_read && self.isolation_level == IsolationLevel::SerializableSnapshot {
+        if matches!(read, PointRead::Get)
+            && self.isolation_level == IsolationLevel::SerializableSnapshot
+        {
             let key_bytes = Bytes::copy_from_slice(key.as_ref());
             let mut read_keys = HashSet::new();
             read_keys.insert(key_bytes);
@@ -211,18 +227,26 @@ impl DbTransaction {
             ))
         };
 
-        let kv = self
-            .db_inner
-            .reader
-            .get_key_value_with_options(
-                key,
-                options,
-                &db_state,
-                write_batch_iter,
-                Some(self.started_seq),
-            )
-            .await
-            .map_err(crate::Error::from)?;
+        let reader = &self.db_inner.reader;
+        let kv = match read {
+            PointRead::Get | PointRead::Untracked => {
+                reader
+                    .get_key_value_with_options(
+                        key,
+                        options,
+                        &db_state,
+                        write_batch_iter,
+                        Some(self.started_seq),
+                    )
+                    .await
+            }
+            PointRead::MultiGetKey(max_seq) => {
+                reader
+                    .get_key_value_in_request(key, options, &db_state, write_batch_iter, max_seq)
+                    .await
+            }
+        }
+        .map_err(crate::Error::from)?;
         Ok(kv)
     }
 
@@ -263,7 +287,18 @@ impl DbTransaction {
             self.txn_manager.track_read_keys(&self.txn_id, read_keys);
         }
 
+        // One get request however the keys resolve: from the write batch, the
+        // reader or a point-get fallback.
+        self.db_inner.reader.db_stats.get_requests.increment(1);
         let db_state = self.db_inner.state.read().view();
+        // One visibility bound for every key, including keys that fall back
+        // to a point get, so a batch that commits mid-call cannot show for
+        // some keys and not others.
+        let max_seq = self.db_inner.reader.prepare_max_seq(
+            Some(self.started_seq),
+            options.durability_filter,
+            options.dirty,
+        );
 
         let mut key_to_idx = HashMap::<Bytes, usize>::with_capacity(keys.len());
         let mut unique_keys = Vec::<Bytes>::with_capacity(keys.len());
@@ -324,12 +359,7 @@ impl DbTransaction {
             let reader_values = self
                 .db_inner
                 .reader
-                .multi_get_key_value_with_options(
-                    &reader_keys,
-                    options,
-                    &db_state,
-                    Some(self.started_seq),
-                )
+                .resolve_unique_key_values(&reader_keys, options, &db_state, max_seq)
                 .await
                 .map_err(crate::Error::from)?;
             for (key_idx, value) in reader_key_indices.into_iter().zip(reader_values) {
@@ -344,7 +374,11 @@ impl DbTransaction {
             .filter_map(|(idx, should_fallback)| should_fallback.then_some(idx))
         {
             values[key_idx] = self
-                .get_key_value_with_options(unique_keys[key_idx].as_ref(), options)
+                .get_key_value_with_options_inner(
+                    unique_keys[key_idx].as_ref(),
+                    options,
+                    PointRead::MultiGetKey(max_seq),
+                )
                 .await?;
             resolved[key_idx] = true;
         }
@@ -371,7 +405,18 @@ impl DbTransaction {
         options: &ReadOptions,
     ) -> Result<Vec<Option<KeyValue>>, crate::Error> {
         self.db_inner.check_closed()?;
+        // One get request however the keys resolve: from the write batch, the
+        // reader or a point-get fallback.
+        self.db_inner.reader.db_stats.get_requests.increment(1);
         let db_state = self.db_inner.state.read().view();
+        // One visibility bound for every key, including keys that fall back
+        // to a point get, so a batch that commits mid-call cannot show for
+        // some keys and not others.
+        let max_seq = self.db_inner.reader.prepare_max_seq(
+            Some(self.started_seq),
+            options.durability_filter,
+            options.dirty,
+        );
         let mut resolved: SmallVec<[bool; 8]> = smallvec![false; keys.len()];
         let mut values: SmallVec<[Option<KeyValue>; 8]> = smallvec![None; keys.len()];
         let mut fallback_to_point_get: SmallVec<[bool; 8]> = smallvec![false; keys.len()];
@@ -410,12 +455,7 @@ impl DbTransaction {
             let reader_values = self
                 .db_inner
                 .reader
-                .multi_get_unique_key_value_with_options(
-                    &reader_keys,
-                    options,
-                    &db_state,
-                    Some(self.started_seq),
-                )
+                .resolve_unique_key_values(&reader_keys, options, &db_state, max_seq)
                 .await
                 .map_err(crate::Error::from)?;
             for (key_idx, value) in reader_key_indices.into_iter().zip(reader_values) {
@@ -429,7 +469,11 @@ impl DbTransaction {
             .filter_map(|(idx, should_fallback)| should_fallback.then_some(idx))
         {
             values[key_idx] = self
-                .get_key_value_with_options_inner(keys[key_idx].as_ref(), options, false)
+                .get_key_value_with_options_inner(
+                    keys[key_idx].as_ref(),
+                    options,
+                    PointRead::MultiGetKey(max_seq),
+                )
                 .await?;
         }
         Ok(values.into_vec())
@@ -746,130 +790,13 @@ impl DbTransaction {
         self.merge_with_options(key, value, &MergeOptions::default())
     }
 
-    /// Buffers a merge operand whose effect is independent of its ordering
-    /// relative to other commutative merge operands for the same key.
-    ///
-    /// This is an opt-in write/write conflict optimization for transactions
-    /// performing blind, merge-only updates. Unlike [`Self::merge`], concurrent
-    /// transactions using this method for the same key may both commit. Both
-    /// operands are retained and applied by the configured [`crate::MergeOperator`].
-    ///
-    /// # Required algebraic contract
-    ///
-    /// Let `apply(base, operand)` represent the configured merge operator. For
-    /// every base value and every pair of operands that may concurrently target
-    /// the key, the caller must ensure:
-    ///
-    /// ```text
-    /// apply(apply(base, a), b) == apply(apply(base, b), a)
-    /// ```
-    ///
-    /// The existing associativity requirements of [`crate::MergeOperator`] and
-    /// [`crate::MergeOperator::merge_batch`] also continue to apply. SlateDB
-    /// cannot inspect an application-defined merge operator or prove this
-    /// property. Idempotence is not required, so additive counter deltas are
-    /// valid. Do not use this method for order-sensitive operations.
-    ///
-    /// # Conflict and isolation guarantees
-    ///
-    /// This remains a tracked write and does not have the broad semantics of
-    /// [`Self::unmark_write`].
-    ///
-    /// - A write/write conflict is omitted only when both transactions classify
-    ///   their final operations for the key exclusively as commutative merges.
-    /// - A put, delete, ordinary merge, or mixture of operation kinds makes the
-    ///   key exclusive and restores normal write/write conflict detection.
-    /// - Serializable point-read and range-read dependencies continue to see
-    ///   this key as written and can still cause the transaction to abort.
-    /// - Reading the key before calling this method does not suppress that read
-    ///   dependency, and conflicts involving other keys are unaffected.
-    ///
-    /// The operand remains part of the transaction's ordinary atomic write
-    /// batch. Commit ordering, durability, snapshot visibility, merge-operator
-    /// execution, and error propagation are unchanged. The commutative marker
-    /// is transaction conflict metadata only and is not stored on disk.
-    ///
-    /// Custom [`MergeOptions`] are intentionally unsupported because TTL or
-    /// other order-sensitive options would require a separate compatibility
-    /// contract.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::Error`] when the database has no configured
-    /// [`crate::MergeOperator`].
-    ///
-    /// # Panics
-    ///
-    /// Panics under the same input constraints as other write operations:
-    /// the key must be non-empty and no larger than `u16::MAX` bytes, and the
-    /// operand must be no larger than `u32::MAX` bytes.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use std::sync::Arc;
-    ///
-    /// use bytes::Bytes;
-    /// use slatedb::object_store::{memory::InMemory, ObjectStore};
-    /// use slatedb::{Db, Error, IsolationLevel, MergeOperator, MergeOperatorError};
-    ///
-    /// struct Counter;
-    ///
-    /// impl MergeOperator for Counter {
-    ///     fn merge(
-    ///         &self,
-    ///         _key: &Bytes,
-    ///         existing: Option<Bytes>,
-    ///         operand: Bytes,
-    ///     ) -> Result<Bytes, MergeOperatorError> {
-    ///         let current = existing
-    ///             .map(|value| u64::from_le_bytes(value.as_ref().try_into().unwrap()))
-    ///             .unwrap_or(0);
-    ///         let delta = u64::from_le_bytes(operand.as_ref().try_into().unwrap());
-    ///         Ok(Bytes::copy_from_slice(&(current + delta).to_le_bytes()))
-    ///     }
-    /// }
-    ///
-    /// # #[tokio::main]
-    /// # async fn main() -> Result<(), Error> {
-    /// let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    /// let db = Db::builder("commutative-merge-example", store)
-    ///     .with_merge_operator(Arc::new(Counter))
-    ///     .build()
-    ///     .await?;
-    ///
-    /// let first = db.begin(IsolationLevel::SerializableSnapshot).await?;
-    /// let second = db.begin(IsolationLevel::SerializableSnapshot).await?;
-    /// first.merge_commutative(b"counter", 1_u64.to_le_bytes())?;
-    /// second.merge_commutative(b"counter", 1_u64.to_le_bytes())?;
-    /// first.commit().await?;
-    /// second.commit().await?;
-    ///
-    /// let value = db.get(b"counter").await?.unwrap();
-    /// assert_eq!(u64::from_le_bytes(value.as_ref().try_into().unwrap()), 2);
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn merge_commutative<K, V>(&self, key: K, operand: V) -> Result<(), crate::Error>
-    where
-        K: AsRef<[u8]>,
-        V: AsRef<[u8]>,
-    {
-        if self.db_inner.flush_merge_operator.is_none() {
-            return Err(SlateDBError::MergeOperatorMissing.into());
-        }
-
-        self.write_batch.write().merge_commutative(key, operand);
-        Ok(())
-    }
-
     /// Buffers a merge operand whose logical writes are identified by
     /// `discriminators`.
     ///
     /// Concurrent transactions may commit merges to the same physical key
     /// only when both use this method and their discriminator sets are
-    /// disjoint. Any overlapping discriminator, ordinary write, ordinary
-    /// merge, or commutative merge retains the normal write/write conflict.
+    /// disjoint. Any overlapping discriminator, ordinary write, or ordinary
+    /// merge retains the normal write/write conflict.
     /// Point and range reads still conflict at the physical key.
     ///
     /// The caller must use the same stable discriminator for every operation
@@ -877,6 +804,11 @@ impl DbTransaction {
     /// associative and order-independent across disjoint discriminator sets.
     /// This metadata is used only for transaction conflict detection and is
     /// not persisted.
+    ///
+    /// Disjoint merges never expire. A put or merge on the same key in this
+    /// transaction must not expire either: one that does, including through
+    /// the default TTL, fails the commit with an invalid-argument error. Pass
+    /// [`Ttl::NoExpiry`](crate::config::Ttl::NoExpiry) to combine them.
     ///
     /// # Panics
     ///
@@ -947,8 +879,9 @@ impl DbTransaction {
     /// conflict at commit, while valid disjoint writes retain their logical
     /// member compatibility.
     ///
-    /// Disjoint merges never expire. Callers that need TTL semantics must use
-    /// an exclusive merge with explicit [`MergeOptions`].
+    /// Disjoint merges never expire, with the same restriction on other
+    /// writes to the key as [`Self::merge_disjoint`]. Callers that need TTL
+    /// semantics must use an exclusive merge with explicit [`MergeOptions`].
     pub async fn merge_disjoint_checked<K, V, D, I>(
         &self,
         key: K,
@@ -1054,7 +987,7 @@ impl DbTransaction {
             .as_ref()
             .ok_or(SlateDBError::MergeOperatorMissing)?;
         let existing_value = self
-            .get_key_value_with_options_inner(&key, &ReadOptions::default(), false)
+            .get_key_value_with_options_inner(&key, &ReadOptions::default(), PointRead::Untracked)
             .await?
             .map(|value| value.value);
         merge_operator
@@ -1189,9 +1122,6 @@ impl DbTransaction {
                 .filter(|key| !untracked_write_keys.contains(key))
                 .map(|key| {
                     let kind = match write_batch.merge_conflict_kind(&key) {
-                        Some(MergeConflictKind::Commutative) => {
-                            TransactionWriteKind::CommutativeMerge
-                        }
                         Some(MergeConflictKind::Disjoint(discriminators)) => {
                             TransactionWriteKind::DisjointMerge(discriminators.clone())
                         }
@@ -1329,14 +1259,6 @@ impl DbTransactionOps for DbTransaction {
         V: AsRef<[u8]>,
     {
         DbTransaction::merge_with_options(self, key, value, options)
-    }
-
-    fn merge_commutative<K, V>(&self, key: K, operand: V) -> Result<(), crate::Error>
-    where
-        K: AsRef<[u8]>,
-        V: AsRef<[u8]>,
-    {
-        DbTransaction::merge_commutative(self, key, operand)
     }
 
     fn merge_disjoint<K, V, D, I>(
@@ -1691,9 +1613,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_txn_multi_get_reads_commutative_merge_overlay() {
+    async fn test_txn_multi_get_reads_disjoint_merge_overlay() {
         let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let db = crate::Db::builder("test_txn_multi_get_commutative_overlay", object_store)
+        let db = crate::Db::builder("test_txn_multi_get_disjoint_overlay", object_store)
             .with_merge_operator(Arc::new(CounterMergeOperator))
             .build()
             .await
@@ -1701,7 +1623,7 @@ mod tests {
         db.put(b"counter", 10_u64.to_le_bytes()).await.unwrap();
 
         let txn = db.begin(IsolationLevel::Snapshot).await.unwrap();
-        txn.merge_commutative(b"counter", 2_u64.to_le_bytes())
+        txn.merge_disjoint(b"counter", [b"member"], 2_u64.to_le_bytes())
             .unwrap();
 
         let values = txn
@@ -1718,10 +1640,96 @@ mod tests {
         assert_eq!(u64::from_le_bytes(value.as_ref().try_into().unwrap()), 12);
     }
 
+    /// A transaction multi-get is one get request whether its keys resolve
+    /// from the write batch, the reader or a point-get fallback.
+    #[rstest]
+    #[case::reader_and_fallback(&[b"counter".as_slice(), b"plain".as_slice()])]
+    #[case::fallback_only(&[b"counter".as_slice()])]
+    #[case::write_batch_only(&[b"pending".as_slice()])]
     #[tokio::test]
-    async fn test_txn_multi_get_read_conflicts_with_commutative_merge() {
+    async fn test_txn_multi_get_counts_one_get_request(#[case] keys: &[&[u8]]) {
+        use slatedb_common::metrics::{lookup_metric_with_labels, DefaultMetricsRecorder};
+
+        // given: a transaction with a pending merge and a pending put
         let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let db = crate::Db::builder("test_txn_multi_get_commutative_conflict", object_store)
+        let metrics = Arc::new(DefaultMetricsRecorder::new());
+        let db = crate::Db::builder("test_txn_multi_get_counts_one_get_request", object_store)
+            .with_metrics_recorder(metrics.clone())
+            .with_merge_operator(Arc::new(CounterMergeOperator))
+            .build()
+            .await
+            .unwrap();
+        db.put(b"plain", b"value").await.unwrap();
+        let txn = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        txn.merge_disjoint(b"counter", [b"member"], 2_u64.to_le_bytes())
+            .unwrap();
+        txn.put(b"pending", b"value").unwrap();
+        let requests = || {
+            lookup_metric_with_labels(&metrics, crate::db_stats::REQUEST_COUNT, &[("op", "get")])
+                .unwrap_or(0)
+        };
+        let before = requests();
+
+        // when
+        txn.multi_get(keys).await.unwrap();
+
+        // then
+        assert_eq!(requests() - before, 1);
+    }
+
+    /// Disjoint merges never expire, so a same-key put that expires through the
+    /// default TTL fails the commit and writes nothing, while a non-expiring
+    /// put combines with the merge.
+    #[rstest]
+    #[case::default_ttl(crate::config::Ttl::Default, None)]
+    #[case::no_expiry(crate::config::Ttl::NoExpiry, Some(12))]
+    #[tokio::test]
+    async fn test_txn_disjoint_merge_requires_non_expiring_same_key_writes(
+        #[case] put_ttl: crate::config::Ttl,
+        #[case] expected: Option<u64>,
+    ) {
+        // given: a DB with a default TTL
+        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = crate::Db::builder("test_txn_disjoint_merge_ttl", object_store)
+            .with_settings(crate::config::Settings {
+                default_ttl_millis: Some(60_000),
+                ..Default::default()
+            })
+            .with_merge_operator(Arc::new(CounterMergeOperator))
+            .build()
+            .await
+            .unwrap();
+
+        // when: one transaction puts and disjointly merges the same key
+        let txn = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        txn.put_with_options(
+            b"counter",
+            10_u64.to_le_bytes(),
+            &PutOptions { ttl: put_ttl },
+        )
+        .unwrap();
+        txn.merge_disjoint(b"counter", [b"member"], 2_u64.to_le_bytes())
+            .unwrap();
+        let committed = txn.commit().await;
+
+        // then
+        assert_eq!(
+            committed.as_ref().err().map(crate::Error::kind),
+            expected.is_none().then_some(crate::ErrorKind::Invalid),
+            "{committed:?}"
+        );
+        let value = db
+            .get(b"counter")
+            .await
+            .unwrap()
+            .map(|value| u64::from_le_bytes(value.as_ref().try_into().unwrap()));
+        assert_eq!(value, expected);
+    }
+
+    #[tokio::test]
+    async fn test_txn_multi_get_read_conflicts_with_disjoint_merge() {
+        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = crate::Db::builder("test_txn_multi_get_disjoint_conflict", object_store)
             .with_merge_operator(Arc::new(CounterMergeOperator))
             .build()
             .await
@@ -1740,7 +1748,7 @@ mod tests {
 
         let writer = db.begin(IsolationLevel::Snapshot).await.unwrap();
         writer
-            .merge_commutative(b"counter", 1_u64.to_le_bytes())
+            .merge_disjoint(b"counter", [b"member"], 1_u64.to_le_bytes())
             .unwrap();
         writer.commit().await.unwrap();
 
@@ -2924,48 +2932,6 @@ mod tests {
         assert_eq!(total, EXPECTED);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn test_commutative_merge_counter_aggregates_under_high_concurrency() {
-        const CONCURRENT_TXNS: usize = 32;
-        const ROUNDS: usize = 8;
-        const MERGE_INCREMENT: [u8; 8] = 1u64.to_le_bytes();
-        const EXPECTED: u64 = (CONCURRENT_TXNS * ROUNDS) as u64;
-
-        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let db = crate::Db::builder("test_commutative_merge_counter", object_store)
-            .with_merge_operator(Arc::new(CounterMergeOperator))
-            .build()
-            .await
-            .unwrap();
-
-        for _ in 0..ROUNDS {
-            let barrier = Arc::new(tokio::sync::Barrier::new(CONCURRENT_TXNS));
-            let mut handles = Vec::with_capacity(CONCURRENT_TXNS);
-
-            for _ in 0..CONCURRENT_TXNS {
-                let db = db.clone();
-                let barrier = barrier.clone();
-                handles.push(tokio::spawn(async move {
-                    let txn = db
-                        .begin(IsolationLevel::SerializableSnapshot)
-                        .await
-                        .unwrap();
-                    txn.merge_commutative(b"counter", MERGE_INCREMENT).unwrap();
-                    barrier.wait().await;
-                    txn.commit().await.unwrap();
-                }));
-            }
-
-            for handle in handles {
-                handle.await.unwrap();
-            }
-        }
-
-        let value = db.get(b"counter").await.unwrap().unwrap();
-        let total = u64::from_le_bytes(value.as_ref().try_into().unwrap());
-        assert_eq!(total, EXPECTED);
-    }
-
     #[tokio::test]
     async fn test_disjoint_merges_commit_in_both_orders_and_preserve_operands() {
         const INCREMENT: [u8; 8] = 1u64.to_le_bytes();
@@ -3515,11 +3481,7 @@ mod tests {
             .await
             .unwrap();
 
-        for key in [
-            b"merge".as_slice(),
-            b"commutative".as_slice(),
-            b"put".as_slice(),
-        ] {
+        for key in [b"merge".as_slice(), b"put".as_slice(), b"delete".as_slice()] {
             db.put(key, INITIAL).await.unwrap();
             let disjoint = db.begin(IsolationLevel::Snapshot).await.unwrap();
             let other = db.begin(IsolationLevel::Snapshot).await.unwrap();
@@ -3528,8 +3490,8 @@ mod tests {
                 .unwrap();
             match key {
                 b"merge" => other.merge(key, INCREMENT).unwrap(),
-                b"commutative" => other.merge_commutative(key, INCREMENT).unwrap(),
                 b"put" => other.put(key, INITIAL).unwrap(),
+                b"delete" => other.delete(key).unwrap(),
                 _ => unreachable!(),
             }
             disjoint.commit().await.unwrap();
@@ -3582,42 +3544,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_commutative_merge_conflicts_with_ordinary_merge_put_and_delete() {
-        const INITIAL: [u8; 8] = 0u64.to_le_bytes();
-        const INCREMENT: [u8; 8] = 1u64.to_le_bytes();
-
-        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let db = crate::Db::builder("test_commutative_merge_exclusive_conflicts", object_store)
-            .with_merge_operator(Arc::new(CounterMergeOperator))
-            .build()
-            .await
-            .unwrap();
-
-        for key in [b"merge".as_slice(), b"put".as_slice(), b"delete".as_slice()] {
-            db.put(key, INITIAL).await.unwrap();
-            let commutative = db.begin(IsolationLevel::Snapshot).await.unwrap();
-            let exclusive = db.begin(IsolationLevel::Snapshot).await.unwrap();
-            commutative.merge_commutative(key, INCREMENT).unwrap();
-
-            match key {
-                b"merge" => exclusive.merge(key, INCREMENT).unwrap(),
-                b"put" => exclusive.put(key, INITIAL).unwrap(),
-                b"delete" => exclusive.delete(key).unwrap(),
-                _ => unreachable!(),
-            }
-
-            commutative.commit().await.unwrap();
-            assert!(exclusive.commit().await.is_err());
-        }
-    }
-
-    #[tokio::test]
     async fn test_mixed_same_key_operations_restore_exclusive_conflicts() {
         const INITIAL: [u8; 8] = 0u64.to_le_bytes();
         const INCREMENT: [u8; 8] = 1u64.to_le_bytes();
 
         let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let db = crate::Db::builder("test_commutative_merge_mixed_operations", object_store)
+        let db = crate::Db::builder("test_disjoint_merge_mixed_operations", object_store)
             .with_merge_operator(Arc::new(CounterMergeOperator))
             .build()
             .await
@@ -3625,58 +3557,18 @@ mod tests {
         db.put(b"counter", INITIAL).await.unwrap();
 
         let mixed = db.begin(IsolationLevel::Snapshot).await.unwrap();
-        mixed.merge_commutative(b"counter", INCREMENT).unwrap();
+        mixed
+            .merge_disjoint(b"counter", [b"member-a"], INCREMENT)
+            .unwrap();
         mixed.put(b"counter", INITIAL).unwrap();
 
-        let commutative = db.begin(IsolationLevel::Snapshot).await.unwrap();
-        commutative
-            .merge_commutative(b"counter", INCREMENT)
+        let disjoint = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        disjoint
+            .merge_disjoint(b"counter", [b"member-b"], INCREMENT)
             .unwrap();
-        commutative.commit().await.unwrap();
+        disjoint.commit().await.unwrap();
 
         assert!(mixed.commit().await.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_commutative_merge_remains_visible_to_ssi_point_and_range_reads() {
-        const INCREMENT: [u8; 8] = 1u64.to_le_bytes();
-
-        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let db = crate::Db::builder("test_commutative_merge_ssi_reads", object_store)
-            .with_merge_operator(Arc::new(CounterMergeOperator))
-            .build()
-            .await
-            .unwrap();
-
-        let point_reader = db
-            .begin(IsolationLevel::SerializableSnapshot)
-            .await
-            .unwrap();
-        assert_eq!(point_reader.get(b"point").await.unwrap(), None);
-        let point_writer = db.begin(IsolationLevel::Snapshot).await.unwrap();
-        point_writer.merge_commutative(b"point", INCREMENT).unwrap();
-        point_writer.commit().await.unwrap();
-        point_reader.put(b"point-reader-write", b"value").unwrap();
-        assert!(point_reader.commit().await.is_err());
-
-        let range_reader = db
-            .begin(IsolationLevel::SerializableSnapshot)
-            .await
-            .unwrap();
-        let mut range = range_reader
-            .scan(&b"range-a"[..]..=&b"range-z"[..])
-            .await
-            .unwrap();
-        while range.next().await.unwrap().is_some() {}
-        drop(range);
-
-        let range_writer = db.begin(IsolationLevel::Snapshot).await.unwrap();
-        range_writer
-            .merge_commutative(b"range-m", INCREMENT)
-            .unwrap();
-        range_writer.commit().await.unwrap();
-        range_reader.put(b"range-reader-write", b"value").unwrap();
-        assert!(range_reader.commit().await.is_err());
     }
 
     #[tokio::test]
@@ -3694,20 +3586,6 @@ mod tests {
 
         txn.commit().await.unwrap();
         assert_eq!(db.get(b"counter").await.unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn test_txn_commutative_merge_requires_merge_operator() {
-        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let db = crate::Db::open("test_txn_commutative_merge_requires_operator", object_store)
-            .await
-            .unwrap();
-
-        let txn = db.begin(IsolationLevel::Snapshot).await.unwrap();
-        let err = txn
-            .merge_commutative(b"counter", 1u64.to_le_bytes())
-            .unwrap_err();
-        assert_eq!(err.kind(), crate::ErrorKind::Invalid);
     }
 
     #[tokio::test]
@@ -3790,7 +3668,6 @@ mod tests {
             min_filter_keys,
             l0_sst_size_bytes,
             max_wal_flushes_before_l0_flush: 4096,
-            wal_replay: crate::config::WalReplaySettings::default(),
             compactor_options,
             compression_codec: None,
             object_store_cache_options: crate::config::ObjectStoreCacheOptions::default(),

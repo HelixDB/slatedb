@@ -2,8 +2,9 @@ use crate::dispatcher::MessageHandlerExecutor;
 use crate::error::SlateDBError;
 use crate::manifest::Manifest;
 use crate::utils::WatchableOnceCellReader;
-use crate::wal::slatedb::iterator::{SlateDbWalIterator, WalIteratorEndBound};
-use crate::wal::slatedb::reader::SlateDbWalReaderOptions;
+use crate::wal::slatedb::iterator::{
+    SlateDbWalIterator, SlateDbWalIteratorOptions, WalIteratorEndBound,
+};
 use crate::wal::slatedb::writer::SlateDbWalWriter;
 use crate::wal::{WalError, WriterInitResult, WriterManifest};
 use crate::{wal, Settings};
@@ -19,9 +20,6 @@ use super::store::WalTableStore;
 pub(crate) struct SlateDbWalWriterInitOptions {
     max_wal_bytes_size: usize,
     max_wal_flushes_before_l0_flush: u64,
-    max_replay_metadata_bytes: usize,
-    max_replay_block_bytes: usize,
-    max_replay_concurrent_objects: usize,
     max_flush_interval: Option<Duration>,
 }
 
@@ -30,9 +28,6 @@ impl From<&Settings> for SlateDbWalWriterInitOptions {
         Self {
             max_wal_bytes_size: settings.l0_sst_size_bytes,
             max_wal_flushes_before_l0_flush: settings.max_wal_flushes_before_l0_flush,
-            max_replay_metadata_bytes: settings.wal_replay.metadata_working_memory_limit(),
-            max_replay_block_bytes: settings.wal_replay.block_working_memory_limit(),
-            max_replay_concurrent_objects: settings.wal_replay.max_concurrent_objects,
             max_flush_interval: settings.flush_interval,
         }
     }
@@ -44,9 +39,6 @@ pub(crate) struct SlateDbWalWriterInit {
     table_store: Arc<WalTableStore>,
     max_wal_bytes_size: usize,
     max_wal_flushes_before_l0_flush: u64,
-    max_replay_metadata_bytes: usize,
-    max_replay_block_bytes: usize,
-    max_replay_concurrent_objects: usize,
     max_flush_interval: Option<Duration>,
     empty_wal_id: u64,
     task_executor: Arc<MessageHandlerExecutor>,
@@ -65,8 +57,9 @@ impl SlateDbWalWriterInit {
         fp_tx: FailPointTx,
     ) -> Result<Self, SlateDBError> {
         let empty_wal_id = table_store
-            .next_wal_sst_id(manifest.core.replay_after_wal_id)
-            .await?;
+            .next_wal_sst_id(manifest.core.replay_after_wal_id.into())
+            .await?
+            .value();
         fail_point_send!(fp_tx, "LoadEmptyWalId");
         Ok(Self {
             closed_result_reader,
@@ -74,9 +67,6 @@ impl SlateDbWalWriterInit {
             table_store,
             max_wal_bytes_size: options.max_wal_bytes_size,
             max_wal_flushes_before_l0_flush: options.max_wal_flushes_before_l0_flush,
-            max_replay_metadata_bytes: options.max_replay_metadata_bytes,
-            max_replay_block_bytes: options.max_replay_block_bytes,
-            max_replay_concurrent_objects: options.max_replay_concurrent_objects,
             max_flush_interval: options.max_flush_interval,
             empty_wal_id,
             task_executor,
@@ -101,8 +91,9 @@ impl wal::WriterInit for SlateDbWalWriterInit {
             // the next wal id
             empty_wal_id = self
                 .table_store
-                .next_wal_sst_id(manifest.core().replay_after_wal_id)
-                .await?;
+                .next_wal_sst_id(manifest.core().replay_after_wal_id.into())
+                .await?
+                .value();
             writer_manifest.refresh().await?;
             manifest = writer_manifest.manifest();
             fail_point_send!(self.fp_tx, "ReloadEmptyWalId");
@@ -115,7 +106,7 @@ impl wal::WriterInit for SlateDbWalWriterInit {
         let mut _attempt = 0;
         loop {
             _attempt += 1;
-            let wrote_fence = match self.table_store.write_wal_fence(empty_wal_id).await {
+            let wrote_fence = match self.table_store.write_wal_fence(empty_wal_id.into()).await {
                 Ok(()) => true,
                 Err(SlateDBError::Fenced) => false,
                 Err(err) => return Err(err.into()),
@@ -131,12 +122,7 @@ impl wal::WriterInit for SlateDbWalWriterInit {
                 let replay_iterator = SlateDbWalIterator::range(
                     replay_after_wal_id + 1,
                     WalIteratorEndBound::Exclusive(empty_wal_id + 1),
-                    SlateDbWalReaderOptions {
-                        sst_batch_size: self.max_replay_concurrent_objects,
-                        read_ahead_bytes: self.max_replay_block_bytes,
-                        ..SlateDbWalReaderOptions::default()
-                    }
-                    .into(),
+                    SlateDbWalIteratorOptions::default(),
                     self.table_store.clone(),
                 )?;
                 let wal_writer = SlateDbWalWriter::start_new(
@@ -146,8 +132,6 @@ impl wal::WriterInit for SlateDbWalWriterInit {
                     self.table_store.clone(),
                     self.max_wal_bytes_size,
                     self.max_wal_flushes_before_l0_flush,
-                    self.max_replay_metadata_bytes,
-                    self.max_replay_block_bytes,
                     self.max_flush_interval,
                     self.task_executor.clone(),
                 )

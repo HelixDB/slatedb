@@ -30,9 +30,6 @@ pub enum IsolationLevel {
 pub(crate) enum TransactionWriteKind {
     /// The key conflicts with every concurrent write to the same key.
     Exclusive,
-    /// The key is merge-only and may coexist with another merge-only,
-    /// commutative write to the same key.
-    CommutativeMerge,
     /// Merge operations may coexist only when their logical discriminator
     /// sets do not overlap.
     DisjointMerge(DisjointMergeDiscriminators),
@@ -81,10 +78,6 @@ impl TransactionState {
                 .entry(key)
                 .and_modify(|existing| {
                     let compatible = match (&mut *existing, &kind) {
-                        (
-                            TransactionWriteKind::CommutativeMerge,
-                            TransactionWriteKind::CommutativeMerge,
-                        ) => true,
                         (
                             TransactionWriteKind::DisjointMerge(existing),
                             TransactionWriteKind::DisjointMerge(next),
@@ -561,10 +554,6 @@ impl TransactionManagerInner {
                     };
                     let compatible = match (kind, other_kind) {
                         (
-                            TransactionWriteKind::CommutativeMerge,
-                            TransactionWriteKind::CommutativeMerge,
-                        ) => true,
-                        (
                             TransactionWriteKind::DisjointMerge(current),
                             TransactionWriteKind::DisjointMerge(committed),
                         ) => current.is_disjoint(committed),
@@ -648,12 +637,10 @@ mod tests {
             .collect()
     }
 
-    fn commutative_writes(
-        keys: impl IntoIterator<Item = &'static str>,
-    ) -> HashMap<Bytes, TransactionWriteKind> {
-        keys.into_iter()
-            .map(|key| (Bytes::from(key), TransactionWriteKind::CommutativeMerge))
-            .collect()
+    fn disjoint_kind(discriminator: &'static str) -> TransactionWriteKind {
+        TransactionWriteKind::DisjointMerge(DisjointMergeDiscriminators::from_bytes([Bytes::from(
+            discriminator,
+        )]))
     }
 
     fn disjoint_writes(
@@ -935,19 +922,20 @@ mod tests {
     }
 
     #[rstest]
-    #[case::commutative_with_commutative(
-        TransactionWriteKind::CommutativeMerge,
-        TransactionWriteKind::CommutativeMerge,
-        false
+    #[case::disjoint_with_disjoint(disjoint_kind("member-a"), disjoint_kind("member-b"), false)]
+    #[case::disjoint_with_overlapping_disjoint(
+        disjoint_kind("member-a"),
+        disjoint_kind("member-a"),
+        true
     )]
-    #[case::commutative_with_exclusive(
-        TransactionWriteKind::CommutativeMerge,
+    #[case::disjoint_with_exclusive(
+        disjoint_kind("member-a"),
         TransactionWriteKind::Exclusive,
         true
     )]
-    #[case::exclusive_with_commutative(
+    #[case::exclusive_with_disjoint(
         TransactionWriteKind::Exclusive,
-        TransactionWriteKind::CommutativeMerge,
+        disjoint_kind("member-a"),
         true
     )]
     #[case::exclusive_with_exclusive(
@@ -989,45 +977,31 @@ mod tests {
 
     #[test]
     fn test_mixed_write_kinds_are_exclusive_in_either_order() {
-        let mut repeated_commutative = TransactionState {
+        let mut disjoint_then_exclusive = TransactionState {
             started_seq: 0,
             committed_seq: None,
             writes: HashMap::new(),
             read_keys: HashSet::new(),
             read_ranges: Vec::new(),
         };
-        repeated_commutative.track_writes(commutative_writes(["key"]));
-        repeated_commutative.track_writes(commutative_writes(["key"]));
+        disjoint_then_exclusive.track_writes(disjoint_writes("key", ["member-a"]));
+        disjoint_then_exclusive.track_writes(exclusive_writes(["key"]));
         assert_eq!(
-            repeated_commutative.writes.get(b"key".as_slice()),
-            Some(&TransactionWriteKind::CommutativeMerge)
-        );
-
-        let mut commutative_then_exclusive = TransactionState {
-            started_seq: 0,
-            committed_seq: None,
-            writes: HashMap::new(),
-            read_keys: HashSet::new(),
-            read_ranges: Vec::new(),
-        };
-        commutative_then_exclusive.track_writes(commutative_writes(["key"]));
-        commutative_then_exclusive.track_writes(exclusive_writes(["key"]));
-        assert_eq!(
-            commutative_then_exclusive.writes.get(b"key".as_slice()),
+            disjoint_then_exclusive.writes.get(b"key".as_slice()),
             Some(&TransactionWriteKind::Exclusive)
         );
 
-        let mut exclusive_then_commutative = TransactionState {
+        let mut exclusive_then_disjoint = TransactionState {
             started_seq: 0,
             committed_seq: None,
             writes: HashMap::new(),
             read_keys: HashSet::new(),
             read_ranges: Vec::new(),
         };
-        exclusive_then_commutative.track_writes(exclusive_writes(["key"]));
-        exclusive_then_commutative.track_writes(commutative_writes(["key"]));
+        exclusive_then_disjoint.track_writes(exclusive_writes(["key"]));
+        exclusive_then_disjoint.track_writes(disjoint_writes("key", ["member-a"]));
         assert_eq!(
-            exclusive_then_commutative.writes.get(b"key".as_slice()),
+            exclusive_then_disjoint.writes.get(b"key".as_slice()),
             Some(&TransactionWriteKind::Exclusive)
         );
 
@@ -1050,7 +1024,7 @@ mod tests {
             ))
         );
 
-        repeated_disjoint.track_writes(commutative_writes(["key"]));
+        repeated_disjoint.track_writes(exclusive_writes(["key"]));
         assert_eq!(
             repeated_disjoint.writes.get(b"key".as_slice()),
             Some(&TransactionWriteKind::Exclusive)
@@ -1079,35 +1053,7 @@ mod tests {
         assert!(
             inner.has_write_write_conflict(&disjoint_writes("key", ["member-b", "member-c"]), 100)
         );
-        assert!(inner.has_write_write_conflict(&commutative_writes(["key"]), 100));
         assert!(inner.has_write_write_conflict(&exclusive_writes(["key"]), 100));
-    }
-
-    #[test]
-    fn test_commutative_writes_remain_visible_to_point_and_range_read_conflicts() {
-        let txn_manager = create_transaction_manager();
-        txn_manager
-            .inner
-            .write()
-            .recent_committed_txns
-            .push_back(TransactionState {
-                started_seq: 50,
-                committed_seq: Some(150),
-                writes: commutative_writes(["foo5"]),
-                read_keys: HashSet::new(),
-                read_ranges: Vec::new(),
-            });
-        let read_keys = [Bytes::from_static(b"foo5")].into_iter().collect();
-
-        let inner = txn_manager.inner.read();
-        assert!(inner.has_read_write_conflict(&read_keys, Vec::new(), 100));
-        assert!(inner.has_read_write_conflict(
-            &HashSet::new(),
-            vec![BytesRange::from(
-                Bytes::from_static(b"foo0")..=Bytes::from_static(b"foo9")
-            )],
-            100
-        ));
     }
 
     #[test]
