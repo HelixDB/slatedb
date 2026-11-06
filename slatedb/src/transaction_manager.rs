@@ -10,6 +10,7 @@ use parking_lot::RwLock;
 use slatedb_common::metrics::{CounterFn, GaugeFn};
 use slatedb_common::DbRand;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::BuildHasher;
 use std::ops::RangeBounds;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -547,22 +548,8 @@ impl TransactionManagerInner {
                 "all txns in recent_committed_txns should be committed with committed_seq set",
             );
 
-            if other_committed_seq > started_seq {
-                for (key, kind) in writes {
-                    let Some(other_kind) = committed_txn.writes.get(key) else {
-                        continue;
-                    };
-                    let compatible = match (kind, other_kind) {
-                        (
-                            TransactionWriteKind::DisjointMerge(current),
-                            TransactionWriteKind::DisjointMerge(committed),
-                        ) => current.is_disjoint(committed),
-                        _ => false,
-                    };
-                    if !compatible {
-                        return true;
-                    }
-                }
+            if other_committed_seq > started_seq && writes_conflict(writes, &committed_txn.writes) {
+                return true;
             }
         }
 
@@ -594,10 +581,7 @@ impl TransactionManagerInner {
             if other_committed_seq > started_seq {
                 // Check if any of the current transaction's read keys were written by
                 // the committed transaction.
-                if read_keys
-                    .iter()
-                    .any(|read_key| committed_txn.writes.contains_key(read_key))
-                {
+                if reads_conflict(read_keys, &committed_txn.writes) {
                     return true;
                 }
 
@@ -619,6 +603,47 @@ impl TransactionManagerInner {
     }
 }
 
+/// Returns whether two write sets touch any key incompatibly.
+///
+/// This runs once per recent commit while the manager lock is held, so it walks
+/// the smaller set and probes the larger. Walking a large transaction's writes
+/// instead would hash every key once per commit and stall the whole database.
+/// Compatibility is symmetric, so the walked side cannot change the result.
+fn writes_conflict<S: BuildHasher>(
+    current: &HashMap<Bytes, TransactionWriteKind, S>,
+    committed: &HashMap<Bytes, TransactionWriteKind, S>,
+) -> bool {
+    let (smaller, larger) = if current.len() <= committed.len() {
+        (current, committed)
+    } else {
+        (committed, current)
+    };
+    smaller.iter().any(|(key, kind)| {
+        larger
+            .get(key)
+            .is_some_and(|other_kind| match (kind, other_kind) {
+                (
+                    TransactionWriteKind::DisjointMerge(current),
+                    TransactionWriteKind::DisjointMerge(committed),
+                ) => !current.is_disjoint(committed),
+                _ => true,
+            })
+    })
+}
+
+/// Returns whether a committed write set touches any read key, walking the
+/// smaller side for the same reason as [`writes_conflict`].
+fn reads_conflict<S: BuildHasher>(
+    read_keys: &HashSet<Bytes, S>,
+    writes: &HashMap<Bytes, TransactionWriteKind, S>,
+) -> bool {
+    if read_keys.len() <= writes.len() {
+        read_keys.iter().any(|key| writes.contains_key(key))
+    } else {
+        writes.keys().any(|key| read_keys.contains(key))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -627,7 +652,9 @@ mod tests {
     use parking_lot::Mutex;
     use rstest::rstest;
     use slatedb_common::DbRand;
+    use std::collections::hash_map::DefaultHasher;
     use std::collections::HashSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn exclusive_writes(
         keys: impl IntoIterator<Item = &'static str>,
@@ -919,6 +946,100 @@ mod tests {
             "Test case '{}' failed",
             case.name
         );
+    }
+
+    /// Counts every key hash, so tests can bound work without measuring time.
+    #[derive(Clone, Default)]
+    struct CountingHashState {
+        hashes: Arc<AtomicUsize>,
+    }
+
+    impl BuildHasher for CountingHashState {
+        type Hasher = DefaultHasher;
+
+        fn build_hasher(&self) -> DefaultHasher {
+            self.hashes.fetch_add(1, Ordering::Relaxed);
+            DefaultHasher::new()
+        }
+    }
+
+    fn counted_writes(
+        keys: impl Iterator<Item = String>,
+        state: &CountingHashState,
+    ) -> HashMap<Bytes, TransactionWriteKind, CountingHashState> {
+        keys.map(|key| (Bytes::from(key), TransactionWriteKind::Exclusive))
+            .fold(
+                HashMap::with_hasher(state.clone()),
+                |mut writes, (key, kind)| {
+                    writes.insert(key, kind);
+                    writes
+                },
+            )
+    }
+
+    #[rstest]
+    #[case::large_current(true)]
+    #[case::large_committed(false)]
+    fn write_conflict_work_is_bounded_by_the_smaller_transaction(#[case] large_current: bool) {
+        let state = CountingHashState::default();
+        let large = counted_writes((0..10_000).map(|key| format!("large-{key}")), &state);
+        let small = counted_writes((0..3).map(|key| format!("small-{key}")), &state);
+        state.hashes.store(0, Ordering::Relaxed);
+
+        let conflict = if large_current {
+            writes_conflict(&large, &small)
+        } else {
+            writes_conflict(&small, &large)
+        };
+
+        assert!(!conflict);
+        assert_eq!(state.hashes.load(Ordering::Relaxed), small.len());
+    }
+
+    #[rstest]
+    #[case::many_reads(10_000, 3)]
+    #[case::many_writes(3, 10_000)]
+    fn read_conflict_work_is_bounded_by_the_smaller_set(
+        #[case] reads: usize,
+        #[case] writes: usize,
+    ) {
+        let state = CountingHashState::default();
+        let mut read_keys = HashSet::with_hasher(state.clone());
+        read_keys.extend((0..reads).map(|key| Bytes::from(format!("read-{key}"))));
+        let writes = counted_writes((0..writes).map(|key| format!("write-{key}")), &state);
+        state.hashes.store(0, Ordering::Relaxed);
+
+        assert!(!reads_conflict(&read_keys, &writes));
+        assert_eq!(state.hashes.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn a_large_transaction_still_conflicts_with_a_small_commit() {
+        let txn_manager = create_transaction_manager();
+        let large_writes: HashMap<_, _> = (0..10_000)
+            .map(|key| {
+                (
+                    Bytes::from(format!("key-{key}")),
+                    TransactionWriteKind::Exclusive,
+                )
+            })
+            .collect();
+        let committed = |key: &'static str| TransactionState {
+            started_seq: 1,
+            committed_seq: Some(2),
+            writes: HashMap::from([(Bytes::from(key), TransactionWriteKind::Exclusive)]),
+            read_keys: HashSet::new(),
+            read_ranges: Vec::new(),
+        };
+        txn_manager.inner.write().recent_committed_txns =
+            vec![committed("elsewhere"), committed("key-9999")].into();
+
+        let inner = txn_manager.inner.read();
+        assert!(inner.has_write_write_conflict(&large_writes, 1));
+        assert!(!inner.has_write_write_conflict(&large_writes, 2));
+        let read_keys: HashSet<_> = large_writes.keys().cloned().collect();
+        assert!(inner.has_read_write_conflict(&read_keys, Vec::new(), 1));
+        assert!(!inner.has_read_write_conflict(&read_keys, Vec::new(), 2));
     }
 
     #[rstest]
@@ -1734,7 +1855,44 @@ mod tests {
         }
     }
 
+    fn conflict_key() -> impl Strategy<Value = Bytes> {
+        (0u8..32).prop_map(|key| Bytes::from(vec![key]))
+    }
+
+    fn write_set() -> impl Strategy<Value = HashMap<Bytes, TransactionWriteKind>> {
+        proptest::collection::hash_map(
+            conflict_key(),
+            prop_oneof![
+                Just(TransactionWriteKind::Exclusive),
+                proptest::sample::select(&["a", "b", "c", "d"]).prop_map(disjoint_kind),
+            ],
+            0..24,
+        )
+    }
+
     proptest! {
+        #[test]
+        fn prop_walking_the_smaller_side_matches_the_full_comparison(
+            current in write_set(),
+            committed in write_set(),
+            read_keys in proptest::collection::hash_set(conflict_key(), 0..24),
+        ) {
+            let full_write_conflict = current.iter().any(|(key, kind)| {
+                committed.get(key).is_some_and(|other_kind| match (kind, other_kind) {
+                    (
+                        TransactionWriteKind::DisjointMerge(current),
+                        TransactionWriteKind::DisjointMerge(committed),
+                    ) => !current.is_disjoint(committed),
+                    _ => true,
+                })
+            });
+            let full_read_conflict = read_keys.iter().any(|key| committed.contains_key(key));
+
+            prop_assert_eq!(writes_conflict(&current, &committed), full_write_conflict);
+            prop_assert_eq!(writes_conflict(&committed, &current), full_write_conflict);
+            prop_assert_eq!(reads_conflict(&read_keys, &committed), full_read_conflict);
+        }
+
         #[test]
         fn prop_inv_disjoint_active_and_committed_sets(ops in operation_sequence_strategy()) {
             let txn_manager = create_transaction_manager();
