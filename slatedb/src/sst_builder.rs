@@ -1212,14 +1212,15 @@ mod tests {
             upper in model_bound(),
             v1 in any::<bool>(),
         ) {
-            let reversed = match (&lower, &upper) {
+            let empty = match (&lower, &upper) {
+                (Bound::Included(lower), Bound::Included(upper)) => lower > upper,
                 (
                     Bound::Included(lower) | Bound::Excluded(lower),
                     Bound::Included(upper) | Bound::Excluded(upper),
                 ) => lower >= upper,
                 _ => false,
             };
-            prop_assume!(!reversed);
+            prop_assume!(!empty);
             let block_format = if v1 { BlockFormat::V1 } else { BlockFormat::Latest };
             // Keys ascend; versions of one key run newest first.
             let mut rows = rows
