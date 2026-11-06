@@ -1208,6 +1208,26 @@ mod tests {
     }
 
     #[test]
+    fn disjoint_check_gives_the_same_answer_in_both_directions() {
+        let bytes = |members: &[&str]| {
+            DisjointMergeDiscriminators::from_bytes(members.iter().map(|member| member.as_bytes()))
+        };
+        let tokens =
+            |members: &[u128]| DisjointMergeDiscriminators::from_tokens(members.iter().copied());
+        for (left, right, disjoint) in [
+            (bytes(&["a", "b"]), bytes(&["b", "c"]), false),
+            (bytes(&["a", "c"]), bytes(&["b", "d"]), true),
+            (tokens(&[1, 2]), tokens(&[2, 3]), false),
+            (tokens(&[1, 3]), tokens(&[2, 4]), true),
+            // Different representations can never be proven disjoint.
+            (bytes(&["a"]), tokens(&[1]), false),
+        ] {
+            assert_eq!(left.is_disjoint(&right), disjoint);
+            assert_eq!(right.is_disjoint(&left), disjoint);
+        }
+    }
+
+    #[test]
     fn disjoint_merge_metadata_does_not_change_write_operations() {
         // Disjoint merges never expire, so compare against a non-expiring merge.
         let mut ordinary = WriteBatch::new();

@@ -653,7 +653,7 @@ mod tests {
     use rstest::rstest;
     use slatedb_common::DbRand;
     use std::collections::hash_map::DefaultHasher;
-    use std::collections::HashSet;
+    use std::collections::{BTreeMap, BTreeSet, HashSet};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn exclusive_writes(
@@ -1855,72 +1855,169 @@ mod tests {
         }
     }
 
-    fn conflict_key() -> impl Strategy<Value = Bytes> {
-        (0u8..32).prop_map(|key| Bytes::from(vec![key]))
+    /// A write kind described with plain sets, so expected answers come from
+    /// set intersection and never from the code under test.
+    #[derive(Clone, Debug)]
+    enum ModelKind {
+        Exclusive,
+        Bytes(BTreeSet<Vec<u8>>),
+        Tokens(BTreeSet<u128>),
     }
 
-    fn write_set() -> impl Strategy<Value = HashMap<Bytes, TransactionWriteKind>> {
-        proptest::collection::hash_map(
-            conflict_key(),
-            prop_oneof![
-                Just(TransactionWriteKind::Exclusive),
-                proptest::sample::select(&["a", "b", "c", "d"]).prop_map(disjoint_kind),
-            ],
-            0..24,
-        )
-    }
-
-    proptest! {
-        #[test]
-        fn prop_walking_the_smaller_side_matches_the_full_comparison(
-            current in write_set(),
-            committed in write_set(),
-            read_keys in proptest::collection::hash_set(conflict_key(), 0..24),
-        ) {
-            let full_write_conflict = current.iter().any(|(key, kind)| {
-                committed.get(key).is_some_and(|other_kind| match (kind, other_kind) {
-                    (
-                        TransactionWriteKind::DisjointMerge(current),
-                        TransactionWriteKind::DisjointMerge(committed),
-                    ) => !current.is_disjoint(committed),
-                    _ => true,
-                })
-            });
-            let full_read_conflict = read_keys.iter().any(|key| committed.contains_key(key));
-
-            prop_assert_eq!(writes_conflict(&current, &committed), full_write_conflict);
-            prop_assert_eq!(writes_conflict(&committed, &current), full_write_conflict);
-            prop_assert_eq!(reads_conflict(&read_keys, &committed), full_read_conflict);
-        }
-
-        #[test]
-        fn prop_inv_disjoint_active_and_committed_sets(ops in operation_sequence_strategy()) {
-            let txn_manager = create_transaction_manager();
-            let mut exec_state = ExecutionState::new();
-
-            for op in ops {
-                exec_state.execute_operation(&txn_manager, &op);
-
-                // Verify that active_txns.keys() and committed transaction IDs are disjoint
-                let inner = txn_manager.inner.read();
-                let active_ids: HashSet<Uuid> = inner.active_txns.keys().cloned().collect();
-
-                for active_id in &active_ids {
-                    // Each active transaction should not appear in recent_committed_txns
-                    // Since we don't store the original ID in committed txns, this is automatically true
-                    prop_assert!(inner.active_txns.contains_key(active_id),
-                        "Active transaction {:?} should be in active_txns", active_id);
-                }
-
-                // The real check: a transaction cannot be both active and committed simultaneously
-                // This is enforced by track_recent_committed_txn removing from active_txns
-                prop_assert!(
-                    inner.recent_committed_txns.iter().all(|_committed_txn| true),
-                    "No committed transaction should have an active counterpart"
-                );
+    impl ModelKind {
+        fn write_kind(&self) -> TransactionWriteKind {
+            match self {
+                ModelKind::Exclusive => TransactionWriteKind::Exclusive,
+                ModelKind::Bytes(members) => TransactionWriteKind::DisjointMerge(
+                    DisjointMergeDiscriminators::from_bytes(members.iter()),
+                ),
+                ModelKind::Tokens(tokens) => TransactionWriteKind::DisjointMerge(
+                    DisjointMergeDiscriminators::from_tokens(tokens.iter().copied()),
+                ),
             }
         }
 
+        fn compatible_with(&self, other: &Self) -> bool {
+            match (self, other) {
+                (ModelKind::Bytes(left), ModelKind::Bytes(right)) => {
+                    left.intersection(right).next().is_none()
+                }
+                (ModelKind::Tokens(left), ModelKind::Tokens(right)) => {
+                    left.intersection(right).next().is_none()
+                }
+                _ => false,
+            }
+        }
+    }
+
+    type ModelWrites = BTreeMap<u8, ModelKind>;
+
+    fn model_writes_conflict(left: &ModelWrites, right: &ModelWrites) -> bool {
+        left.iter().any(|(key, kind)| {
+            right
+                .get(key)
+                .is_some_and(|other| !kind.compatible_with(other))
+        })
+    }
+
+    fn real_writes(model: &ModelWrites) -> HashMap<Bytes, TransactionWriteKind> {
+        model
+            .iter()
+            .map(|(key, kind)| (Bytes::from(vec![*key]), kind.write_kind()))
+            .collect()
+    }
+
+    fn real_keys(keys: &BTreeSet<u8>) -> HashSet<Bytes> {
+        keys.iter().map(|key| Bytes::from(vec![*key])).collect()
+    }
+
+    /// Short members collide often; long ones spill past the inline capacity.
+    fn model_member() -> impl Strategy<Value = Vec<u8>> {
+        prop_oneof![vec(0u8..3, 1..=2), vec(0u8..2, 17..=19),]
+    }
+
+    /// The high range matches real enqueue tokens, which set the top bit.
+    fn model_token() -> impl Strategy<Value = u128> {
+        prop_oneof![
+            0u128..6,
+            (0u128..6).prop_map(|token| (1 << 127) | token),
+            Just(u128::MAX),
+        ]
+    }
+
+    fn model_kind() -> impl Strategy<Value = ModelKind> {
+        prop_oneof![
+            Just(ModelKind::Exclusive),
+            proptest::collection::btree_set(model_member(), 1..6).prop_map(ModelKind::Bytes),
+            proptest::collection::btree_set(model_token(), 1..6).prop_map(ModelKind::Tokens),
+        ]
+    }
+
+    /// Mixes sizes so each side is the smaller one about as often.
+    fn model_writes() -> impl Strategy<Value = ModelWrites> {
+        let sized = |max| proptest::collection::btree_map(0u8..48, model_kind(), 0..max);
+        prop_oneof![sized(3), sized(12), sized(48)]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2_000))]
+
+        #[test]
+        fn prop_write_conflicts_match_set_intersection(
+            current in model_writes(),
+            committed in model_writes(),
+        ) {
+            let expected = model_writes_conflict(&current, &committed);
+            let (current, committed) = (real_writes(&current), real_writes(&committed));
+            prop_assert_eq!(writes_conflict(&current, &committed), expected);
+            prop_assert_eq!(writes_conflict(&committed, &current), expected);
+        }
+
+        #[test]
+        fn prop_read_conflicts_match_key_overlap(
+            read_keys in proptest::collection::btree_set(0u8..48, 0..48),
+            committed in model_writes(),
+        ) {
+            let expected = read_keys.iter().any(|key| committed.contains_key(key));
+            prop_assert_eq!(
+                reads_conflict(&real_keys(&read_keys), &real_writes(&committed)),
+                expected
+            );
+        }
+
+        #[test]
+        fn prop_manager_checks_only_commits_after_the_snapshot(
+            current in model_writes(),
+            read_keys in proptest::collection::btree_set(0u8..48, 0..24),
+            commits in vec((model_writes(), 1u64..12), 0..8),
+            started_seq in 0u64..12,
+        ) {
+            let txn_manager = create_transaction_manager();
+            txn_manager.inner.write().recent_committed_txns = commits
+                .iter()
+                .map(|(writes, committed_seq)| TransactionState {
+                    started_seq: 0,
+                    committed_seq: Some(*committed_seq),
+                    writes: real_writes(writes),
+                    read_keys: HashSet::new(),
+                    read_ranges: Vec::new(),
+                })
+                .collect();
+            let mut newer = commits
+                .iter()
+                .filter(|(_, committed_seq)| *committed_seq > started_seq)
+                .map(|(writes, _)| writes);
+
+            let inner = txn_manager.inner.read();
+            prop_assert_eq!(
+                inner.has_write_write_conflict(&real_writes(&current), started_seq),
+                newer.clone().any(|writes| model_writes_conflict(&current, writes))
+            );
+            prop_assert_eq!(
+                inner.has_read_write_conflict(&real_keys(&read_keys), Vec::new(), started_seq),
+                newer.any(|writes| read_keys.iter().any(|key| writes.contains_key(key)))
+            );
+        }
+
+        #[test]
+        fn prop_repeated_merges_on_a_key_keep_set_semantics(
+            first in proptest::collection::btree_set(model_token(), 1..6),
+            second in proptest::collection::btree_set(model_token(), 1..6),
+            other in proptest::collection::btree_set(model_token(), 1..6),
+        ) {
+            let tokens = |set: &BTreeSet<u128>| {
+                DisjointMergeDiscriminators::from_tokens(set.iter().copied())
+            };
+            let mut repeated = tokens(&first);
+            prop_assert!(repeated.extend_from(&tokens(&second)));
+
+            let expected = first.union(&second).all(|token| !other.contains(token));
+            prop_assert_eq!(repeated.is_disjoint(&tokens(&other)), expected);
+            prop_assert_eq!(tokens(&other).is_disjoint(&repeated), expected);
+        }
+    }
+
+    proptest! {
         #[test]
         fn prop_all_write_without_conflict_should_be_committed(ops in operation_sequence_strategy()) {
             let txn_manager = create_transaction_manager();
