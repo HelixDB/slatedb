@@ -3424,6 +3424,45 @@ mod tests {
         }
     }
 
+    #[rstest]
+    #[case::overlapping_members(&[1, 2], &[2, 3], false)]
+    #[case::disjoint_members(&[1, 3], &[2, 4], true)]
+    #[tokio::test]
+    async fn disjoint_merge_conflicts_do_not_depend_on_transaction_size(
+        #[case] large_tokens: &[u128],
+        #[case] small_tokens: &[u128],
+        #[case] compatible: bool,
+        #[values(true, false)] large_commits_first: bool,
+    ) {
+        const INCREMENT: [u8; 8] = 1u64.to_le_bytes();
+
+        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = crate::Db::builder("test_disjoint_conflict_by_size", object_store)
+            .with_merge_operator(Arc::new(CounterMergeOperator))
+            .build()
+            .await
+            .unwrap();
+        let large = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let small = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        large
+            .merge_disjoint_tokens(b"members", large_tokens.iter().copied(), INCREMENT)
+            .unwrap();
+        for filler in 0..64 {
+            large.put(format!("filler-{filler}"), b"value").unwrap();
+        }
+        small
+            .merge_disjoint_tokens(b"members", small_tokens.iter().copied(), INCREMENT)
+            .unwrap();
+
+        let (first, second) = if large_commits_first {
+            (large, small)
+        } else {
+            (small, large)
+        };
+        first.commit().await.unwrap();
+        assert_eq!(second.commit().await.is_ok(), compatible);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_disjoint_merges_aggregate_under_high_concurrency() {
         const CONCURRENT_TXNS: usize = 64;
