@@ -73,6 +73,17 @@ use crate::BlockTransformer;
 use bytes::Bytes;
 use flatbuffers::DefaultAllocator;
 
+/// Rows at least this large are indexed by their full key instead of a
+/// shortened separator.
+///
+/// A separator can sort below a range that ends before the row, and a scan of
+/// that range then reads the row's whole block. That is cheap for ordinary
+/// rows and ruinous for a merged row of hundreds of megabytes. A full key is
+/// not free either: a read of exactly that key also reads the previous block,
+/// so this stays well above any ordinary row, including a vector, which can
+/// exceed a block by itself.
+const FULL_INDEX_KEY_MIN_ROW_BYTES: usize = 1024 * 1024;
+
 /// SST block format version.
 ///
 /// This enum is only available under `#[cfg(test)]` for integration tests
@@ -225,7 +236,13 @@ impl EncodedSsTableBuilder {
         self.stats.raw_key_size += entry.key.len() as u64;
         self.stats.raw_val_size += entry.value.len() as u64;
 
-        let index_key = compute_index_key(self.current_block_max_key.clone(), &entry.key);
+        let row_bytes = entry.key.len() + entry.value.len();
+        let index_key = if row_bytes > self.block_size && row_bytes >= FULL_INDEX_KEY_MIN_ROW_BYTES
+        {
+            entry.key.clone()
+        } else {
+            compute_index_key(self.current_block_max_key.clone(), &entry.key)
+        };
         let is_sst_first_key = self.sst_first_key.is_none();
 
         let mut block_size = None;
@@ -423,8 +440,9 @@ impl EncodedSsTableBuilder {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
     use rstest::rstest;
-    use std::ops::Range;
+    use std::ops::{Bound, Range};
 
     use async_trait::async_trait;
     use bytes::{BufMut, BytesMut};
@@ -439,14 +457,17 @@ mod tests {
     use crate::block_cache_policy::BlockCachePolicy;
     use crate::block_iterator::{BlockIteratorLatest, BlockLike};
     use crate::bytes_range::BytesRange;
-    use crate::db_state::{SsTableId, SsTableView};
+    use crate::db_state::{SsTableHandle, SsTableId, SsTableView};
     use crate::filter_policy::{BloomFilterPolicy, FilterQuery};
     use crate::format::block::Block;
+    use crate::iter::IterationOrder;
+    use crate::partitioned_keyspace::partitions_covering_range;
     use crate::prefix_extractor::PrefixExtractor;
     use crate::reader::ReadTrace;
     use crate::sst_iter::{SstIterator, SstIteratorOptions};
     use crate::tablestore::{TableStore, TableStoreKind};
     use crate::test_utils::{assert_iterator, build_test_sst};
+    use crate::types::ValueDeletable;
     use crate::wal::slatedb::store::{WalFileId, WalTableStore};
 
     fn test_sst_id(id: u64) -> SsTableId {
@@ -489,7 +510,6 @@ mod tests {
     #[tokio::test]
     async fn test_estimate_vs_actual_encoded_size() {
         use crate::paths::PathResolver;
-        use crate::types::ValueDeletable;
         use object_store::ObjectStoreExt;
 
         let format = SsTableFormat {
@@ -888,6 +908,331 @@ mod tests {
             assert!(sst_info.filter_len > 0);
         } else {
             assert_eq!(sst_info.filter_len, 0);
+        }
+    }
+
+    const OVERSIZED_KEY: &[u8] = b"\x06\x14queue";
+    const BEFORE_OVERSIZED: &[u8] = b"\x05\xff";
+    const AFTER_OVERSIZED: &[u8] = b"\x07";
+    const OVERSIZED_VALUE_BYTES: usize = FULL_INDEX_KEY_MIN_ROW_BYTES;
+
+    fn small_block_table_store() -> Arc<TableStore> {
+        Arc::new(TableStore::new(
+            Arc::new(InMemory::new()),
+            SsTableFormat {
+                block_size: 64,
+                ..SsTableFormat::default()
+            },
+            Path::from(""),
+            None,
+            TableStoreKind::Main,
+            BlockCachePolicy::default(),
+        ))
+    }
+
+    /// Writes `rows` of the given value sizes to one SST of small blocks.
+    async fn write_sized_rows(rows: &[(&[u8], usize)]) -> (Arc<TableStore>, SsTableHandle) {
+        let table_store = small_block_table_store();
+        let mut builder = table_store.table_builder();
+        for (key, value_bytes) in rows {
+            builder
+                .add_value(key, &vec![7; *value_bytes], None, None)
+                .await
+                .unwrap();
+        }
+        let encoded = builder.build().await.unwrap();
+        let handle = table_store
+            .write_sst(&test_sst_id(0), &encoded, Some(Bytes::new()))
+            .await
+            .unwrap();
+        (table_store, handle)
+    }
+
+    async fn index_keys(table_store: &TableStore, handle: &SsTableHandle) -> Vec<Vec<u8>> {
+        let index = table_store
+            .read_index(
+                handle,
+                true,
+                Some(Bytes::new()),
+                &ReadTrace::new(None),
+                None,
+            )
+            .await
+            .unwrap();
+        let index = index.borrow();
+        let blocks = index.block_meta();
+        (0..blocks.len())
+            .map(|block| blocks.get(block).first_key().bytes().to_vec())
+            .collect()
+    }
+
+    #[rstest]
+    #[case::starts_the_sst(&[], 0)]
+    #[case::follows_another_prefix(&[(BEFORE_OVERSIZED, 1)], 1)]
+    #[tokio::test]
+    async fn oversized_row_is_indexed_by_its_full_key(
+        #[case] before: &[(&[u8], usize)],
+        #[case] oversized_block: usize,
+    ) {
+        let rows = [
+            before,
+            &[(OVERSIZED_KEY, OVERSIZED_VALUE_BYTES), (AFTER_OVERSIZED, 1)],
+        ]
+        .concat();
+        let (table_store, handle) = write_sized_rows(&rows).await;
+
+        let keys = index_keys(&table_store, &handle).await;
+
+        assert_eq!(keys[oversized_block], OVERSIZED_KEY);
+        assert_eq!(keys[oversized_block + 1], AFTER_OVERSIZED);
+        assert!(keys.is_sorted(), "index keys stay sorted: {keys:?}");
+    }
+
+    /// A scan of a range that ends before the row must not read its block,
+    /// even though the row shares no prefix with what comes before it.
+    #[rstest]
+    #[case::starts_the_sst(&[])]
+    #[case::follows_another_prefix(&[(BEFORE_OVERSIZED, 1)])]
+    #[tokio::test]
+    async fn scan_ending_before_an_oversized_row_skips_its_block(
+        #[case] before: &[(&[u8], usize)],
+    ) {
+        let rows = [before, &[(OVERSIZED_KEY, OVERSIZED_VALUE_BYTES)]].concat();
+        let (table_store, handle) = write_sized_rows(&rows).await;
+        let oversized_block = before.len();
+
+        let index = table_store
+            .read_index(
+                &handle,
+                true,
+                Some(Bytes::new()),
+                &ReadTrace::new(None),
+                None,
+            )
+            .await
+            .unwrap();
+        let blocks = partitions_covering_range(
+            &index.borrow(),
+            Bound::Included(b"\x06\x01".as_slice()),
+            Bound::Excluded(b"\x06\x02".as_slice()),
+        );
+
+        assert!(!blocks.contains(&oversized_block), "read {blocks:?}");
+    }
+
+    /// Everything below the threshold keeps its shortened separator. A vector
+    /// row is larger than a block, and with a full key every point read of it
+    /// would also fetch the block before it.
+    #[rstest]
+    #[case::fills_a_block(64 - OVERSIZED_KEY.len(), false)]
+    #[case::vector_row(6 * 1024, false)]
+    #[case::just_below_the_threshold(FULL_INDEX_KEY_MIN_ROW_BYTES - OVERSIZED_KEY.len() - 1, false)]
+    #[case::at_the_threshold(FULL_INDEX_KEY_MIN_ROW_BYTES - OVERSIZED_KEY.len(), true)]
+    #[tokio::test]
+    async fn only_rows_at_the_threshold_keep_their_full_key(
+        #[case] value_bytes: usize,
+        #[case] full_key: bool,
+    ) {
+        let (table_store, handle) =
+            write_sized_rows(&[(BEFORE_OVERSIZED, 60), (OVERSIZED_KEY, value_bytes)]).await;
+
+        let keys = index_keys(&table_store, &handle).await;
+
+        let expected: &[u8] = if full_key { OVERSIZED_KEY } else { b"\x06" };
+        assert_eq!(keys.last().unwrap(), expected);
+    }
+
+    async fn assert_oversized_rows_read_back(db: &crate::Db, oversized: &[u8]) {
+        assert_eq!(db.get(BEFORE_OVERSIZED).await.unwrap().unwrap(), "before");
+        assert_eq!(db.get(OVERSIZED_KEY).await.unwrap().unwrap(), oversized);
+        assert_eq!(db.get(AFTER_OVERSIZED).await.unwrap().unwrap(), "after");
+        let mut below = db.scan_prefix(b"\x06\x01", ..).await.unwrap();
+        assert!(below.next().await.unwrap().is_none());
+        let mut all = db.scan(..).await.unwrap();
+        let mut rows = 0;
+        while all.next().await.unwrap().is_some() {
+            rows += 1;
+        }
+        assert_eq!(rows, 3);
+    }
+
+    #[tokio::test]
+    async fn oversized_rows_read_back_through_the_database_after_a_flush_and_reopen() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let oversized = vec![7u8; OVERSIZED_VALUE_BYTES];
+        let db = crate::Db::open("oversized_rows", object_store.clone())
+            .await
+            .unwrap();
+        db.put(BEFORE_OVERSIZED, b"before").await.unwrap();
+        db.put(OVERSIZED_KEY, &oversized).await.unwrap();
+        db.put(AFTER_OVERSIZED, b"after").await.unwrap();
+        db.flush_with_options(crate::config::FlushOptions {
+            flush_type: crate::config::FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+
+        assert_oversized_rows_read_back(&db, &oversized).await;
+        db.close().await.unwrap();
+
+        let reopened = crate::Db::open("oversized_rows", object_store)
+            .await
+            .unwrap();
+        assert_oversized_rows_read_back(&reopened, &oversized).await;
+        reopened.close().await.unwrap();
+    }
+
+    fn model_row_key() -> impl Strategy<Value = Vec<u8>> {
+        proptest::collection::vec(0u8..3, 1..=3)
+    }
+
+    fn model_row_value() -> impl Strategy<Value = ValueDeletable> {
+        let bytes = |size: usize| ValueDeletable::Value(Bytes::from(vec![7; size]));
+        prop_oneof![
+            4 => Just(bytes(1)),
+            2 => Just(bytes(6 * 1024)),
+            3 => Just(bytes(OVERSIZED_VALUE_BYTES)),
+            1 => Just(ValueDeletable::Tombstone),
+            1 => Just(ValueDeletable::Merge(Bytes::from(vec![9; OVERSIZED_VALUE_BYTES]))),
+        ]
+    }
+
+    fn model_bound() -> impl Strategy<Value = Bound<Vec<u8>>> {
+        prop_oneof![
+            Just(Bound::Unbounded),
+            model_row_key().prop_map(Bound::Included),
+            model_row_key().prop_map(Bound::Excluded),
+        ]
+    }
+
+    fn model_contains(lower: &Bound<Vec<u8>>, upper: &Bound<Vec<u8>>, key: &[u8]) -> bool {
+        let above = match lower {
+            Bound::Unbounded => true,
+            Bound::Included(bound) => key >= bound.as_slice(),
+            Bound::Excluded(bound) => key > bound.as_slice(),
+        };
+        let below = match upper {
+            Bound::Unbounded => true,
+            Bound::Included(bound) => key <= bound.as_slice(),
+            Bound::Excluded(bound) => key < bound.as_slice(),
+        };
+        above && below
+    }
+
+    async fn check_rows_read_back(
+        block_format: BlockFormat,
+        rows: Vec<(Vec<u8>, u64, ValueDeletable)>,
+        lower: Bound<Vec<u8>>,
+        upper: Bound<Vec<u8>>,
+    ) {
+        let table_store = small_block_table_store();
+        let mut builder = table_store.table_builder().with_block_format(block_format);
+        let rows = rows
+            .into_iter()
+            .map(|(key, seq, value)| RowEntry::new(key.into(), value, seq, None, None))
+            .collect::<Vec<_>>();
+        for row in &rows {
+            builder.add(row.clone()).await.unwrap();
+        }
+        let encoded = builder.build().await.unwrap();
+        let handle = SsTableView::identity(
+            table_store
+                .write_sst(&test_sst_id(0), &encoded, Some(Bytes::new()))
+                .await
+                .unwrap(),
+        );
+
+        // Every requested order and range returns exactly the sorted model.
+        for order in [IterationOrder::Ascending, IterationOrder::Descending] {
+            let mut expected = rows
+                .iter()
+                .filter(|row| model_contains(&lower, &upper, &row.key))
+                .cloned()
+                .collect::<Vec<_>>();
+            // Keys reverse, but each key's newest version still comes first.
+            if matches!(order, IterationOrder::Descending) {
+                expected
+                    .sort_by(|left, right| right.key.cmp(&left.key).then(right.seq.cmp(&left.seq)));
+            }
+            let range = BytesRange::new(
+                lower.clone().map(Bytes::from),
+                upper.clone().map(Bytes::from),
+            );
+            let iter = SstIterator::new_owned_initialized(
+                range,
+                handle.clone(),
+                table_store.clone(),
+                SstIteratorOptions {
+                    order,
+                    ..SstIteratorOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+            match iter {
+                Some(mut iter) => assert_iterator(&mut iter, expected).await,
+                None => assert!(expected.is_empty()),
+            }
+        }
+
+        // A point lookup finds every version of its key, and only those.
+        for row in &rows {
+            let expected = rows
+                .iter()
+                .filter(|other| other.key == row.key)
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut iter = SstIterator::for_key_with_stats_initialized(
+                &handle,
+                &row.key,
+                table_store.clone(),
+                SstIteratorOptions::default(),
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("a written key has a block");
+            assert_iterator(&mut iter, expected).await;
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// Duplicate versions, adjacent oversized rows, tombstones and merges
+        /// read back identically in both block formats, whatever the bound.
+        #[test]
+        fn prop_rows_read_back_like_a_sorted_model(
+            rows in proptest::collection::btree_map(
+                (model_row_key(), 1u64..4),
+                model_row_value(),
+                1..12,
+            ),
+            lower in model_bound(),
+            upper in model_bound(),
+            v1 in any::<bool>(),
+        ) {
+            let empty = match (&lower, &upper) {
+                (Bound::Included(lower), Bound::Included(upper)) => lower > upper,
+                (
+                    Bound::Included(lower) | Bound::Excluded(lower),
+                    Bound::Included(upper) | Bound::Excluded(upper),
+                ) => lower >= upper,
+                _ => false,
+            };
+            prop_assume!(!empty);
+            let block_format = if v1 { BlockFormat::V1 } else { BlockFormat::Latest };
+            // Keys ascend; versions of one key run newest first.
+            let mut rows = rows
+                .into_iter()
+                .map(|((key, seq), value)| (key, seq, value))
+                .collect::<Vec<_>>();
+            rows.sort_by(|left, right| left.0.cmp(&right.0).then(right.1.cmp(&left.1)));
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(check_rows_read_back(block_format, rows, lower, upper));
         }
     }
 
@@ -1740,8 +2085,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_stats_block_with_mixed_entry_types() {
-        use crate::types::ValueDeletable;
-
         let root_path = Path::from("");
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let format = SsTableFormat::default();
@@ -1935,7 +2278,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_block_stats_multi_block() {
-        use crate::types::ValueDeletable;
         // Use a small block_size (32) with large entries (16-byte keys + 16-byte
         // values) so every entry exceeds the block capacity and lands in its own
         // block regardless of value type.
