@@ -120,7 +120,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use crossbeam_skiplist::SkipMap;
+use bbtree::BBTreeMap;
 use fail_parallel::{fail_point, FailPointRegistry};
 use futures::{
     future::BoxFuture,
@@ -570,7 +570,7 @@ struct TaskMonitor {
     tasks: JoinMap<(String, usize), Result<(), SlateDBError>>,
     groups: HashMap<String, TaskGroup>,
     closed_result: Arc<dyn ClosedResultWriter>,
-    results: Arc<SkipMap<String, WatchableOnceCell<Result<(), SlateDBError>>>>,
+    results: Arc<BBTreeMap<String, WatchableOnceCell<Result<(), SlateDBError>>>>,
     tokens: Vec<CancellationToken>,
 }
 
@@ -605,9 +605,8 @@ impl TaskMonitor {
                         .expect("group tracking entry missing on final member")
                         .result;
                     self.results
-                        .get(&group_name)
+                        .get_cloned(&group_name)
                         .expect("result cell isn't set when expected")
-                        .value()
                         .write(group_result);
                 }
             }
@@ -638,9 +637,9 @@ pub(crate) struct MessageHandlerExecutor {
     /// A vector of futures for each dispatcher. Set to `None` when executor starts.
     futures: Mutex<Option<Vec<MessageHandlerFuture>>>,
     /// A map of cancellation tokens for each dispatcher.
-    tokens: SkipMap<String, CancellationToken>,
+    tokens: BBTreeMap<String, CancellationToken>,
     /// A map of (task name, results) for dispatchers that have returned.
-    results: Arc<SkipMap<String, WatchableOnceCell<Result<(), SlateDBError>>>>,
+    results: Arc<BBTreeMap<String, WatchableOnceCell<Result<(), SlateDBError>>>>,
     /// A wrapper that stores the final result of the database lifecycle and
     /// auto-reports the close reason. Ok(()) indicates a clean shutdown; Err(e)
     /// indicates an error.
@@ -671,8 +670,8 @@ impl MessageHandlerExecutor {
             futures: Mutex::new(Some(vec![])),
             closed_result,
             clock,
-            tokens: SkipMap::new(),
-            results: Arc::new(SkipMap::new()),
+            tokens: BBTreeMap::new(),
+            results: Arc::new(BBTreeMap::new()),
             fp_registry: Arc::new(FailPointRegistry::new()),
         }
     }
@@ -791,9 +790,11 @@ impl MessageHandlerExecutor {
             // Only insert token and result cell once per group name
             if !self.tokens.contains_key(&task_definition.name) {
                 self.tokens
-                    .insert(task_definition.name.clone(), task_definition.token.clone());
+                    .insert(task_definition.name.clone(), task_definition.token.clone())
+                    .expect("background task cancellation entry allocation failed");
                 self.results
-                    .insert(task_definition.name.clone(), WatchableOnceCell::new());
+                    .insert(task_definition.name.clone(), WatchableOnceCell::new())
+                    .expect("background task result entry allocation failed");
             }
             groups
                 .entry(task_definition.name.clone())
@@ -810,7 +811,11 @@ impl MessageHandlerExecutor {
             groups,
             closed_result: self.closed_result.clone(),
             results: self.results.clone(),
-            tokens: self.tokens.iter().map(|e| e.value().clone()).collect(),
+            tokens: self
+                .tokens
+                .range_cloned::<String, _>(..)
+                .map(|(_, token)| token)
+                .collect(),
         };
         Ok(handle.spawn(monitor.run()))
     }
@@ -821,9 +826,10 @@ impl MessageHandlerExecutor {
     ///
     /// * `name`: The name of the task to cancel.
     pub(crate) fn cancel_task(&self, name: &str) {
-        if let Some(entry) = self.tokens.get(name) {
-            entry.value().cancel();
-        }
+        let Some(token) = self.tokens.get_cloned(name) else {
+            return;
+        };
+        token.cancel();
     }
 
     /// Waits for a task to complete.
@@ -836,10 +842,10 @@ impl MessageHandlerExecutor {
     ///
     /// The result of the task.
     pub(crate) async fn join_task(&self, name: &str) -> Result<(), SlateDBError> {
-        if let Some(entry) = self.results.get(name) {
-            return entry.value().reader().await_value().await;
-        }
-        Ok(())
+        let Some(mut reader) = self.results.read(name, |_, result| result.reader()) else {
+            return Ok(());
+        };
+        reader.await_value().await
     }
 
     /// Cancels a running task and waits for it to complete.
@@ -1276,14 +1282,72 @@ mod test {
         running_result.write(Ok(()));
         task_executor
             .tokens
-            .insert("running".to_string(), running_token.clone());
+            .insert("running".to_string(), running_token.clone())
+            .unwrap();
         task_executor
             .results
-            .insert("running".to_string(), running_result);
+            .insert("running".to_string(), running_result)
+            .unwrap();
 
         task_executor.shutdown_task("running").await.unwrap();
 
         assert!(running_token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_executor_cancellation_and_join_are_isolated_by_task_name() {
+        let clock = Arc::new(DefaultSystemClock::new());
+        let task_executor =
+            MessageHandlerExecutor::new(Arc::new(WatchableOnceCell::new()), clock.clone());
+        let names = ["task", "task\0", "task-long"];
+        let mut senders = Vec::new();
+
+        for name in names {
+            let (tx, rx) = async_channel::unbounded();
+            senders.push(tx);
+            task_executor
+                .add_handler(
+                    name.to_string(),
+                    Box::new(TestHandler::new(
+                        Arc::new(Mutex::new(Vec::new())),
+                        WatchableOnceCell::new(),
+                        clock.clone(),
+                    )),
+                    rx,
+                    &Handle::current(),
+                )
+                .unwrap();
+        }
+
+        let monitor = task_executor.monitor_on(&Handle::current()).unwrap();
+        task_executor.cancel_task("missing");
+        task_executor.join_task("missing").await.unwrap();
+        task_executor.cancel_task(names[0]);
+        timeout(Duration::from_secs(5), task_executor.join_task(names[0]))
+            .await
+            .expect("cancelled task did not finish")
+            .unwrap();
+
+        for name in &names[1..] {
+            assert!(!task_executor
+                .tokens
+                .get_cloned(*name)
+                .unwrap()
+                .is_cancelled());
+            assert!(task_executor
+                .results
+                .read(*name, |_, result| result.reader().read())
+                .unwrap()
+                .is_none());
+            task_executor.cancel_task(name);
+            timeout(Duration::from_secs(5), task_executor.join_task(name))
+                .await
+                .expect("cancelled task did not finish")
+                .unwrap();
+        }
+
+        monitor.await.unwrap();
+        assert!(senders.iter().all(async_channel::Sender::is_closed));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
