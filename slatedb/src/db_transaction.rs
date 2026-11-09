@@ -399,6 +399,23 @@ impl DbTransaction {
         Ok(result)
     }
 
+    /// Reads distinct `keys` from this transaction's view, including its own
+    /// uncommitted writes, without adding them to its read set.
+    ///
+    /// A concurrent write to one of these keys cannot conflict with this
+    /// transaction at commit, even under Serializable Snapshot Isolation.
+    /// Callers must prove that outcome harmless, typically because the fact
+    /// they read can only change alongside a write to a key they also write.
+    /// [`Self::mark_read`] turns such a read into an ordinary dependency later.
+    pub async fn multi_get_untracked(
+        &self,
+        keys: &[Bytes],
+    ) -> Result<Vec<Option<Bytes>>, crate::Error> {
+        self.multi_get_unique_key_value_with_options_untracked(keys, &ReadOptions::default())
+            .await
+            .map(|values| values.into_iter().map(|kv| kv.map(|kv| kv.value)).collect())
+    }
+
     async fn multi_get_unique_key_value_with_options_untracked(
         &self,
         keys: &[Bytes],
@@ -2727,6 +2744,61 @@ mod tests {
         // Verify k2 is now in the database
         let value = db.get(b"k2").await.unwrap();
         assert_eq!(value, Some(Bytes::from_static(b"v2")));
+    }
+
+    #[tokio::test]
+    async fn test_multi_get_untracked_sees_own_writes_and_adds_no_dependency() {
+        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = crate::Db::builder("test_multi_get_untracked", object_store)
+            .build()
+            .await
+            .unwrap();
+        db.put(b"stored", b"before").await.unwrap();
+        db.put(b"deleted", b"before").await.unwrap();
+
+        let txn = db
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await
+            .unwrap();
+        txn.put(b"staged", b"own").unwrap();
+        txn.delete(b"deleted").unwrap();
+        let keys = [
+            b"stored".as_slice(),
+            b"staged".as_slice(),
+            b"deleted".as_slice(),
+            b"absent".as_slice(),
+        ]
+        .map(Bytes::from_static);
+        assert_eq!(
+            txn.multi_get_untracked(&keys).await.unwrap(),
+            vec![
+                Some(Bytes::from_static(b"before")),
+                Some(Bytes::from_static(b"own")),
+                None,
+                None,
+            ]
+        );
+
+        db.put(b"stored", b"after").await.unwrap();
+        assert_eq!(
+            txn.multi_get_untracked(&keys[..1]).await.unwrap(),
+            vec![Some(Bytes::from_static(b"before"))],
+            "the read stays on the transaction's snapshot"
+        );
+        txn.commit().await.unwrap();
+
+        let marked = db
+            .begin(IsolationLevel::SerializableSnapshot)
+            .await
+            .unwrap();
+        marked.multi_get_untracked(&keys[..1]).await.unwrap();
+        db.put(b"stored", b"later").await.unwrap();
+        marked.put(b"other", b"value").unwrap();
+        marked.mark_read([b"stored"]).unwrap();
+        assert!(
+            marked.commit().await.is_err(),
+            "a marked key conflicts like any read"
+        );
     }
 
     #[tokio::test]
