@@ -1,0 +1,6 @@
+# Crucible (https://crucibl.sh) settings for this repo, read from the default branch.
+
+[resources]
+# Four tests each allocate 4 GiB, more than a standard VM holds (2 vCPU / 4 GiB),
+# so every full run on a standard VM fails them.
+size = "large" # 8 vCPU / 16 GiB
