@@ -2542,6 +2542,7 @@ mod tests {
     use slatedb_common::metrics::{
         lookup_metric, lookup_metric_with_labels, DefaultMetricsRecorder, MetricsRecorderHelper,
     };
+    use std::num::NonZeroU64;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -2611,6 +2612,83 @@ mod tests {
             result,
             Err(error) if error.kind() == ErrorKind::Closed(crate::CloseReason::Fenced)
         ));
+    }
+
+    #[tokio::test]
+    async fn test_writer_epoch_claims_exact_epoch_and_rejects_stale_opens() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let open = |writer_epoch: u64| {
+            crate::Db::builder("exact-epoch", object_store.clone())
+                .with_writer_epoch(NonZeroU64::new(writer_epoch).unwrap())
+                .build()
+        };
+
+        // The claim may skip epochs.
+        let db = open(5).await.unwrap();
+        assert_eq!(db.manifest().writer_epoch(), 5);
+        db.close().await.unwrap();
+
+        for stale_epoch in [4, 5] {
+            assert!(matches!(
+                open(stale_epoch).await,
+                Err(error) if error.kind() == ErrorKind::Closed(crate::CloseReason::Fenced)
+            ));
+        }
+
+        let db = open(9).await.unwrap();
+        assert_eq!(db.manifest().writer_epoch(), 9);
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_expected_writer_epoch_claims_the_next_epoch() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let open = |expected_epoch: u64| {
+            crate::Db::builder("expected-epoch", object_store.clone())
+                .with_expected_epoch(expected_epoch)
+                .build()
+        };
+
+        let db = open(0).await.unwrap();
+        assert_eq!(db.manifest().writer_epoch(), 1);
+        db.close().await.unwrap();
+
+        // Unlike an exact claim, an expected claim cannot skip epochs.
+        for wrong_epoch in [0, 2] {
+            assert!(matches!(
+                open(wrong_epoch).await,
+                Err(error) if error.kind() == ErrorKind::Closed(crate::CloseReason::Fenced)
+            ));
+        }
+
+        let db = open(1).await.unwrap();
+        assert_eq!(db.manifest().writer_epoch(), 2);
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_last_writer_epoch_claim_replaces_the_earlier_claim() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        // An expected epoch of 7 fences the open of a new database.
+        let db = crate::Db::builder("claim-order", object_store.clone())
+            .with_expected_epoch(7)
+            .with_writer_epoch(NonZeroU64::new(3).unwrap())
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(db.manifest().writer_epoch(), 3);
+        db.close().await.unwrap();
+
+        // An exact epoch of 3 fences the open now that the stored epoch is 3.
+        let db = crate::Db::builder("claim-order", object_store)
+            .with_writer_epoch(NonZeroU64::new(3).unwrap())
+            .with_expected_epoch(3)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(db.manifest().writer_epoch(), 4);
+        db.close().await.unwrap();
     }
 
     #[tokio::test]
