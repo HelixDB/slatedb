@@ -426,18 +426,13 @@ fn assert_no_span(log: &str, name: &str, trace_id: &str) {
 }
 
 fn assert_merge_spans(log: &str, trace_id: &str) {
-    assert_span(
-        log,
-        "slatedb.read.merge",
-        trace_id,
-        &[("num_operands", "3")],
-    );
-    assert_span(
-        log,
-        "slatedb.read.merge",
-        trace_id,
-        &[("num_operands", "1")],
-    );
+    // The compaction into the last run resolved the sorted-run operand to a
+    // value. The read merges the two newer operands, then their result with
+    // that base.
+    let merges = span_lines(log, "slatedb.read.merge", trace_id)
+        .map(|line| span_fields(line, "slatedb.read.merge").remove("num_operands"))
+        .collect::<Vec<_>>();
+    assert_eq!(merges, [Some("2"), Some("2")], "{log}");
 }
 
 fn assert_span(log: &str, name: &str, trace_id: &str, fields: &[(&str, &str)]) {
