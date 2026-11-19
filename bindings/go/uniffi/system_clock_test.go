@@ -29,18 +29,22 @@ func TestDbFollowsTheInstalledSystemClock(t *testing.T) {
 		}
 	})
 
-	first, err := dbHandle.db.Put([]byte("k"), []byte("v"))
+	// The WAL flush timer follows the mock clock, so the writes do not wait
+	// for durability.
+	putOptions := slatedb.PutOptions{Ttl: slatedb.TtlDefault{}}
+	writeOptions := slatedb.WriteOptions{AwaitDurable: boolPtr(false), Seqnum: 0}
+	first, err := dbHandle.db.PutWithOptions([]byte("k"), []byte("v"), putOptions, writeOptions)
 	if err != nil {
-		t.Fatalf("Put(): %v", err)
+		t.Fatalf("PutWithOptions(): %v", err)
 	}
 	defer first.Destroy()
 	if got := first.CreateTs(); got != 1_000_000 {
 		t.Fatalf("CreateTs() = %d, want the mock clock's 1000000", got)
 	}
 	time.Sleep(20 * time.Millisecond)
-	second, err := dbHandle.db.Put([]byte("k"), []byte("w"))
+	second, err := dbHandle.db.PutWithOptions([]byte("k"), []byte("w"), putOptions, writeOptions)
 	if err != nil {
-		t.Fatalf("Put(): %v", err)
+		t.Fatalf("PutWithOptions(): %v", err)
 	}
 	defer second.Destroy()
 	if got := second.CreateTs(); got != 1_000_000 {
@@ -52,9 +56,9 @@ func TestDbFollowsTheInstalledSystemClock(t *testing.T) {
 	if got := clock.NowMillis(); got != 1_000_500 {
 		t.Fatalf("NowMillis() after Advance(500) = %d, want 1000500", got)
 	}
-	third, err := dbHandle.db.Put([]byte("k"), []byte("x"))
+	third, err := dbHandle.db.PutWithOptions([]byte("k"), []byte("x"), putOptions, writeOptions)
 	if err != nil {
-		t.Fatalf("Put(): %v", err)
+		t.Fatalf("PutWithOptions(): %v", err)
 	}
 	defer third.Destroy()
 	if got := third.CreateTs(); got != 1_000_500 {
