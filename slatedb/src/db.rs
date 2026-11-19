@@ -348,27 +348,42 @@ impl DbInner {
     }
 
     #[inline]
+    /// Estimated encoded sizes of the active memtable and of every immutable
+    /// memtable not yet uploaded as an L0 SST.
+    fn memtable_size_bytes(&self) -> (usize, usize) {
+        let guard = self.state.read();
+        let estimate = |metadata: KVTableMetadata| {
+            self.table_store
+                .estimate_encoded_size_compacted(metadata.entry_num, metadata.entries_size_in_bytes)
+        };
+        let active_memtable_size_bytes = estimate(guard.memtable().table().metadata());
+        let imm_memtable_size_bytes = guard
+            .state()
+            .imm_memtable
+            .iter()
+            .map(|imm| estimate(imm.table().metadata()))
+            .fold(0usize, |total, size| total.saturating_add(size));
+        (active_memtable_size_bytes, imm_memtable_size_bytes)
+    }
+
+    /// The unflushed bytes [`Self::maybe_apply_backpressure`] compares with
+    /// `max_unflushed_bytes`.
+    fn unflushed_bytes(&self) -> Result<UnflushedBytes, SlateDBError> {
+        let wal_status = self.wal_observer.status()?;
+        let (active_memtable_bytes, immutable_memtable_bytes) = self.memtable_size_bytes();
+        Ok(UnflushedBytes {
+            active_memtable_bytes,
+            immutable_memtable_bytes,
+            wal_bytes: wal_status.estimated_bytes,
+            max_unflushed_bytes: self.settings.max_unflushed_bytes,
+        })
+    }
+
     pub(crate) async fn maybe_apply_backpressure(&self) -> Result<(), SlateDBError> {
         loop {
             self.check_closed()?;
             let wal_status = self.wal_observer.status()?;
-            let (active_memtable_size_bytes, imm_memtable_size_bytes) = {
-                let guard = self.state.read();
-                let estimate = |metadata: KVTableMetadata| {
-                    self.table_store.estimate_encoded_size_compacted(
-                        metadata.entry_num,
-                        metadata.entries_size_in_bytes,
-                    )
-                };
-                let active_memtable_size_bytes = estimate(guard.memtable().table().metadata());
-                let imm_memtable_size_bytes = guard
-                    .state()
-                    .imm_memtable
-                    .iter()
-                    .map(|imm| estimate(imm.table().metadata()))
-                    .fold(0usize, |total, size| total.saturating_add(size));
-                (active_memtable_size_bytes, imm_memtable_size_bytes)
-            };
+            let (active_memtable_size_bytes, imm_memtable_size_bytes) = self.memtable_size_bytes();
             let total_mem_size_bytes = active_memtable_size_bytes
                 .saturating_add(imm_memtable_size_bytes)
                 .saturating_add(wal_status.estimated_bytes);
@@ -2160,6 +2175,45 @@ impl Db {
     /// See [`DbMetadataOps::status`].
     pub fn status(&self) -> DbStatus {
         <Self as DbMetadataOps>::status(self)
+    }
+
+    /// The bytes this writer holds that are not yet flushed to object
+    /// storage, as the write backpressure check counts them.
+    ///
+    /// Every write waits while [`UnflushedBytes::total`] is at or above
+    /// [`UnflushedBytes::max_unflushed_bytes`]. A background writer that reads
+    /// this before each batch and waits while the total is high leaves that
+    /// headroom to foreground writes instead of holding them back. The figures
+    /// are estimates computed when called, from the memtables and the WAL.
+    pub fn unflushed_bytes(&self) -> Result<UnflushedBytes, crate::Error> {
+        self.inner.check_closed()?;
+        Ok(self.inner.unflushed_bytes()?)
+    }
+}
+
+/// Bytes a writer holds that are not yet flushed to object storage; see
+/// [`Db::unflushed_bytes`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnflushedBytes {
+    /// Estimated encoded size of the active memtable.
+    pub active_memtable_bytes: usize,
+    /// Estimated encoded size of the immutable memtables awaiting upload as
+    /// L0 SSTs.
+    pub immutable_memtable_bytes: usize,
+    /// Estimated size of the WAL entries not yet durable in object storage.
+    pub wal_bytes: usize,
+    /// The total at which every write waits for flushes
+    /// ([`crate::config::Settings::max_unflushed_bytes`]).
+    pub max_unflushed_bytes: usize,
+}
+
+impl UnflushedBytes {
+    /// The total the backpressure check compares with
+    /// [`Self::max_unflushed_bytes`].
+    pub fn total(&self) -> usize {
+        self.active_memtable_bytes
+            .saturating_add(self.immutable_memtable_bytes)
+            .saturating_add(self.wal_bytes)
     }
 }
 
@@ -6041,26 +6095,17 @@ mod tests {
         let wal_status = db.inner.wal_observer.status().unwrap();
         assert_eq!(wal_status.buffered_wal_entries_count, 1);
 
-        let (active_memtable_size_bytes, imm_memtable_size_bytes) = {
-            let guard = db.inner.state.read();
-            let estimate = |metadata: KVTableMetadata| {
-                db.inner.table_store.estimate_encoded_size_compacted(
-                    metadata.entry_num,
-                    metadata.entries_size_in_bytes,
-                )
-            };
-            let active_memtable_size_bytes = estimate(guard.memtable().table().metadata());
-            let imm_memtable_size_bytes = guard
-                .state()
-                .imm_memtable
-                .iter()
-                .map(|imm| estimate(imm.table().metadata()))
-                .fold(0usize, |total, size| total.saturating_add(size));
-            (active_memtable_size_bytes, imm_memtable_size_bytes)
-        };
-        let memtable_size_bytes =
-            active_memtable_size_bytes.saturating_add(imm_memtable_size_bytes);
-        let total_mem_size_bytes = memtable_size_bytes.saturating_add(wal_status.estimated_bytes);
+        // The public accessor reports exactly what the backpressure check reads.
+        let unflushed = db.unflushed_bytes().unwrap();
+        assert_eq!(unflushed.wal_bytes, wal_status.estimated_bytes);
+        assert_eq!(
+            unflushed.max_unflushed_bytes,
+            db.inner.settings.max_unflushed_bytes
+        );
+        let memtable_size_bytes = unflushed
+            .active_memtable_bytes
+            .saturating_add(unflushed.immutable_memtable_bytes);
+        let total_mem_size_bytes = unflushed.total();
         assert!(
             memtable_size_bytes < db.inner.settings.max_unflushed_bytes,
             "test requires memtable bytes ({memtable_size_bytes}) to remain below \
@@ -6103,6 +6148,65 @@ mod tests {
         // Shutdown the background task
         join_handle.abort();
         let _ = join_handle.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_unflushed_bytes_grow_with_writes_and_drain_with_flushes() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut options = test_db_options(0, 1024 * 1024, None);
+        // Only the flushes below move bytes to object storage.
+        options.flush_interval = None;
+        let db = Db::builder("/tmp/test_unflushed_bytes", object_store)
+            .with_settings(options)
+            .build()
+            .await
+            .unwrap();
+        let empty = db.unflushed_bytes().unwrap();
+        assert_eq!(
+            empty.max_unflushed_bytes,
+            db.inner.settings.max_unflushed_bytes
+        );
+        let write_opts = WriteOptions {
+            await_durable: false,
+            ..Default::default()
+        };
+        for index in 0..100u32 {
+            db.put_with_options(
+                index.to_be_bytes(),
+                [7u8; 128],
+                &PutOptions::default(),
+                &write_opts,
+            )
+            .await
+            .unwrap();
+        }
+        let written = db.unflushed_bytes().unwrap();
+        assert!(written.wal_bytes > empty.wal_bytes, "{written:?}");
+        assert!(
+            written.active_memtable_bytes > empty.active_memtable_bytes,
+            "{written:?}"
+        );
+        assert_eq!(
+            written.total(),
+            written.active_memtable_bytes + written.immutable_memtable_bytes + written.wal_bytes
+        );
+
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::Wal,
+        })
+        .await
+        .unwrap();
+        assert_eq!(db.unflushed_bytes().unwrap().wal_bytes, 0);
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+        let flushed = db.unflushed_bytes().unwrap();
+        assert!(flushed.total() < written.total(), "{flushed:?} {written:?}");
+        assert_eq!(flushed.immutable_memtable_bytes, 0);
+        db.close().await.unwrap();
+        assert!(db.unflushed_bytes().is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
