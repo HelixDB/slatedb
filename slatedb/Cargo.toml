@@ -44,6 +44,7 @@ serde_json = { workspace = true }
 siphasher = { workspace = true }
 smallvec = { workspace = true }
 slatedb-common = { workspace = true, features = ["serde"] }
+slatedb-mirror = { workspace = true }
 slatedb-txn-obj = { workspace = true }
 snap = { workspace = true, optional = true }
 thiserror = { workspace = true }
@@ -174,6 +175,20 @@ required-features = ["test-util"]
 name = "db_reader_memory_scaling"
 harness = false
 required-features = ["test-util"]
+
+[[bench]]
+name = "memtable_seek"
+harness = false
+
+[[bench]]
+name = "recency_scan_bench"
+harness = false
+required-features = ["foyer"]
+
+[[bench]]
+name = "sst_block_fetch_bench"
+harness = false
+required-features = ["foyer"]
 
 [lints]
 workspace = true

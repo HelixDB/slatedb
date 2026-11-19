@@ -5,6 +5,7 @@ use crate::config::{
     WriteOptions,
 };
 use crate::db_snapshot::DbSnapshot;
+use crate::db_status_subscription::DbStatusSubscription;
 use crate::db_transaction::DbTransaction;
 use crate::error::Error;
 use crate::iterator::DbIterator;
@@ -32,6 +33,11 @@ impl Db {
     /// prefixes (RFC-0024) live as of the snapshot (see [`DbStatus::segments`]).
     pub fn status(&self) -> DbStatus {
         self.inner.status().into()
+    }
+
+    /// Subscribes to durability and lifecycle changes.
+    pub fn subscribe(&self) -> Arc<DbStatusSubscription> {
+        Arc::new(DbStatusSubscription::new(self.inner.subscribe()))
     }
 }
 
@@ -254,7 +260,7 @@ impl Db {
 
     /// Creates a read-only snapshot representing a consistent point in time.
     pub async fn snapshot(&self) -> Result<Arc<DbSnapshot>, Error> {
-        Ok(Arc::new(DbSnapshot::new(self.inner.snapshot().await?)))
+        Ok(Arc::new(DbSnapshot::new(self.inner.snapshot()?)))
     }
 
     /// Starts a transaction at the requested isolation level.
@@ -262,7 +268,7 @@ impl Db {
         &self,
         isolation_level: IsolationLevel,
     ) -> Result<Arc<DbTransaction>, Error> {
-        let tx = self.inner.begin(isolation_level.into()).await?;
+        let tx = self.inner.begin(isolation_level.into())?;
         Ok(Arc::new(DbTransaction::new(tx)))
     }
 

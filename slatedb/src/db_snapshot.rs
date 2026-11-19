@@ -448,7 +448,7 @@ mod tests {
         name: "snapshot_after_put",
         setup: |db| Box::pin(async move {
             db.put(b"key1", b"value1").await?;
-            db.snapshot().await
+            db.snapshot()
         }),
         expected_snapshot_results: vec![("key1", Some("value1"))],
         expected_db_results: None,
@@ -458,7 +458,7 @@ mod tests {
         setup: |db| Box::pin(async move {
             db.put(b"key1", b"value1").await?;
             db.delete(b"key1").await?;
-            db.snapshot().await
+            db.snapshot()
         }),
         expected_snapshot_results: vec![("key1", None)],
         expected_db_results: None,
@@ -467,7 +467,7 @@ mod tests {
         name: "write_after_snapshot",
         setup: |db| Box::pin(async move {
             db.put(b"key1", b"original").await?;
-            let snapshot = db.snapshot().await?;
+            let snapshot = db.snapshot()?;
             db.put(b"key1", b"modified").await?;
             db.put(b"key2", b"new_value").await?;
             Ok(snapshot)
@@ -481,7 +481,7 @@ mod tests {
             db.put(b"key1", b"value1").await?;
             db.put(b"key1", b"value2").await?;
             db.put(b"key1", b"final_value").await?;
-            db.snapshot().await
+            db.snapshot()
         }),
         expected_snapshot_results: vec![("key1", Some("final_value"))],
         expected_db_results: None,
@@ -490,7 +490,7 @@ mod tests {
         name: "overwrite_after_snapshot",
         setup: |db| Box::pin(async move {
             db.put(b"key1", b"original").await?;
-            let snapshot = db.snapshot().await?;
+            let snapshot = db.snapshot()?;
             db.put(b"key1", b"overwrite1").await?;
             db.put(b"key1", b"overwrite2").await?;
             Ok(snapshot)
@@ -503,7 +503,7 @@ mod tests {
         setup: |db| Box::pin(async move {
             db.put(b"key1", b"value1").await?;
             db.put(b"key2", b"value2").await?;
-            let snapshot = db.snapshot().await?;
+            let snapshot = db.snapshot()?;
             db.delete(b"key1").await?;
             db.put(b"key3", b"value3").await?;
             Ok(snapshot)
@@ -515,7 +515,7 @@ mod tests {
         name: "missing_keys",
         setup: |db| Box::pin(async move {
             db.put(b"existing", b"value").await?;
-            db.snapshot().await
+            db.snapshot()
         }),
         expected_snapshot_results: vec![("existing", Some("value")), ("nonexistent", None)],
         expected_db_results: None,
@@ -525,7 +525,7 @@ mod tests {
         setup: |db| Box::pin(async move {
             db.put(b"key1", b"value1").await?;
             db.put(b"key2", b"value2").await?;
-            let snapshot = db.snapshot().await?;
+            let snapshot = db.snapshot()?;
             db.put(b"key3", b"value3").await?;
             db.flush().await?; // Trigger flush after snapshot creation
             Ok(snapshot)
@@ -537,7 +537,7 @@ mod tests {
         name: "flush_then_write_after_snapshot",
         setup: |db| Box::pin(async move {
             db.put(b"key1", b"original").await?;
-            let snapshot = db.snapshot().await?;
+            let snapshot = db.snapshot()?;
             db.flush().await?; // Flush first
             db.put(b"key1", b"modified").await?; // Then write
             db.put(b"key2", b"new_value").await?;
@@ -551,7 +551,7 @@ mod tests {
         setup: |db| Box::pin(async move {
             db.put(b"key1", b"value1").await?;
             db.put(b"key2", b"value2").await?;
-            let snapshot = db.snapshot().await?;
+            let snapshot = db.snapshot()?;
             db.put(b"key3", b"value3").await?;
             db.flush().await?; // Flush the new write
             db.delete(b"key1").await?; // Delete after flush
@@ -564,7 +564,7 @@ mod tests {
         name: "multiple_flush_after_snapshot",
         setup: |db| Box::pin(async move {
             db.put(b"key1", b"value1").await?;
-            let snapshot = db.snapshot().await?;
+            let snapshot = db.snapshot()?;
             db.put(b"key2", b"batch1").await?;
             db.flush().await?; // First flush
             db.put(b"key3", b"batch2").await?;
@@ -614,15 +614,15 @@ mod tests {
 
         // Version 1
         db.put(b"key1", b"version1").await?;
-        let snapshot1 = db.snapshot().await?;
+        let snapshot1 = db.snapshot()?;
 
         // Version 2
         db.put(b"key1", b"version2").await?;
-        let snapshot2 = db.snapshot().await?;
+        let snapshot2 = db.snapshot()?;
 
         // Version 3
         db.put(b"key1", b"version3").await?;
-        let snapshot3 = db.snapshot().await?;
+        let snapshot3 = db.snapshot()?;
 
         // Verify each snapshot sees its respective version
         let result1 = snapshot1.get(b"key1").await?;
@@ -644,7 +644,7 @@ mod tests {
             db.put(b"key1", b"value1").await?;
             db.put(b"key2", b"value2").await?;
             db.put(b"key3", b"value3").await?;
-            db.snapshot().await
+            db.snapshot()
         }),
         scan_start_key: "key1",
         expected_snapshot_results: vec![("key1", "value1"), ("key2", "value2"), ("key3", "value3")],
@@ -657,7 +657,7 @@ mod tests {
             db.put(b"key2", b"value2").await?;
             db.put(b"key3", b"value3").await?;
             db.put(b"key4", b"value4").await?;
-            db.snapshot().await
+            db.snapshot()
         }),
         scan_start_key: "key2",
         expected_snapshot_results: vec![("key2", "value2"), ("key3", "value3"), ("key4", "value4")],
@@ -668,7 +668,7 @@ mod tests {
         setup: |db| Box::pin(async move {
             db.put(b"key1", b"original1").await?;
             db.put(b"key2", b"original2").await?;
-            let snapshot = db.snapshot().await?;
+            let snapshot = db.snapshot()?;
             db.put(b"key1", b"modified1").await?;
             db.put(b"key3", b"new_value").await?;
             Ok(snapshot)
@@ -681,7 +681,7 @@ mod tests {
         name: "scan_empty_range",
         setup: |db| Box::pin(async move {
             db.put(b"key1", b"value1").await?;
-            db.snapshot().await
+            db.snapshot()
         }),
         scan_start_key: "key5",
         expected_snapshot_results: vec![],
@@ -693,7 +693,7 @@ mod tests {
             db.put(b"key1", b"value1").await?;
             db.put(b"key2", b"value2").await?;
             db.put(b"key3", b"value3").await?;
-            let snapshot = db.snapshot().await?;
+            let snapshot = db.snapshot()?;
             db.delete(b"key2").await?;
             Ok(snapshot)
         }),
@@ -706,7 +706,7 @@ mod tests {
         setup: |db| Box::pin(async move {
             db.put(b"key1", b"value1").await?;
             db.put(b"key2", b"value2").await?;
-            let snapshot = db.snapshot().await?;
+            let snapshot = db.snapshot()?;
             db.put(b"key3", b"value3").await?;
             db.put(b"key4", b"value4").await?;
             db.flush().await?; // Flush after snapshot creation
@@ -721,7 +721,7 @@ mod tests {
         setup: |db| Box::pin(async move {
             db.put(b"key1", b"original1").await?;
             db.put(b"key2", b"original2").await?;
-            let snapshot = db.snapshot().await?;
+            let snapshot = db.snapshot()?;
             db.flush().await?; // Flush first
             db.put(b"key1", b"modified1").await?; // Overwrite existing
             db.put(b"key3", b"new_value").await?; // Add new
@@ -737,7 +737,7 @@ mod tests {
         setup: |db| Box::pin(async move {
             db.put(b"key1", b"value1").await?;
             db.put(b"key3", b"value3").await?;
-            let snapshot = db.snapshot().await?;
+            let snapshot = db.snapshot()?;
             // First batch write and flush
             db.put(b"key2", b"batch1_key2").await?;
             db.put(b"key4", b"batch1_key4").await?;
@@ -762,7 +762,7 @@ mod tests {
             db.put(b"a", b"before_a").await?;
             db.put(b"c", b"before_c").await?;
             db.put(b"e", b"before_e").await?;
-            let snapshot = db.snapshot().await?;
+            let snapshot = db.snapshot()?;
             // Add keys in between existing ones
             db.put(b"b", b"after_b").await?;
             db.put(b"d", b"after_d").await?;
@@ -909,7 +909,7 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(1)).await;
 
         // At this point the data is in the memtable but not committed; create the snapshot
-        let snapshot = db.snapshot().await?;
+        let snapshot = db.snapshot()?;
         assert_eq!(snapshot.seq(), recent_committed_seq);
 
         // Turn off the failpoint to let the put complete

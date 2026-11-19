@@ -470,7 +470,7 @@ mod tests {
     use foyer::{
         BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCacheBuilder, PsyncIoEngineConfig,
     };
-    use rand::RngCore;
+    use rand::Rng;
     use std::collections::HashMap;
     use std::sync::Arc;
     use tempfile::{tempdir, TempDir};
@@ -559,8 +559,7 @@ mod tests {
                 break;
             }
         }
-        let block = Arc::new(builder.build().unwrap());
-        CachedEntry::with_block(block)
+        CachedEntry::with_block(&builder.build().unwrap())
     }
 
     async fn setup() -> (FoyerHybridCache, TempDir) {

@@ -12,7 +12,7 @@ use crate::error::SlateDBError;
 use crate::iter::{EmptyIterator, IterationOrder, RowEntryIterator};
 use crate::manifest::{LsmTreeState, Segment};
 use crate::merge_iterator::MergeIterator;
-use crate::reader::{ReadTrace, SstTraceLevel};
+use crate::read_trace::{ReadTrace, SstTraceLevel};
 use crate::sorted_run_iterator::SortedRunIterator;
 use crate::sst_iter::{SstIterator, SstIteratorOptions, SstTracingContext};
 use crate::tablestore::TableStore;
@@ -29,6 +29,18 @@ pub(crate) struct SegmentScanContext {
     pub(crate) table_store: Arc<TableStore>,
     pub(crate) range: BytesRange,
     pub(crate) sst_iter_options: SstIteratorOptions,
+    /// Maximum number of L0 SSTs or sorted runs to initialize at the same
+    /// time, capped by the total SST count.
+    ///
+    /// Range scans open every overlapping source no matter what, so this
+    /// changes how fast they are opened, not which ones. Range scans use
+    /// `SCAN_MAX_CONCURRENT_SOURCES` from `reader.rs`.
+    ///
+    /// Point lookups stop at the first source that has the key. With a value
+    /// above 1, sources older than the hit may already be in flight, so it
+    /// also changes how much gets read (i.e. extra object store API calls).
+    /// Gets use `ReadOptions::max_concurrent_sources`. Single-key scans are
+    /// point lookups too and use 1.
     pub(crate) max_parallel: usize,
     /// Stats for point-query SSTs (optional — propagated from
     /// `ReadOptions`).

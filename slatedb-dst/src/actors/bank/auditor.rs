@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use rand::RngCore;
+use rand::Rng;
 use slatedb::config::DbReaderOptions;
 use slatedb::db_cache::{CachedEntry, CachedKey, DbCache};
 use slatedb::{DbReadOps, DbReader, Error};
@@ -82,7 +82,7 @@ impl Actor for AuditorActor {
                 audit_bank_view(ctx.db().as_ref(), &self.bank, self.step).await?;
             }
             BankAuditView::Snapshot => {
-                let snapshot = ctx.db().snapshot().await?;
+                let snapshot = ctx.db().snapshot()?;
                 audit_bank_view(snapshot.as_ref(), &self.bank, self.step).await?;
             }
             BankAuditView::Reader { options } => {
