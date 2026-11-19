@@ -47,7 +47,9 @@ pub use compactor::CompactorBuilder;
 pub use compactor_state::VersionedCompactions;
 pub use config::{Settings, SstBlockSize};
 pub use db::builder::{CloneSourceSpec, CompactionWorkerBuilder};
-pub use db::{Db, DbBuilder, DbReaderBuilder, DbStatus, SegmentPrefix, WriteHandle};
+pub use db::{
+    Db, DbBuilder, DbReaderBuilder, DbStatus, SegmentPrefix, UnflushedBytes, WriteHandle,
+};
 pub use db_cache::stats as db_cache_stats;
 pub use db_cache::CacheTarget;
 pub use db_iter::{DbIterator, DbRecencyIterator};
