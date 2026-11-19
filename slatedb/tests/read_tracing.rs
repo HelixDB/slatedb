@@ -7,8 +7,9 @@
 
 use bytes::{Bytes, BytesMut};
 use slatedb::config::{
-    CompactionWorkerOptions, CompactorOptions, FlushOptions, FlushType, ReadOptions, ScanOptions,
-    Settings, SizeTieredCompactionSchedulerOptions, TracingOptions,
+    CompactionWorkerOptions, CompactorOptions, FlushOptions, FlushType, MergeOptions, PutOptions,
+    ReadOptions, ScanOptions, Settings, SizeTieredCompactionSchedulerOptions, TracingOptions,
+    WriteOptions,
 };
 use slatedb::object_store::memory::InMemory;
 use slatedb::object_store::ObjectStore;
@@ -88,16 +89,40 @@ async fn run_read_tracing() {
         .await
         .expect("failed to open database");
 
-    db.put(b"trace:sorted-a", b"sorted-a")
-        .await
-        .expect("failed to write sorted-run key");
-    db.merge(b"trace:merged", b"sorted")
-        .await
-        .expect("failed to write sorted-run merge operand");
+    db.put_with_options(
+        b"trace:sorted-a",
+        b"sorted-a",
+        &PutOptions::default(),
+        &WriteOptions {
+            await_durable: false,
+            ..WriteOptions::default()
+        },
+    )
+    .await
+    .expect("failed to write sorted-run key");
+    db.merge_with_options(
+        b"trace:merged",
+        b"sorted",
+        &MergeOptions::default(),
+        &WriteOptions {
+            await_durable: false,
+            ..WriteOptions::default()
+        },
+    )
+    .await
+    .expect("failed to write sorted-run merge operand");
     flush_memtable(&db).await;
-    db.put(b"trace:sorted-b", b"sorted-b")
-        .await
-        .expect("failed to write second sorted-run key");
+    db.put_with_options(
+        b"trace:sorted-b",
+        b"sorted-b",
+        &PutOptions::default(),
+        &WriteOptions {
+            await_durable: false,
+            ..WriteOptions::default()
+        },
+    )
+    .await
+    .expect("failed to write second sorted-run key");
     flush_memtable(&db).await;
     wait_for_manifest(&db, |manifest| {
         !manifest.compacted().is_empty() && manifest.l0().is_empty()
@@ -113,23 +138,55 @@ async fn run_read_tracing() {
         .build()
         .await
         .expect("failed to reopen database");
-    db.put(b"trace:l0", b"l0")
-        .await
-        .expect("failed to write L0 key");
-    db.merge(b"trace:merged", b"+l0")
-        .await
-        .expect("failed to write L0 merge operand");
+    db.put_with_options(
+        b"trace:l0",
+        b"l0",
+        &PutOptions::default(),
+        &WriteOptions {
+            await_durable: false,
+            ..WriteOptions::default()
+        },
+    )
+    .await
+    .expect("failed to write L0 key");
+    db.merge_with_options(
+        b"trace:merged",
+        b"+l0",
+        &MergeOptions::default(),
+        &WriteOptions {
+            await_durable: false,
+            ..WriteOptions::default()
+        },
+    )
+    .await
+    .expect("failed to write L0 merge operand");
     flush_memtable(&db).await;
     wait_for_manifest(&db, |manifest| {
         !manifest.compacted().is_empty() && manifest.l0().len() == 1
     })
     .await;
-    db.put(b"trace:memtable", b"memtable")
-        .await
-        .expect("failed to write memtable key");
-    db.merge(b"trace:merged", b"+memtable")
-        .await
-        .expect("failed to write memtable merge operand");
+    db.put_with_options(
+        b"trace:memtable",
+        b"memtable",
+        &PutOptions::default(),
+        &WriteOptions {
+            await_durable: false,
+            ..WriteOptions::default()
+        },
+    )
+    .await
+    .expect("failed to write memtable key");
+    db.merge_with_options(
+        b"trace:merged",
+        b"+memtable",
+        &MergeOptions::default(),
+        &WriteOptions {
+            await_durable: false,
+            ..WriteOptions::default()
+        },
+    )
+    .await
+    .expect("failed to write memtable merge operand");
 
     let output = CapturedOutput::default();
     let subscriber = FmtSubscriber::builder()

@@ -1595,7 +1595,12 @@ mod tests {
 
         clock.set(200);
         assert_eq!(txn.get(b"custom").await.unwrap(), Some(value.clone()));
-        txn.commit().await.unwrap();
+        txn.commit_with_options(&WriteOptions {
+            await_durable: false,
+            ..WriteOptions::default()
+        })
+        .await
+        .unwrap();
         let kv = db.get_key_value(b"custom").await.unwrap().unwrap();
         assert_eq!(kv.value, value);
         assert_eq!(kv.create_ts, 200);

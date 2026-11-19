@@ -7341,7 +7341,18 @@ mod tests {
             .unwrap();
         let manifest_store = ManifestStore::new(&path, object_store);
         let initial_next_wal_id = db.inner.state.read().state().core().next_wal_sst_id;
-        let write = db.put(b"first", b"value").await.unwrap();
+        let write = db
+            .put_with_options(
+                b"first",
+                b"value",
+                &PutOptions::default(),
+                &WriteOptions {
+                    await_durable: false,
+                    ..WriteOptions::default()
+                },
+            )
+            .await
+            .unwrap();
         db.flush().await.unwrap();
         write.await_durable().await.unwrap();
         let next_wal_id = db.inner.wal_observer.status().unwrap().last_flushed_wal_id + 1;
@@ -7369,7 +7380,17 @@ mod tests {
             next_wal_id
         );
 
-        db.put(b"second", b"value").await.unwrap();
+        db.put_with_options(
+            b"second",
+            b"value",
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..WriteOptions::default()
+            },
+        )
+        .await
+        .unwrap();
         db.flush_with_options(FlushOptions {
             flush_type: FlushType::MemTable,
         })
@@ -7391,7 +7412,17 @@ mod tests {
             next_wal_id
         );
 
-        db.put(b"third", b"value").await.unwrap();
+        db.put_with_options(
+            b"third",
+            b"value",
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..WriteOptions::default()
+            },
+        )
+        .await
+        .unwrap();
         let checkpoint = db
             .create_checkpoint(CheckpointScope::Durable, &CheckpointOptions::default())
             .await

@@ -3864,6 +3864,9 @@ mod tests {
                     self.started.fetch_add(1, SeqCst);
                     let _drop = PointReadDrop(self.dropped.clone());
                     self.release.notified().await;
+                    // A miss probes the cache again through `fetch_block`.
+                    // Only this first probe waits.
+                    self.mode.store(0, SeqCst);
                 }
                 2 => panic!("point block read panic control"),
                 _ => {}

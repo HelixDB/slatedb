@@ -3181,7 +3181,12 @@ mod tests {
                 rows.push(row);
             }
         }
-        assert_eq!(rows, vec![live]);
+        // This job compacts into the last run, so the merge has no older base
+        // and the compactor resolves it to a value.
+        assert_eq!(
+            rows,
+            vec![RowEntry::new_value(&live.key, b"live", live.seq)]
+        );
     }
 
     #[rstest]

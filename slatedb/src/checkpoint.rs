@@ -406,7 +406,17 @@ mod tests {
             .build()
             .await
             .unwrap();
-        db.put(b"key", b"value").await.unwrap();
+        db.put_with_options(
+            b"key",
+            b"value",
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..WriteOptions::default()
+            },
+        )
+        .await
+        .unwrap();
         let options = CheckpointOptions {
             lifetime: Some(Duration::from_secs(60)),
             ..CheckpointOptions::default()
@@ -594,7 +604,17 @@ mod tests {
             .await
             .unwrap();
         fail_parallel::cfg(fp_registry.clone(), "write-wal-sst-io-error", "pause").unwrap();
-        db.put(b"before", b"v1").await.unwrap();
+        db.put_with_options(
+            b"before",
+            b"v1",
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..WriteOptions::default()
+            },
+        )
+        .await
+        .unwrap();
         let frozen_wal_id = db.inner.wal_observer.status().unwrap().last_flushed_wal_id + 1;
         let started = tokio::time::timeout(
             Duration::from_secs(5),
@@ -617,7 +637,17 @@ mod tests {
         assert!(completion_pending);
         assert!(flush_pending);
 
-        db.put(b"after", b"v2").await.unwrap();
+        db.put_with_options(
+            b"after",
+            b"v2",
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..WriteOptions::default()
+            },
+        )
+        .await
+        .unwrap();
         db.flush_with_options(FlushOptions {
             flush_type: FlushType::MemTable,
         })
@@ -657,7 +687,17 @@ mod tests {
             .build()
             .await
             .unwrap();
-        db.put(b"key", b"value").await.unwrap();
+        db.put_with_options(
+            b"key",
+            b"value",
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..WriteOptions::default()
+            },
+        )
+        .await
+        .unwrap();
         fail_parallel::cfg(fp_registry.clone(), "write-wal-sst-io-error", "return").unwrap();
 
         let result = tokio::time::timeout(Duration::from_secs(5), async {
@@ -685,19 +725,49 @@ mod tests {
             .build()
             .await
             .unwrap();
-        db.put(b"before", b"v1").await.unwrap();
+        db.put_with_options(
+            b"before",
+            b"v1",
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..WriteOptions::default()
+            },
+        )
+        .await
+        .unwrap();
         let handle = db
             .begin_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
             .await
             .unwrap();
 
-        db.put(b"during", b"v2").await.unwrap();
+        db.put_with_options(
+            b"during",
+            b"v2",
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..WriteOptions::default()
+            },
+        )
+        .await
+        .unwrap();
         db.flush_with_options(FlushOptions {
             flush_type: FlushType::MemTable,
         })
         .await
         .unwrap();
-        db.put(b"after", b"v3").await.unwrap();
+        db.put_with_options(
+            b"after",
+            b"v3",
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..WriteOptions::default()
+            },
+        )
+        .await
+        .unwrap();
         db.flush_with_options(FlushOptions {
             flush_type: FlushType::MemTable,
         })
@@ -738,12 +808,32 @@ mod tests {
             .await
             .unwrap();
 
-        db.put(b"before", b"v1").await.unwrap();
+        db.put_with_options(
+            b"before",
+            b"v1",
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..WriteOptions::default()
+            },
+        )
+        .await
+        .unwrap();
         let checkpoint = db
             .begin_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
             .await
             .unwrap();
-        db.put(b"after", b"v2").await.unwrap();
+        db.put_with_options(
+            b"after",
+            b"v2",
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..WriteOptions::default()
+            },
+        )
+        .await
+        .unwrap();
 
         let (checkpoint_result, flush_result) = tokio::join!(checkpoint.wait(), db.flush());
         let checkpoint_result = checkpoint_result.unwrap();
@@ -767,7 +857,17 @@ mod tests {
             .build()
             .await
             .unwrap();
-        db.put(b"replayed", b"v1").await.unwrap();
+        db.put_with_options(
+            b"replayed",
+            b"v1",
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..WriteOptions::default()
+            },
+        )
+        .await
+        .unwrap();
         db.flush_with_options(FlushOptions {
             flush_type: FlushType::Wal,
         })
@@ -785,7 +885,17 @@ mod tests {
             .build()
             .await
             .unwrap();
-        db.put(b"later", b"v2").await.unwrap();
+        db.put_with_options(
+            b"later",
+            b"v2",
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..WriteOptions::default()
+            },
+        )
+        .await
+        .unwrap();
         let handle = db
             .begin_checkpoint(CheckpointScope::Durable, &CheckpointOptions::default())
             .await
@@ -833,7 +943,17 @@ mod tests {
             .await
             .unwrap();
 
-        db.put(b"before", b"v1").await.unwrap();
+        db.put_with_options(
+            b"before",
+            b"v1",
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..WriteOptions::default()
+            },
+        )
+        .await
+        .unwrap();
         let checkpoint_reached = Arc::new(AtomicBool::new(false));
         let release_checkpoint = Arc::new(AtomicBool::new(false));
         let callback_reached = Arc::clone(&checkpoint_reached);
@@ -869,7 +989,17 @@ mod tests {
         .unwrap();
         let wal_id_before_later_write = db.inner.wal_observer.status().unwrap().last_flushed_wal_id;
 
-        db.put(b"after", b"v2").await.unwrap();
+        db.put_with_options(
+            b"after",
+            b"v2",
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..WriteOptions::default()
+            },
+        )
+        .await
+        .unwrap();
         db.flush_with_options(FlushOptions {
             flush_type: FlushType::Wal,
         })
@@ -1065,14 +1195,34 @@ mod tests {
         let options = CheckpointOptions::default();
         let mut handles = Vec::new();
 
-        db.put(checkpoint_test_key(0), b"v").await.unwrap();
+        db.put_with_options(
+            checkpoint_test_key(0),
+            b"v",
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..WriteOptions::default()
+            },
+        )
+        .await
+        .unwrap();
         db.flush().await.unwrap();
         handles.push(
             db.begin_checkpoint(CheckpointScope::All, &options)
                 .await
                 .unwrap(),
         );
-        db.put(checkpoint_test_key(1), b"v").await.unwrap();
+        db.put_with_options(
+            checkpoint_test_key(1),
+            b"v",
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..WriteOptions::default()
+            },
+        )
+        .await
+        .unwrap();
         db.flush().await.unwrap();
         handles.push(
             db.begin_checkpoint(CheckpointScope::All, &options)
@@ -1084,14 +1234,34 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        db.put(checkpoint_test_key(2), b"v").await.unwrap();
+        db.put_with_options(
+            checkpoint_test_key(2),
+            b"v",
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..WriteOptions::default()
+            },
+        )
+        .await
+        .unwrap();
         db.flush().await.unwrap();
         handles.push(
             db.begin_checkpoint(CheckpointScope::Durable, &options)
                 .await
                 .unwrap(),
         );
-        db.put(checkpoint_test_key(3), b"v").await.unwrap();
+        db.put_with_options(
+            checkpoint_test_key(3),
+            b"v",
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..WriteOptions::default()
+            },
+        )
+        .await
+        .unwrap();
         handles.push(
             db.begin_checkpoint(CheckpointScope::All, &options)
                 .await
@@ -1154,9 +1324,29 @@ mod tests {
             .build()
             .await
             .unwrap();
-        db.put(checkpoint_test_key(0), b"v").await.unwrap();
+        db.put_with_options(
+            checkpoint_test_key(0),
+            b"v",
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..WriteOptions::default()
+            },
+        )
+        .await
+        .unwrap();
         db.flush().await.unwrap();
-        db.put(checkpoint_test_key(1), b"v").await.unwrap();
+        db.put_with_options(
+            checkpoint_test_key(1),
+            b"v",
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..WriteOptions::default()
+            },
+        )
+        .await
+        .unwrap();
 
         let result = tokio::time::timeout(
             Duration::from_secs(30),
@@ -1194,7 +1384,17 @@ mod tests {
             tokio::spawn(async move {
                 for index in 0..TOTAL {
                     started.store(index + 1, Ordering::SeqCst);
-                    db.put(checkpoint_test_key(index), b"v").await.unwrap();
+                    db.put_with_options(
+                        checkpoint_test_key(index),
+                        b"v",
+                        &PutOptions::default(),
+                        &WriteOptions {
+                            await_durable: false,
+                            ..WriteOptions::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
                     completed.store(index + 1, Ordering::SeqCst);
                     tokio::task::yield_now().await;
                 }

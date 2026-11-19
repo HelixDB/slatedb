@@ -469,7 +469,7 @@ impl CloneBuilder {
 mod tests {
     use super::*;
     use crate::block_transformer::tests::Flip;
-    use crate::config::{FlushOptions, FlushType, ReaderMode};
+    use crate::config::{FlushOptions, FlushType, PutOptions, ReaderMode, WriteOptions};
     use std::time::Duration;
 
     #[tokio::test]
@@ -481,13 +481,46 @@ mod tests {
         let builder = DbBuilder::new("clocked".to_owned(), object_store);
         builder.with_system_clock(clock.clone()).unwrap();
         let db = builder.build().await.unwrap();
-        let first = db.put(b"k".to_vec(), b"v".to_vec()).await.unwrap();
+        let first = db
+            .put_with_options(
+                b"k".to_vec(),
+                b"v".to_vec(),
+                PutOptions::default(),
+                WriteOptions {
+                    await_durable: Some(false),
+                    ..WriteOptions::default()
+                },
+            )
+            .await
+            .unwrap();
         assert_eq!(first.create_ts(), 1_000_000);
         tokio::time::sleep(Duration::from_millis(5)).await;
-        let second = db.put(b"k".to_vec(), b"w".to_vec()).await.unwrap();
+        let second = db
+            .put_with_options(
+                b"k".to_vec(),
+                b"w".to_vec(),
+                PutOptions::default(),
+                WriteOptions {
+                    await_durable: Some(false),
+                    ..WriteOptions::default()
+                },
+            )
+            .await
+            .unwrap();
         assert_eq!(second.create_ts(), 1_000_000);
         clock.advance(500).await.unwrap();
-        let third = db.put(b"k".to_vec(), b"x".to_vec()).await.unwrap();
+        let third = db
+            .put_with_options(
+                b"k".to_vec(),
+                b"x".to_vec(),
+                PutOptions::default(),
+                WriteOptions {
+                    await_durable: Some(false),
+                    ..WriteOptions::default()
+                },
+            )
+            .await
+            .unwrap();
         assert_eq!(third.create_ts(), 1_000_500);
         db.close().await.unwrap();
     }
