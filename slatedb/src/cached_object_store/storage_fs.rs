@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, OnceCell};
+use tokio_util::task::AbortOnDropHandle;
 use walkdir::WalkDir;
 
 use crate::cached_object_store::storage::{LocalCacheEntry, LocalCacheHead, LocalCacheStorage};
@@ -559,6 +560,10 @@ const QUEUE_FULL_LOG_INTERVAL_MS: i64 = 30_000;
 /// FsCacheEvictor evicts the cache entries when the cache size exceeds the limit. it is expected to
 /// run in the background to avoid blocking the caller, and it'll be triggered whenever a new cache entry
 /// is added.
+///
+/// Dropping the evictor aborts its background tasks. The scan task never returns on its own, and
+/// both tasks hold [`FsCacheEvictorInner`], so without the abort every dropped cache would keep its
+/// in-memory index and up to `max_open_file_handles` open part files alive for the runtime's life.
 #[derive(Debug)]
 struct FsCacheEvictor {
     max_cache_size_bytes: Option<usize>,
@@ -568,8 +573,8 @@ struct FsCacheEvictor {
     started: AtomicBool,
     queue_full_count: AtomicU64,
     last_queue_full_log_ms: AtomicI64,
-    background_evict_handle: OnceCell<tokio::task::JoinHandle<()>>,
-    background_scan_handle: OnceCell<tokio::task::JoinHandle<()>>,
+    background_evict_handle: OnceCell<AbortOnDropHandle<()>>,
+    background_scan_handle: OnceCell<AbortOnDropHandle<()>>,
     system_clock: Arc<dyn SystemClock>,
     usage: Arc<FsCacheUsage>,
     reconcile_notify: Arc<Notify>,
@@ -649,20 +654,18 @@ impl FsCacheEvictor {
         // scan the cache folder (defaults as every 1 hour) to keep the in-memory cache_entries eventually
         // consistent with the cache folder.
         self.background_scan_handle
-            .set(tokio::spawn(Self::background_scan(
+            .set(AbortOnDropHandle::new(tokio::spawn(Self::background_scan(
                 inner.clone(),
                 self.scan_interval,
                 self.system_clock.clone(),
                 self.reconcile_notify.clone(),
-            )))
+            ))))
             .ok();
 
         // start the background evictor task, it'll be triggered whenever a new cache entry is added
         self.background_evict_handle
-            .set(tokio::spawn(Self::background_evict(
-                inner,
-                rx,
-                self.system_clock.clone(),
+            .set(AbortOnDropHandle::new(tokio::spawn(
+                Self::background_evict(inner, rx, self.system_clock.clone()),
             )))
             .ok();
     }
@@ -1622,6 +1625,52 @@ mod tests {
                 capacity_bytes: None,
             }
         );
+    }
+
+    #[rstest::rstest]
+    #[case::scan_on_reconcile_only(None)]
+    #[case::periodic_scan(Some(Duration::from_secs(3600)))]
+    #[tokio::test]
+    async fn dropping_storage_should_stop_evictor_tasks_and_close_file_handles(
+        #[case] scan_interval: Option<Duration>,
+    ) {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("objstore_cache_drop_")
+            .tempdir()
+            .unwrap();
+        let recorder = MetricsRecorderHelper::noop();
+        let storage = FsCacheStorage::new(
+            temp_dir.path().to_path_buf(),
+            Some(1024 * 1024),
+            scan_interval,
+            Arc::new(CachedObjectStoreStats::new(&recorder)),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+            10,
+        );
+        storage.start_evictor().await;
+
+        let entry = storage.entry(&Path::from("cached/object"), 1024);
+        entry.save_part(0, Bytes::from(vec![1; 17])).await.unwrap();
+        assert_eq!(
+            entry.read_part(0, 0..17).await.unwrap(),
+            Some(Bytes::from(vec![1; 17]))
+        );
+        drop(entry);
+        assert_eq!(storage.file_handle_cache_population(), 1);
+
+        let inner = Arc::downgrade(&storage.evictor.inner);
+        let file_handles = Arc::downgrade(&storage.file_handle_cache.inner);
+        drop(storage);
+
+        // Aborted tasks drop their futures when the runtime next polls them.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while inner.strong_count() > 0 || file_handles.strong_count() > 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the storage should end the evictor tasks and close its file handles");
     }
 
     #[rstest::rstest]
