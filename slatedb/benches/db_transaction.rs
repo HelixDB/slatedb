@@ -111,14 +111,13 @@ async fn build_db() -> Db {
     db
 }
 
-fn begin_txn(runtime: &Runtime, db: &Db) -> DbTransaction {
-    runtime
-        .block_on(db.begin(IsolationLevel::Snapshot))
+fn begin_txn(db: &Db) -> DbTransaction {
+    db.begin(IsolationLevel::Snapshot)
         .expect("begin transaction failed")
 }
 
-fn txn_without_merges(runtime: &Runtime, db: &Db) -> DbTransaction {
-    let txn = begin_txn(runtime, db);
+fn txn_without_merges(db: &Db) -> DbTransaction {
+    let txn = begin_txn(db);
     let options = put_options();
     for index in 0..TXN_ENTRY_COUNT {
         let key = key(index);
@@ -132,8 +131,8 @@ fn txn_without_merges(runtime: &Runtime, db: &Db) -> DbTransaction {
     txn
 }
 
-fn txn_with_merges(runtime: &Runtime, db: &Db) -> DbTransaction {
-    let txn = begin_txn(runtime, db);
+fn txn_with_merges(db: &Db) -> DbTransaction {
+    let txn = begin_txn(db);
     let put_options = put_options();
     let merge_options = merge_options();
     for index in 0..TXN_MERGE_KEY_COUNT {
@@ -152,8 +151,8 @@ fn txn_with_merges(runtime: &Runtime, db: &Db) -> DbTransaction {
     txn
 }
 
-fn txn_with_repeated_overwrites(runtime: &Runtime, db: &Db) -> DbTransaction {
-    let txn = begin_txn(runtime, db);
+fn txn_with_repeated_overwrites(db: &Db) -> DbTransaction {
+    let txn = begin_txn(db);
     let options = put_options();
     let key = Bytes::from_static(b"txn-repeated-overwrite-key");
     for index in 0..TXN_ENTRY_COUNT {
@@ -171,7 +170,7 @@ fn bench_db_transaction(c: &mut Criterion) {
     let read_options = ReadOptions::default();
     let scan_options = ScanOptions::default();
     let write_options = write_options();
-    let read_txn = begin_txn(&runtime, &db);
+    let read_txn = begin_txn(&db);
     let get_key = key(0);
     let scan_start = key(100);
     let scan_end = key(900);
@@ -227,7 +226,7 @@ fn bench_db_transaction(c: &mut Criterion) {
         b.iter_batched(
             || {
                 (
-                    begin_txn(&runtime, &db),
+                    begin_txn(&db),
                     Bytes::from_static(b"txn_bench_key"),
                     Bytes::from_static(b"txn_bench_value"),
                 )
@@ -245,7 +244,7 @@ fn bench_db_transaction(c: &mut Criterion) {
         b.iter_batched(
             || {
                 (
-                    txn_without_merges(&runtime, &db),
+                    txn_without_merges(&db),
                     key(TXN_ENTRY_COUNT + 1),
                     value(TXN_ENTRY_COUNT + 1),
                 )
@@ -261,13 +260,7 @@ fn bench_db_transaction(c: &mut Criterion) {
 
     group.bench_function("put_with_options/overwrite_existing_key", |b| {
         b.iter_batched(
-            || {
-                (
-                    txn_with_merges(&runtime, &db),
-                    key(0),
-                    value(TXN_MERGE_KEY_COUNT + 1),
-                )
-            },
+            || (txn_with_merges(&db), key(0), value(TXN_MERGE_KEY_COUNT + 1)),
             |(txn, key, value)| {
                 txn.put_with_options(key, value, &put_options)
                     .expect("put_with_options failed");
@@ -279,12 +272,7 @@ fn bench_db_transaction(c: &mut Criterion) {
 
     group.bench_function("mark_read", |b| {
         b.iter_batched(
-            || {
-                (
-                    begin_txn(&runtime, &db),
-                    Bytes::from_static(b"txn_bench_key"),
-                )
-            },
+            || (begin_txn(&db), Bytes::from_static(b"txn_bench_key")),
             |(txn, key)| {
                 txn.mark_read([key]).expect("mark_read failed");
                 black_box(txn)
@@ -295,12 +283,7 @@ fn bench_db_transaction(c: &mut Criterion) {
 
     group.bench_function("unmark_write", |b| {
         b.iter_batched(
-            || {
-                (
-                    begin_txn(&runtime, &db),
-                    Bytes::from_static(b"txn_bench_key"),
-                )
-            },
+            || (begin_txn(&db), Bytes::from_static(b"txn_bench_key")),
             |(txn, key)| {
                 txn.unmark_write([key]).expect("unmark_write failed");
                 black_box(txn)
@@ -313,7 +296,7 @@ fn bench_db_transaction(c: &mut Criterion) {
         b.iter_batched(
             || {
                 (
-                    begin_txn(&runtime, &db),
+                    begin_txn(&db),
                     Bytes::from_static(b"txn_bench_key"),
                     Bytes::from_static(b"txn_bench_value"),
                 )
@@ -331,7 +314,7 @@ fn bench_db_transaction(c: &mut Criterion) {
         b.iter_batched(
             || {
                 (
-                    txn_without_merges(&runtime, &db),
+                    txn_without_merges(&db),
                     key(TXN_ENTRY_COUNT + 1),
                     value(TXN_ENTRY_COUNT + 1),
                 )
@@ -347,13 +330,7 @@ fn bench_db_transaction(c: &mut Criterion) {
 
     group.bench_function("merge_with_options/existing_key_with_merges", |b| {
         b.iter_batched(
-            || {
-                (
-                    txn_with_merges(&runtime, &db),
-                    key(0),
-                    value(TXN_MERGE_KEY_COUNT + 1),
-                )
-            },
+            || (txn_with_merges(&db), key(0), value(TXN_MERGE_KEY_COUNT + 1)),
             |(txn, key, value)| {
                 txn.merge_with_options(key, value, &merge_options)
                     .expect("merge_with_options failed");
@@ -365,12 +342,7 @@ fn bench_db_transaction(c: &mut Criterion) {
 
     group.bench_function("delete/empty_transaction", |b| {
         b.iter_batched(
-            || {
-                (
-                    begin_txn(&runtime, &db),
-                    Bytes::from_static(b"txn_bench_key"),
-                )
-            },
+            || (begin_txn(&db), Bytes::from_static(b"txn_bench_key")),
             |(txn, key)| {
                 txn.delete(key).expect("delete failed");
                 black_box(txn)
@@ -381,7 +353,7 @@ fn bench_db_transaction(c: &mut Criterion) {
 
     group.bench_function("delete/new_key_populated", |b| {
         b.iter_batched(
-            || (txn_without_merges(&runtime, &db), key(TXN_ENTRY_COUNT + 1)),
+            || (txn_without_merges(&db), key(TXN_ENTRY_COUNT + 1)),
             |(txn, key)| {
                 txn.delete(key).expect("delete failed");
                 black_box(txn)
@@ -392,7 +364,7 @@ fn bench_db_transaction(c: &mut Criterion) {
 
     group.bench_function("delete/existing_key", |b| {
         b.iter_batched(
-            || (txn_with_merges(&runtime, &db), key(0)),
+            || (txn_with_merges(&db), key(0)),
             |(txn, key)| {
                 txn.delete(key).expect("delete failed");
                 black_box(txn)
@@ -410,7 +382,6 @@ fn bench_db_transaction(c: &mut Criterion) {
                     let db = build_empty_db().await;
                     let txn = db
                         .begin(IsolationLevel::Snapshot)
-                        .await
                         .expect("begin transaction failed");
                     #[allow(clippy::disallowed_types)]
                     let start = Instant::now();
@@ -434,7 +405,6 @@ fn bench_db_transaction(c: &mut Criterion) {
                     let db = build_empty_db().await;
                     let txn = db
                         .begin(IsolationLevel::Snapshot)
-                        .await
                         .expect("begin transaction failed");
                     txn.put_with_options(key(0), value(0), &put_options)
                         .expect("put_with_options failed");
@@ -452,7 +422,7 @@ fn bench_db_transaction(c: &mut Criterion) {
 
     group.bench_function("drop/no_merges", |b| {
         b.iter_batched(
-            || txn_without_merges(&runtime, &db),
+            || txn_without_merges(&db),
             |txn| drop(black_box(txn)),
             BatchSize::LargeInput,
         );
@@ -460,7 +430,7 @@ fn bench_db_transaction(c: &mut Criterion) {
 
     group.bench_function("drop/with_merges", |b| {
         b.iter_batched(
-            || txn_with_merges(&runtime, &db),
+            || txn_with_merges(&db),
             |txn| drop(black_box(txn)),
             BatchSize::LargeInput,
         );
@@ -468,7 +438,7 @@ fn bench_db_transaction(c: &mut Criterion) {
 
     group.bench_function("drop/repeated_overwrites", |b| {
         b.iter_batched(
-            || txn_with_repeated_overwrites(&runtime, &db),
+            || txn_with_repeated_overwrites(&db),
             |txn| drop(black_box(txn)),
             BatchSize::LargeInput,
         );

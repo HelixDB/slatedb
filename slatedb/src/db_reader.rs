@@ -1,8 +1,9 @@
+#[allow(deprecated)] // `CachedObjectStore` is deprecated.
+use crate::cached_object_store::CachedObjectStore;
 use crate::wal::slatedb::reader::SlateDbWalReaderOptions;
 use {
     crate::{
         bytes_range::{ByteRangeBounds, BytesRange},
-        cached_object_store::CachedObjectStore,
         clock::MonotonicClock,
         config::{CheckpointOptions, DbReaderOptions, ReadOptions, ScanOptions},
         db_cache::CacheTarget,
@@ -121,6 +122,7 @@ impl WalReplayEnd {
 pub struct DbReader {
     inner: Arc<DbReaderInner>,
     task_executor: MessageHandlerExecutor,
+    #[allow(deprecated)] // `CachedObjectStore` is deprecated.
     pub(crate) object_store_cache: Option<Arc<CachedObjectStore>>,
 }
 
@@ -1445,6 +1447,7 @@ impl DbReader {
     }
 
     /// Preload the disk cache from the current manifest state.
+    #[allow(deprecated)] // `CachedObjectStore` and its options are deprecated.
     pub(crate) async fn preload_cache(
         &self,
         cached_obj_store: &CachedObjectStore,
@@ -3470,6 +3473,7 @@ mod tests {
         db.close().await.unwrap();
     }
 
+    #[allow(deprecated)] // `ObjectStoreCacheOptions` is deprecated.
     #[tokio::test]
     async fn reader_snapshot_isolation_should_survive_warm_object_store_cache_hits() {
         use crate::cached_object_store::stats::PART_HIT_COUNT;
@@ -5199,6 +5203,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(deprecated)] // `CachedObjectStore` is deprecated.
     async fn should_populate_disk_cache_on_read() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let path = Path::from("/tmp/test_db_reader_disk_cache");

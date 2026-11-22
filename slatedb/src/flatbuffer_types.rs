@@ -19,7 +19,7 @@ use crate::compactor_state::{
 };
 use crate::db_state::{self, FilterFormat, SsTableInfo, SsTableInfoCodec, SstType};
 use crate::db_state::{SsTableHandle, SsTableView};
-use crate::subcompaction::Subcompaction as CompactorSubcompaction;
+use crate::subcompaction::{Subcompaction as CompactorSubcompaction, SubcompactionStatus};
 
 #[path = "./generated/root_generated.rs"]
 #[allow(warnings, clippy::disallowed_macros, clippy::disallowed_types, clippy::disallowed_methods, unreachable_pub)]
@@ -43,7 +43,8 @@ use crate::flatbuffer_types::root_generated::{
     CompactionStatus as FbCompactionStatus, CompactionsV1, CompactionsV1Args, CompressionFormat,
     DrainSegmentSpec, DrainSegmentSpecArgs, Segment as FbSegment, SegmentArgs as FbSegmentArgs,
     SortedRunV2, SortedRunV2Args, SstType as FbSstType, Subcompaction as FbSubcompaction,
-    SubcompactionArgs as FbSubcompactionArgs, TieredCompactionContext as FbTieredCompactionContext,
+    SubcompactionArgs as FbSubcompactionArgs, SubcompactionStatus as FbSubcompactionStatus,
+    TieredCompactionContext as FbTieredCompactionContext,
     TieredCompactionContextArgs as FbTieredCompactionContextArgs, TieredCompactionSpec,
     TieredCompactionSpecArgs, Ulid as FbUlid, UlidArgs as FbUlidArgs, Uuid, UuidArgs,
 };
@@ -702,7 +703,14 @@ impl FlatBufferCompactionsCodec {
             })
             .transpose()?
             .unwrap_or_default();
-        Ok(CompactorSubcompaction::new(range).with_output_ssts(output_ssts))
+        let status = match subcompaction.status() {
+            FbSubcompactionStatus::InProgress => SubcompactionStatus::InProgress,
+            FbSubcompactionStatus::Completed => SubcompactionStatus::Completed,
+            _ => return Err(SlateDBError::InvalidCompaction),
+        };
+        Ok(CompactorSubcompaction::new(range)
+            .with_output_ssts(output_ssts)
+            .with_status(status))
     }
 
     fn worker_spec(
@@ -1184,6 +1192,10 @@ impl<'b> DbFlatBufferBuilder<'b> {
             &FbSubcompactionArgs {
                 range: Some(range),
                 output_ssts,
+                status: match subcompaction.status() {
+                    SubcompactionStatus::InProgress => FbSubcompactionStatus::InProgress,
+                    SubcompactionStatus::Completed => FbSubcompactionStatus::Completed,
+                },
             },
         )
     }
@@ -2143,6 +2155,40 @@ mod tests {
     }
 
     #[test]
+    fn subcompaction_status_defaults_to_in_progress_and_rejects_unknown_values() {
+        use super::{
+            DbFlatBufferBuilder, FbSubcompaction, FbSubcompactionStatus, SubcompactionStatus,
+        };
+        use flatbuffers::FlatBufferBuilder;
+
+        for (encoded_status, expected) in [
+            (None, Some(SubcompactionStatus::InProgress)),
+            (
+                Some(FbSubcompactionStatus::Completed),
+                Some(SubcompactionStatus::Completed),
+            ),
+            (Some(FbSubcompactionStatus(42)), None),
+        ] {
+            let mut builder = DbFlatBufferBuilder::new(FlatBufferBuilder::new());
+            let range = builder.add_bytes_range(&BytesRange::unbounded());
+            let mut sub = root_generated::SubcompactionBuilder::new(&mut builder.builder);
+            sub.add_range(range);
+            if let Some(status) = encoded_status {
+                sub.add_status(status);
+            }
+            let sub = sub.finish();
+            builder.builder.finish(sub, None);
+            let encoded =
+                flatbuffers::root::<FbSubcompaction>(builder.builder.finished_data()).unwrap();
+            let decoded = FlatBufferCompactionsCodec::subcompaction(encoded);
+            match expected {
+                Some(status) => assert_eq!(decoded.unwrap().status(), status),
+                None => assert!(matches!(decoded, Err(SlateDBError::InvalidCompaction))),
+            }
+        }
+    }
+
+    #[test]
     fn test_should_encode_decode_compaction_with_subcompactions() {
         fn new_output_sst(first_key: &[u8]) -> SsTableHandle {
             SsTableHandle::new(
@@ -2168,11 +2214,13 @@ mod tests {
                 std::ops::Bound::Included(Bytes::from_static(b"g")),
                 std::ops::Bound::Excluded(Bytes::from_static(b"q")),
             ))
-            .with_output_ssts(vec![new_output_sst(b"g")]),
+            .with_output_ssts(vec![new_output_sst(b"g")])
+            .with_status(crate::subcompaction::SubcompactionStatus::Completed),
             Subcompaction::new(BytesRange::new(
                 std::ops::Bound::Included(Bytes::from_static(b"q")),
                 std::ops::Bound::Unbounded,
-            )),
+            ))
+            .with_status(crate::subcompaction::SubcompactionStatus::Completed),
         ];
         let compaction = Compaction::new(
             ulid::Ulid::new(),

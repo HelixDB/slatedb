@@ -13,6 +13,18 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// How a writer open claims its epoch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum WriterEpochClaim {
+    /// Claim the epoch after the stored one, retrying against newer writers.
+    #[default]
+    Latest,
+    /// Claim exactly this epoch. Fenced unless the stored epoch is lower.
+    Exact(NonZeroU64),
+    /// Claim the epoch after this one. Fenced unless the stored epoch equals it.
+    After(u64),
+}
+
 pub(crate) struct WriterFencer {
     closed_result_reader: WatchableOnceCellReader<Result<(), SlateDBError>>,
     recorder: MetricsRecorderHelper,
@@ -85,10 +97,11 @@ impl WriterFencer {
     /// a new `FenceableManifest` with a bumped epoch, and (2) delegating WAL fencing and recovery
     /// to the configured [`WriterInit`]. Returns the fenced manifest, the initialized WAL writer,
     /// and the iterator that must be replayed to recover up to the current epoch.
+    /// The caller must validate epoch ownership after replay, before serving reads or writes.
     pub(crate) async fn fence(
         mut self,
         stored_manifest: StoredManifest,
-        writer_epoch: Option<NonZeroU64>,
+        epoch_claim: WriterEpochClaim,
     ) -> Result<WriterFenceResult, SlateDBError> {
         let wal_writer_init = match self.wal_writer_init.take() {
             Some(wal_writer_init) => wal_writer_init,
@@ -106,8 +119,8 @@ impl WriterFencer {
             ),
         };
 
-        let manifest = match writer_epoch {
-            Some(writer_epoch) => {
+        let manifest = match epoch_claim {
+            WriterEpochClaim::Exact(writer_epoch) => {
                 FenceableManifest::init_writer_with_epoch(
                     stored_manifest,
                     self.manifest_update_timeout,
@@ -116,11 +129,21 @@ impl WriterFencer {
                 )
                 .await?
             }
-            None => {
+            WriterEpochClaim::Latest => {
                 FenceableManifest::init_writer(
                     stored_manifest,
                     self.manifest_update_timeout,
                     self.system_clock.clone(),
+                    None,
+                )
+                .await?
+            }
+            WriterEpochClaim::After(expected_epoch) => {
+                FenceableManifest::init_writer(
+                    stored_manifest,
+                    self.manifest_update_timeout,
+                    self.system_clock.clone(),
+                    Some(expected_epoch),
                 )
                 .await?
             }
@@ -129,14 +152,9 @@ impl WriterFencer {
 
         let mut manifest = manifest.into();
         let result = wal_writer_init.fence_and_init(&mut manifest).await?;
-        let mut manifest: FenceableManifest = manifest.into();
-
-        // Refresh validates that we own the latest epoch still.
-        manifest.refresh().await?;
-        fail_point_send!(self.fp_tx, "FinalRefreshManifest");
 
         Ok(WriterFenceResult {
-            manifest,
+            manifest: manifest.into(),
             wal_writer: result.wal_writer,
             replay_iterator: result.replay_iterator,
         })
@@ -152,7 +170,7 @@ mod tests {
     };
     use crate::dispatcher::MessageHandlerExecutor;
     use crate::error::SlateDBError;
-    use crate::fence::WriterFencer;
+    use crate::fence::{WriterEpochClaim, WriterFencer};
     use crate::format::sst::SsTableFormat;
     use crate::garbage_collector::GarbageCollector;
     use crate::manifest::store::{ManifestStore, StoredManifest};
@@ -431,7 +449,9 @@ mod tests {
         h.put(&db, 1, false).await;
         let fencer = h.fencer.take().unwrap();
 
-        let result = fencer.fence(h.stored_manifest.take().unwrap(), None).await;
+        let result = fencer
+            .fence(h.stored_manifest.take().unwrap(), WriterEpochClaim::Latest)
+            .await;
 
         assert!(result.is_ok());
         h.put(&db, 2, true).await;
@@ -478,7 +498,11 @@ mod tests {
 
         let fencer = h.fencer.take().unwrap();
         let stored_manifest = h.stored_manifest.take().unwrap();
-        let jh = tokio::task::spawn(async move { fencer.fence(stored_manifest, None).await });
+        let jh = tokio::task::spawn(async move {
+            fencer
+                .fence(stored_manifest, WriterEpochClaim::Latest)
+                .await
+        });
         // wait for LoadEmptyWalId pause
         assert_eq!(h.event_rx.recv().await.unwrap(), "LoadEmptyWalId");
 
@@ -543,8 +567,7 @@ mod tests {
         // resume the fencer
         fail_parallel::cfg(h.fp_registry.clone(), case.pause_event, "off").unwrap();
 
-        // validate that its fenced — the fencer's manifest.refresh sees the new db's
-        // bumped epoch and returns Fenced.
+        // The refresh after WAL ID recomputation or a failed fence write detects the newer epoch.
         let result = jh.await.unwrap();
         assert!(
             matches!(result, Err(SlateDBError::Fenced)),
@@ -577,7 +600,11 @@ mod tests {
         // spawn WriterFencer on another task
         let fencer = h.fencer.take().unwrap();
         let stored_manifest = h.stored_manifest.take().unwrap();
-        let jh = tokio::task::spawn(async move { fencer.fence(stored_manifest, None).await });
+        let jh = tokio::task::spawn(async move {
+            fencer
+                .fence(stored_manifest, WriterEpochClaim::Latest)
+                .await
+        });
         // wait for fencer to load empty wal id and pause
         h.event_rx.recv().await.unwrap();
 

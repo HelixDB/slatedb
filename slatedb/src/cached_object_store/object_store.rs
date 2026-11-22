@@ -20,7 +20,7 @@ use slatedb_common::clock::{DefaultSystemClock, SystemClock};
 use slatedb_common::DbRand;
 use std::{ops::Range, sync::Arc};
 
-use crate::single_flight::SingleFlight;
+use slatedb_common::single_flight::SingleFlight;
 
 use crate::cached_object_store::storage::{LocalCacheStorage, PartID};
 use crate::db_cache::CacheUsageSnapshot;
@@ -33,6 +33,11 @@ use slatedb_common::metrics::{
 };
 
 /// An [`ObjectStore`] wrapper that caches object parts on local disk.
+///
+/// `CachedObjectStore` is deprecated. It is being replaced by the local object
+/// mirror, [`ObjectStoreMirror`](slatedb_mirror::ObjectStoreMirror). If you
+/// need tiered caching, use
+/// [`FoyerHybridCache`](crate::db_cache::foyer_hybrid::FoyerHybridCache).
 ///
 /// The cache splits each object into fixed-size parts and stores them under a
 /// root folder.
@@ -55,6 +60,10 @@ use slatedb_common::metrics::{
 ///     .await?;
 /// let db = Db::builder(path, cache).build().await?;
 /// ```
+#[deprecated(
+    since = "0.18.0",
+    note = "`CachedObjectStore` is being replaced by the local object mirror, `slatedb_mirror::ObjectStoreMirror`. If you need tiered caching, use `slatedb::db_cache::foyer_hybrid::FoyerHybridCache`."
+)]
 #[derive(Debug, Clone)]
 pub struct CachedObjectStore {
     object_store: Arc<dyn ObjectStore>,
@@ -1176,7 +1185,7 @@ mod tests {
         path::Path, GetOptions, GetRange, MultipartUpload, ObjectStore, ObjectStoreExt,
         PutMultipartOptions, PutPayload,
     };
-    use rand::Rng;
+    use rand::RngExt;
     use rstest::rstest;
     use std::sync::Arc;
     use std::time::Duration;

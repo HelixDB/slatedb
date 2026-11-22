@@ -8,6 +8,7 @@ use thiserror::Error;
 use crate::{
     error::SlateDBError,
     iter::{RowEntryIterator, TrackedRowEntryIterator},
+    read_trace::ReadTrace,
     types::{RowEntry, ValueDeletable},
     utils::merge_options,
 };
@@ -303,6 +304,7 @@ impl<T: TrackedRowEntryIterator> TrackedRowEntryIterator for MergeOperatorRequir
 pub(crate) struct MergeOperatorIterator<T: RowEntryIterator> {
     merge_operator: MergeOperatorType,
     delegate: T,
+    read_trace: ReadTrace,
     /// Entry from the delegate that we've peeked ahead and buffered.
     buffered_entry: Option<RowEntry>,
     /// Whether to merge entries with different expire timestamps.
@@ -386,10 +388,12 @@ impl<T: RowEntryIterator> MergeOperatorIterator<T> {
         delegate: T,
         merge_different_expire_ts: bool,
         snapshot_barrier_seq: Option<u64>,
+        read_trace: ReadTrace,
     ) -> Self {
         Self {
             merge_operator,
             delegate,
+            read_trace,
             buffered_entry: None,
             merge_different_expire_ts,
             snapshot_barrier_seq,
@@ -426,6 +430,9 @@ impl<T: RowEntryIterator> MergeOperatorIterator<T> {
         batch: &mut Vec<RowEntry>,
         merge_tracker: &mut MergeTracker,
     ) -> Result<Bytes, SlateDBError> {
+        let span = self.read_trace.new_read_merge_span(batch.len());
+        let _guard = span.enter();
+
         batch.reverse();
         let mut operands: Vec<Bytes> = Vec::with_capacity(batch.len());
         for entry in &*batch {
@@ -526,15 +533,20 @@ impl<T: RowEntryIterator> MergeOperatorIterator<T> {
             return Ok(None);
         }
 
-        results.reverse();
-        let final_result = if base_is_resolved {
-            self.merge_operator
-                .merge_batch_with_base(&key, base_value, &results)?
-        } else {
-            MergeResult::Value(
+        let final_result = {
+            let num_operands = results.len() + if base_value.is_some() { 1 } else { 0 };
+            let span = self.read_trace.new_read_merge_span(num_operands);
+            let _guard = span.enter();
+            results.reverse();
+            if base_is_resolved {
                 self.merge_operator
-                    .merge_batch(&key, base_value, &results)?,
-            )
+                    .merge_batch_with_base(&key, base_value, &results)?
+            } else {
+                MergeResult::Value(
+                    self.merge_operator
+                        .merge_batch(&key, base_value, &results)?,
+                )
+            }
         };
 
         Ok(Some(RowEntry {
@@ -595,14 +607,16 @@ impl<T: TrackedRowEntryIterator> TrackedRowEntryIterator for MergeOperatorIterat
 
 #[cfg(test)]
 mod tests {
-    use std::{cmp::Ordering, collections::VecDeque, fmt::Debug};
-
     use rstest::rstest;
     use slatedb_common::metrics::{lookup_metric, test_recorder_helper};
-
-    use crate::test_utils::assert_iterator;
+    use std::{cmp::Ordering, collections::VecDeque, fmt::Debug};
+    use tracing_subscriber::prelude::*;
 
     use super::*;
+    use crate::{
+        config::TracingOptions,
+        test_utils::{assert_iterator, SpanRecorder},
+    };
 
     struct MockMergeOperator;
 
@@ -833,6 +847,7 @@ mod tests {
             data.into(),
             true,
             None,
+            ReadTrace::none(),
         );
         assert_iterator(
             &mut iterator,
@@ -843,6 +858,113 @@ mod tests {
             ],
         )
         .await;
+    }
+
+    #[rstest]
+    #[case::with_base_value(Some(0))]
+    #[case::without_base_value(None)]
+    fn test_merge_operator_iterator_records_merge_spans(#[case] base_value: Option<u8>) {
+        const TRACE_ID: &str = "merge-trace";
+
+        let key = b"key1";
+        let num_rows = 250usize;
+        let mut data = Vec::new();
+        if let Some(value) = base_value {
+            data.push(RowEntry::new_value(key, &[value], 0));
+        }
+        let merges = (1..=num_rows)
+            .map(|i| RowEntry::new_merge(key, &[i as u8], i as u64))
+            .collect::<Vec<_>>();
+        data.extend(merges);
+        let recorder = SpanRecorder::for_name("slatedb.read.merge");
+        let subscriber = tracing_subscriber::registry().with(recorder.clone());
+
+        tracing::subscriber::with_default(subscriber, || {
+            let mut iterator = MergeOperatorIterator::<MockRowEntryIterator>::new(
+                Arc::new(MockMergeOperator {}),
+                data.into(),
+                true,
+                None,
+                ReadTrace::new(Some(TracingOptions::new(TRACE_ID))),
+            );
+            tokio_test::block_on(iterator.next()).unwrap().unwrap();
+        });
+
+        let spans = recorder.spans();
+        assert_eq!(
+            spans.len(),
+            3 /* merging each batch */ + 1 /* merging the batch results */
+        );
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| span
+                    .fields
+                    .get("num_operands")
+                    .map(|s| s.parse::<usize>().unwrap())
+                    .unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                MERGE_BATCH_SIZE,
+                MERGE_BATCH_SIZE,
+                50,
+                3 /* merging 3 batch results */ + if base_value.is_some() { 1 } else { 0 },
+            ]
+        );
+        for span in spans {
+            assert_eq!(span.level, "INFO");
+            assert_eq!(span.parent_name.as_deref(), Some("slatedb.read"));
+            assert_eq!(
+                span.fields.get("trace_id").map(String::as_str),
+                Some(TRACE_ID)
+            );
+        }
+    }
+
+    #[test]
+    fn test_merge_operator_iterator_records_no_merge_spans_without_merges() {
+        const TRACE_ID: &str = "merge-trace";
+
+        let data = Vec::new();
+        let recorder = SpanRecorder::for_name("slatedb.read.merge");
+        let subscriber = tracing_subscriber::registry().with(recorder.clone());
+
+        tracing::subscriber::with_default(subscriber, || {
+            let mut iterator = MergeOperatorIterator::<MockRowEntryIterator>::new(
+                Arc::new(MockMergeOperator {}),
+                data.into(),
+                true,
+                None,
+                ReadTrace::new(Some(TracingOptions::new(TRACE_ID))),
+            );
+            assert_eq!(None, tokio_test::block_on(iterator.next()).unwrap());
+        });
+
+        let spans = recorder.spans();
+        assert_eq!(spans.len(), 0);
+    }
+
+    #[test]
+    fn test_merge_operator_iterator_does_not_record_merge_spans_without_tracing() {
+        let data = vec![
+            RowEntry::new_merge(b"key1", b"1", 1),
+            RowEntry::new_merge(b"key1", b"2", 2),
+        ];
+        let recorder = SpanRecorder::for_name("slatedb.read.merge");
+        let subscriber = tracing_subscriber::registry().with(recorder.clone());
+
+        tracing::subscriber::with_default(subscriber, || {
+            let mut iterator = MergeOperatorIterator::<MockRowEntryIterator>::new(
+                Arc::new(MockMergeOperator {}),
+                data.into(),
+                true,
+                None,
+                ReadTrace::none(),
+            );
+            tokio_test::block_on(iterator.next()).unwrap().unwrap();
+        });
+
+        assert!(recorder.spans().is_empty());
     }
 
     #[tokio::test]
@@ -857,6 +979,7 @@ mod tests {
             .into(),
             true,
             None,
+            ReadTrace::none(),
         );
         assert_iterator(&mut with_base, vec![RowEntry::new_tombstone(b"key", 2)]).await;
 
@@ -865,6 +988,7 @@ mod tests {
             vec![RowEntry::new_merge(b"key", b"remove", 2)].into(),
             true,
             None,
+            ReadTrace::none(),
         );
         assert_iterator(
             &mut without_base,
@@ -880,6 +1004,7 @@ mod tests {
             vec![RowEntry::new_merge(b"key", b"remove", 2)].into(),
             true,
             None,
+            ReadTrace::none(),
         )
         .with_resolved_missing_base();
 
@@ -901,6 +1026,7 @@ mod tests {
             .into(),
             false,
             None,
+            ReadTrace::none(),
         )
         .with_resolved_missing_base();
 
@@ -928,6 +1054,7 @@ mod tests {
             data.into(),
             true,
             None,
+            ReadTrace::none(),
         );
 
         iterator.init().await.unwrap();
@@ -1053,6 +1180,7 @@ mod tests {
             test_case.unsorted_data.into(),
             test_case.merge_different_expire_ts,
             test_case.snapshot_barrier_seq,
+            ReadTrace::none(),
         );
         assert_iterator(&mut iterator, test_case.expected).await;
     }
@@ -1195,6 +1323,7 @@ mod tests {
             data.into(),
             true,
             None,
+            ReadTrace::none(),
         );
 
         // Expected: max should return 10, sum should return 15
@@ -1225,6 +1354,7 @@ mod tests {
             data.into(),
             true,
             None,
+            ReadTrace::none(),
         );
 
         let expected_bytes: Vec<u8> = (1..=250).map(|i| i as u8).collect();
@@ -1248,6 +1378,7 @@ mod tests {
             data.into(),
             true,
             None,
+            ReadTrace::none(),
         );
 
         let mut expected_bytes = b"BASE".to_vec();
@@ -1272,6 +1403,7 @@ mod tests {
             data.into(),
             true,
             None,
+            ReadTrace::none(),
         );
 
         let expected_bytes: Vec<u8> = (1..=250).map(|i| i as u8).collect();
@@ -1303,6 +1435,7 @@ mod tests {
             data.into(),
             true,
             None,
+            ReadTrace::none(),
         );
 
         let mut expected_bytes = b"BASE".to_vec();
@@ -1336,6 +1469,7 @@ mod tests {
             data.into(),
             true,
             None,
+            ReadTrace::none(),
         );
 
         // Entries sorted by reverse seq: seq=5, 4, 3, 2, 1
@@ -1366,6 +1500,7 @@ mod tests {
             data.into(),
             true,
             None,
+            ReadTrace::none(),
         );
 
         // Sorted by reverse seq: seq=4, 3, 2, 1, 0(BASE)
@@ -1394,6 +1529,7 @@ mod tests {
             data.into(),
             true,
             None,
+            ReadTrace::none(),
         );
 
         // Sorted by reverse seq: seq=3, 2, 1
@@ -1421,6 +1557,7 @@ mod tests {
             data.into(),
             true,
             None,
+            ReadTrace::none(),
         );
 
         // then: min_expire_ts should come from the base value (50)
