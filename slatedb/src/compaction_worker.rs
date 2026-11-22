@@ -21,6 +21,19 @@
 //!    more separate worker processes each run a [`CompactionWorker`]. The coordinator must
 //!    have `worker: None` in its [`crate::config::CompactorOptions`].
 //!
+//! # Fencing
+//!
+//! A coordinator is fenced by the compactor epoch: one that starts bumps the
+//! epoch in `.compactions`, and every write of an older coordinator fails. A
+//! worker embedded in a coordinator is fenced with it (see [`WorkerFence`]):
+//! it carries its coordinator's epoch and refuses to claim, heartbeat or
+//! complete a compaction once `.compactions` records a later one. Without
+//! that, the worker of a superseded process that is slow to notice could
+//! claim a compaction the new coordinator scheduled and run it with its own
+//! stale merge operator and compaction filters, and the new coordinator
+//! would commit the output. A standalone worker belongs to no coordinator
+//! and is not fenced.
+//!
 //! # Heartbeat and failure detection
 //!
 //! Workers emit heartbeats to prove liveness. A heartbeat is a CAS write that
@@ -171,12 +184,43 @@ fn total_output_ssts(subcompactions: &[Subcompaction]) -> usize {
     subcompactions.iter().map(|s| s.output_ssts().len()).sum()
 }
 
+/// Which coordinator, if any, a worker's writes to `.compactions` answer to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkerFence {
+    /// A standalone worker: it serves whichever coordinator schedules work,
+    /// so no epoch supersedes it.
+    Unfenced,
+    /// A worker embedded in the coordinator that holds this compactor epoch.
+    /// Once `.compactions` records a later epoch the worker's process has
+    /// been superseded, and its claims, heartbeats and results fail with
+    /// [`SlateDBError::Fenced`].
+    CompactorEpoch(u64),
+}
+
+impl WorkerFence {
+    /// Fails when `compactions` records a compactor epoch after this
+    /// worker's.
+    ///
+    /// Callers check the state they are about to replace: a write to
+    /// `.compactions` succeeds only against the version that was checked,
+    /// and a coordinator that starts writes a new version to bump the
+    /// epoch, so a check that passed cannot be overtaken by the bump.
+    fn check(self, compactor_epoch: u64) -> Result<(), SlateDBError> {
+        match self {
+            Self::Unfenced => Ok(()),
+            Self::CompactorEpoch(epoch) if compactor_epoch > epoch => Err(SlateDBError::Fenced),
+            Self::CompactorEpoch(_) => Ok(()),
+        }
+    }
+}
+
 /// Internal `MessageHandler` for the worker's event loop.
 ///
 /// Reuses [`CompactorMessage`] so the embedded [`TokioCompactionExecutor`] can
 /// report `CompactionJobFinished` on the same channel the dispatcher polls.
 pub(crate) struct CompactionWorkerHandler {
     worker_id: String,
+    fence: WorkerFence,
     options: Arc<CompactionWorkerOptions>,
     compactions_store: Arc<CompactionsStore>,
     manifest_store: Arc<ManifestStore>,
@@ -209,6 +253,7 @@ impl CompactionWorkerHandler {
     ) -> Self {
         Self {
             worker_id,
+            fence: WorkerFence::Unfenced,
             options,
             compactions_store,
             manifest_store,
@@ -221,10 +266,18 @@ impl CompactionWorkerHandler {
         }
     }
 
+    /// Fences this worker as `fence` says; a worker is unfenced until then.
+    pub(crate) fn with_fence(mut self, fence: WorkerFence) -> Self {
+        self.fence = fence;
+        self
+    }
+
     /// Builds the worker's [`CompactionWorkerHandler`] and the receiver that
     /// the handler reads completion messages from. Shared between the
     /// standalone `run()` path and the embedded-worker path in `Compactor::run`.
+    /// An embedded worker passes its coordinator's epoch as `fence`.
     pub(crate) fn build_worker_handler(
+        fence: WorkerFence,
         manifest_store: Arc<ManifestStore>,
         compactions_store: Arc<CompactionsStore>,
         table_store: Arc<TableStore>,
@@ -246,8 +299,9 @@ impl CompactionWorkerHandler {
         let (tx, rx) = async_channel::unbounded::<WorkerMessage>();
         let worker_id = rand.rng().gen_ulid(system_clock.as_ref()).to_string();
         info!(
-            "starting compaction worker [worker_id={}, max_concurrent_compactions={}, compactions_poll_interval={:?}]",
+            "starting compaction worker [worker_id={}, fence={:?}, max_concurrent_compactions={}, compactions_poll_interval={:?}]",
             worker_id,
+            fence,
             options.max_concurrent_compactions,
             options.compactions_poll_interval,
         );
@@ -279,7 +333,8 @@ impl CompactionWorkerHandler {
             system_clock.clone(),
             rand.clone(),
             fp_registry,
-        );
+        )
+        .with_fence(fence);
         (handler, rx)
     }
 
@@ -321,7 +376,10 @@ impl CompactionWorkerHandler {
         // to be consistent with the claimed compaction.
         let claimed = loop {
             let stored = self.stored.as_mut().expect(Self::EXPECT_LOADED);
-            stored.refresh().await?;
+            let compactor_epoch = stored.refresh().await?.compactor_epoch;
+            // A superseded worker claims nothing: its filters and merge
+            // operator are those of a process that no longer owns the store.
+            self.fence.check(compactor_epoch)?;
             let mut dirty_compactions = stored.prepare_dirty()?;
 
             let mut to_claim: Vec<Compaction> = Vec::new();
@@ -523,7 +581,10 @@ impl CompactionWorkerHandler {
             }
 
             let stored = self.stored.as_mut().expect(Self::EXPECT_LOADED);
-            stored.refresh().await?;
+            let compactor_epoch = stored.refresh().await?.compactor_epoch;
+            // A superseded worker publishes no progress: a worker that
+            // resumed the job would adopt output this one filtered.
+            self.fence.check(compactor_epoch)?;
             let mut dirty = stored.prepare_dirty()?;
             let now_ms = self.clock.now().timestamp_millis() as u64;
             let worker_spec = WorkerSpec::new(self.worker_id.clone(), now_ms);
@@ -596,7 +657,11 @@ impl CompactionWorkerHandler {
     ) -> Result<(), SlateDBError> {
         loop {
             let stored = self.stored.as_mut().expect(Self::EXPECT_LOADED);
-            stored.refresh().await?;
+            let compactor_epoch = stored.refresh().await?.compactor_epoch;
+            // A superseded worker hands in no result: the output becomes
+            // orphaned tables for GC, and the claim goes back to `Scheduled`
+            // when this worker shuts down or its heartbeat times out.
+            self.fence.check(compactor_epoch)?;
             let mut dirty = stored.prepare_dirty()?;
             let Some(existing) = dirty.value.get(&compaction_id).cloned() else {
                 info!(
@@ -653,6 +718,10 @@ impl CompactionWorkerHandler {
 
     /// Returns a claim to `Scheduled` so it can be re-attempted by any worker
     /// (used when execution fails or when the worker shuts down gracefully).
+    ///
+    /// Not fenced: a superseded worker that gives its claim up only spares
+    /// the new coordinator the wait for the heartbeat timeout. The job keeps
+    /// the progress the worker published while it still held the epoch.
     async fn release_claim(&mut self, compaction_id: Ulid) -> Result<(), SlateDBError> {
         let worker_id = self.worker_id.as_str();
         loop {
@@ -1187,6 +1256,228 @@ mod tests {
         let release_order = job_progress.into_keys().collect::<Vec<_>>();
 
         assert_eq!(release_order, vec![id1, id2, id3]);
+    }
+
+    impl WorkerFixture {
+        /// Starts a coordinator elsewhere, as a process that supersedes this
+        /// worker's does: bumps the compactor epoch in `.compactions`.
+        async fn supersede_coordinator(&self) -> u64 {
+            let stored = StoredCompactions::load(self.compactions_store.clone())
+                .await
+                .unwrap();
+            crate::compactions_store::FenceableCompactions::init(
+                stored,
+                Duration::from_secs(300),
+                Arc::new(DefaultSystemClock::new()),
+            )
+            .await
+            .unwrap();
+            self.compactions_store
+                .read_latest_compactions()
+                .await
+                .unwrap()
+                .compactions
+                .compactor_epoch
+        }
+
+        fn output_run() -> SortedRun {
+            SortedRun::new(
+                0,
+                [SsTableView::identity(SsTableHandle::new(
+                    SsTableId::from(Ulid::from_parts(9000, 0)),
+                    SST_FORMAT_VERSION_LATEST,
+                    SsTableInfo {
+                        first_entry: Some(Bytes::from_static(b"a")),
+                        ..SsTableInfo::default()
+                    },
+                ))],
+            )
+        }
+    }
+
+    #[test]
+    fn test_worker_fence_fails_only_a_later_compactor_epoch() {
+        for epoch in [0, 1, 7, u64::MAX] {
+            assert!(WorkerFence::Unfenced.check(epoch).is_ok());
+        }
+        let fence = WorkerFence::CompactorEpoch(7);
+        assert!(fence.check(0).is_ok());
+        assert!(fence.check(6).is_ok());
+        assert!(fence.check(7).is_ok());
+        assert!(matches!(fence.check(8), Err(SlateDBError::Fenced)));
+        assert!(matches!(fence.check(u64::MAX), Err(SlateDBError::Fenced)));
+    }
+
+    /// The hole the fence closes, shown on a worker without one: the
+    /// embedded worker of a superseded coordinator claims a compaction the
+    /// new coordinator scheduled and hands its output in. A standalone
+    /// worker is meant to do exactly that.
+    #[tokio::test]
+    async fn test_unfenced_worker_claims_and_completes_under_a_later_epoch() {
+        let mut fx = WorkerFixture::new("worker-A").await;
+        assert_eq!(fx.handler.fence, WorkerFence::Unfenced);
+        assert_eq!(fx.supersede_coordinator().await, 1);
+        let id = Ulid::from_parts(1, 0);
+        fx.seed_scheduled_compaction(id, vec![SourceId::SstView(fx.l0_view.id)])
+            .await;
+
+        fx.handler.poll_and_claim().await.unwrap();
+        assert_eq!(fx.executor.jobs().len(), 1);
+        fx.handler
+            .handle_finished(id, Ok(WorkerFixture::output_run()))
+            .await
+            .unwrap();
+
+        let c = fx.read_compaction(id).await.expect("compaction missing");
+        assert_eq!(c.status(), CompactionStatus::Compacted);
+        assert_eq!(c.output_ssts().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_embedded_worker_claims_under_its_own_epoch() {
+        let mut fx = WorkerFixture::new("worker-A").await;
+        let epoch = fx.supersede_coordinator().await;
+        fx.handler = fx.handler.with_fence(WorkerFence::CompactorEpoch(epoch));
+        let id = Ulid::from_parts(1, 0);
+        fx.seed_scheduled_compaction(id, vec![SourceId::SstView(fx.l0_view.id)])
+            .await;
+
+        fx.handler.poll_and_claim().await.unwrap();
+
+        let c = fx.read_compaction(id).await.expect("compaction missing");
+        assert_eq!(c.status(), CompactionStatus::Running);
+        assert_eq!(fx.executor.jobs().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_superseded_embedded_worker_cannot_claim() {
+        let mut fx = WorkerFixture::new("worker-A").await;
+        fx.handler = fx.handler.with_fence(WorkerFence::CompactorEpoch(0));
+        assert_eq!(fx.supersede_coordinator().await, 1);
+        // Scheduled by the coordinator that superseded this worker's.
+        let id = Ulid::from_parts(1, 0);
+        fx.seed_scheduled_compaction(id, vec![SourceId::SstView(fx.l0_view.id)])
+            .await;
+
+        let result = fx.handler.poll_and_claim().await;
+
+        assert!(matches!(result, Err(SlateDBError::Fenced)));
+        let c = fx.read_compaction(id).await.expect("compaction missing");
+        assert_eq!(c.status(), CompactionStatus::Scheduled);
+        assert!(c.worker().is_none());
+        assert!(fx.executor.jobs().is_empty());
+        assert!(fx.handler.job_progress.is_empty());
+    }
+
+    /// The claim is made against the version of `.compactions` the fence
+    /// was checked on, so a coordinator that starts between the check and
+    /// the write still fences it.
+    #[tokio::test]
+    async fn test_embedded_worker_claim_loses_to_an_epoch_bump_after_its_check() {
+        let mut fx = WorkerFixture::new("worker-A").await;
+        fx.handler = fx.handler.with_fence(WorkerFence::CompactorEpoch(0));
+        let id = Ulid::from_parts(1, 0);
+        fx.seed_scheduled_compaction(id, vec![SourceId::SstView(fx.l0_view.id)])
+            .await;
+        // The worker's own handle now holds the version it would check.
+        let stored = fx.handler.stored.as_mut().unwrap();
+        assert_eq!(stored.refresh().await.unwrap().compactor_epoch, 0);
+        let mut dirty = stored.prepare_dirty().unwrap();
+        let claim = dirty
+            .value
+            .get(&id)
+            .cloned()
+            .unwrap()
+            .with_status(CompactionStatus::Running)
+            .with_worker(Some(WorkerSpec::new("worker-A".to_string(), 1)));
+        dirty.value.insert(claim);
+
+        assert_eq!(fx.supersede_coordinator().await, 1);
+
+        let stored = fx.handler.stored.as_mut().unwrap();
+        let conflict = stored.update(dirty).await.unwrap_err();
+        assert!(conflict.is_sequenced_write_conflict());
+        // The retry re-reads, and the fence fails it.
+        let result = fx.handler.poll_and_claim().await;
+        assert!(matches!(result, Err(SlateDBError::Fenced)));
+        let c = fx.read_compaction(id).await.expect("compaction missing");
+        assert_eq!(c.status(), CompactionStatus::Scheduled);
+    }
+
+    #[tokio::test]
+    async fn test_superseded_embedded_worker_cannot_hand_in_its_output() {
+        let mut fx = WorkerFixture::new("worker-A").await;
+        fx.handler = fx.handler.with_fence(WorkerFence::CompactorEpoch(0));
+        let id = Ulid::from_parts(1, 0);
+        fx.seed_scheduled_compaction(id, vec![SourceId::SstView(fx.l0_view.id)])
+            .await;
+        // Claimed while this worker's coordinator still held the epoch.
+        fx.handler.poll_and_claim().await.unwrap();
+        assert_eq!(fx.supersede_coordinator().await, 1);
+
+        let result = fx
+            .handler
+            .handle_finished(id, Ok(WorkerFixture::output_run()))
+            .await;
+
+        assert!(matches!(result, Err(SlateDBError::Fenced)));
+        let c = fx.read_compaction(id).await.expect("compaction missing");
+        assert_eq!(c.status(), CompactionStatus::Running);
+        assert!(c.output_ssts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_superseded_embedded_worker_cannot_publish_progress() {
+        let mut fx = WorkerFixture::new("worker-A").await;
+        fx.handler = fx.handler.with_fence(WorkerFence::CompactorEpoch(0));
+        let id = Ulid::from_parts(1, 0);
+        fx.seed_scheduled_compaction(id, vec![SourceId::SstView(fx.l0_view.id)])
+            .await;
+        fx.handler.poll_and_claim().await.unwrap();
+        let heartbeat_ms = fx
+            .read_compaction(id)
+            .await
+            .and_then(|c| c.worker().map(|w| w.last_heartbeat_ms))
+            .expect("claimed compaction has a worker");
+        let ctx =
+            CompactionContext::new(vec![Subcompaction::new(BytesRange::unbounded())], Some(0));
+        fx.handler.record_progress(id, 1000, ctx);
+        assert_eq!(fx.supersede_coordinator().await, 1);
+
+        let result = fx.handler.heartbeat_owned_jobs().await;
+
+        assert!(matches!(result, Err(SlateDBError::Fenced)));
+        let c = fx.read_compaction(id).await.expect("compaction missing");
+        assert_eq!(c.ctx(), None);
+        assert_eq!(c.worker().unwrap().last_heartbeat_ms, heartbeat_ms);
+    }
+
+    /// A fenced worker's event loop ends with the error, and its cleanup
+    /// still gives the claim back so the new coordinator need not wait for
+    /// the heartbeat timeout.
+    #[tokio::test]
+    async fn test_superseded_embedded_worker_releases_its_claims_on_cleanup() {
+        let mut fx = WorkerFixture::new("worker-A").await;
+        fx.handler = fx.handler.with_fence(WorkerFence::CompactorEpoch(0));
+        let id = Ulid::from_parts(1, 0);
+        fx.seed_scheduled_compaction(id, vec![SourceId::SstView(fx.l0_view.id)])
+            .await;
+        fx.handler.poll_and_claim().await.unwrap();
+        assert_eq!(fx.supersede_coordinator().await, 1);
+        let fenced = fx.handler.handle(WorkerMessage::PollCompactions).await;
+        assert!(matches!(fenced, Err(SlateDBError::Fenced)));
+
+        let empty: BoxStream<'_, WorkerMessage> = futures::stream::empty().boxed();
+        fx.handler
+            .cleanup(empty, Err(SlateDBError::Fenced))
+            .await
+            .unwrap();
+
+        let c = fx.read_compaction(id).await.expect("compaction missing");
+        assert_eq!(c.status(), CompactionStatus::Scheduled);
+        assert!(c.worker().is_none());
+        assert_eq!(fx.executor.stopped_jobs(), Vec::<Ulid>::new());
+        assert!(fx.handler.job_progress.is_empty());
     }
 
     #[tokio::test]

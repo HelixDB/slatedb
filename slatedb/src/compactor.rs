@@ -394,6 +394,8 @@ impl Compactor {
             self.recorder.clone(),
         )
         .await?;
+        // The embedded worker is fenced with this coordinator.
+        let compactor_epoch = handler.compactor_epoch();
         self.task_executor
             .add_handler(
                 COMPACTOR_TASK_NAME.to_string(),
@@ -408,6 +410,7 @@ impl Compactor {
         // shutting it down alongside the coordinator.
         if let Some(worker_options) = self.options.worker.clone() {
             let (worker_handler, worker_rx) = CompactionWorkerHandler::build_worker_handler(
+                crate::compaction_worker::WorkerFence::CompactorEpoch(compactor_epoch),
                 self.manifest_store.clone(),
                 self.compactions_store.clone(),
                 self.table_store.clone(),
@@ -609,6 +612,12 @@ impl CompactorEventHandler {
 
     fn state(&self) -> &CompactorState {
         &self.state_writer.state
+    }
+
+    /// The compactor epoch this coordinator took when it started. Later
+    /// coordinators take later epochs.
+    pub(crate) fn compactor_epoch(&self) -> u64 {
+        self.state().manifest().value.compactor_epoch
     }
 
     fn state_mut(&mut self) -> &mut CompactorState {
