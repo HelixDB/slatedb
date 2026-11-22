@@ -1226,7 +1226,36 @@ impl CompactorEventHandler {
 
         let mut manifest_changed = false;
 
+        // Every source and destination of a compaction that is past this
+        // gate. A submission that shares one with them would run beside that
+        // compaction, and the commit of whichever finished second would see
+        // only that its sources still exist by id: a run rewritten as
+        // `[SR k] -> SR k` committed after a merge into `SR k` would replace
+        // the merged run with the old one's rows. The scheduler never
+        // proposes such a spec; a submission from outside can, and so can a
+        // proposal made before a submission it conflicts with was read.
+        let mut claimed = self
+            .state()
+            .compactions_with_status(&[
+                CompactionStatus::Scheduled,
+                CompactionStatus::Running,
+                CompactionStatus::Compacted,
+            ])
+            .flat_map(|c| Self::claims(c.spec()))
+            .collect::<HashSet<_>>();
+
         for compaction in &submitted_compactions {
+            let claims = Self::claims(compaction.spec()).collect::<Vec<_>>();
+            if let Some(conflict) = claims.iter().find(|claim| claimed.contains(claim)) {
+                warn!(
+                    "rejected compaction: {:?} is in use by a compaction in flight [compaction={:?}]",
+                    conflict, compaction
+                );
+                self.state_mut().update_compaction(&compaction.id(), |c| {
+                    c.set_status(CompactionStatus::Failed)
+                });
+                continue;
+            }
             // Validate the candidate compaction; mark as failed if invalid.
             if let Err(e) = self.validate_compaction(compaction) {
                 error!(
@@ -1238,6 +1267,7 @@ impl CompactorEventHandler {
                 });
                 continue;
             }
+            claimed.extend(claims);
 
             // Coordinator-local compactions never enter Scheduled because no
             // worker runs them. Everything else becomes ready to claim.
@@ -1273,6 +1303,15 @@ impl CompactorEventHandler {
         }
 
         Ok(())
+    }
+
+    /// What a compaction reads or replaces while it is in flight: its
+    /// sources, and the sorted run it writes.
+    fn claims(spec: &CompactionSpec) -> impl Iterator<Item = SourceId> + '_ {
+        spec.sources()
+            .iter()
+            .copied()
+            .chain(spec.destination().map(SourceId::SortedRun))
     }
 
     /// Records a failed compaction attempt.
@@ -5411,6 +5450,145 @@ mod tests {
                 .expect("missing stored compaction")
                 .status(),
             CompactionStatus::Failed
+        );
+    }
+
+    /// Seeds sorted runs `ids` (newest first) into the handler's manifest.
+    fn seed_sorted_runs(fixture: &mut CompactorEventHandlerTestFixture, ids: &[u32]) {
+        let core = &mut fixture
+            .handler
+            .state_writer
+            .state
+            .manifest_mut_for_test()
+            .value
+            .core;
+        Arc::make_mut(&mut core.tree).compacted =
+            ids.iter().map(|id| SortedRun::new(*id, [])).collect();
+    }
+
+    fn sorted_run_spec(sources: &[u32], destination: u32) -> CompactionSpec {
+        CompactionSpec::new(
+            sources.iter().copied().map(SourceId::SortedRun).collect(),
+            destination,
+        )
+    }
+
+    async fn stored_status(
+        fixture: &CompactorEventHandlerTestFixture,
+        id: Ulid,
+    ) -> Option<CompactionStatus> {
+        fixture
+            .compactions_store
+            .read_latest_compactions()
+            .await
+            .unwrap()
+            .compactions
+            .get(&id)
+            .map(|compaction| compaction.status())
+    }
+
+    /// A run rewritten as `[SR k] -> SR k` beside a merge into `SR k` would,
+    /// committed second, replace the merged run with the old one's rows: its
+    /// only source still exists by id. Such a submission is refused, in each
+    /// state the merge can be in once it is past validation, while one that
+    /// shares nothing with the merge is accepted.
+    #[rstest]
+    #[case::scheduled(CompactionStatus::Scheduled)]
+    #[case::running(CompactionStatus::Running)]
+    #[case::compacted(CompactionStatus::Compacted)]
+    #[tokio::test]
+    async fn test_maybe_validate_submitted_compactions_fails_one_that_shares_a_source_with_a_compaction_in_flight(
+        #[case] in_flight: CompactionStatus,
+    ) {
+        let mut fixture = CompactorEventHandlerTestFixture::new().await;
+        seed_sorted_runs(&mut fixture, &[7, 6, 5, 4, 3]);
+        let merge = Ulid::from_parts(1, 0);
+        let rewrite = Ulid::from_parts(2, 0);
+        let elsewhere = Ulid::from_parts(3, 0);
+        let state = fixture.handler.state_mut();
+        state.insert_compaction_for_test(
+            Compaction::new(merge, sorted_run_spec(&[5, 4, 3], 3)).with_status(in_flight),
+        );
+        state.insert_compaction_for_test(Compaction::new(rewrite, sorted_run_spec(&[3], 3)));
+        state.insert_compaction_for_test(Compaction::new(elsewhere, sorted_run_spec(&[7], 7)));
+
+        fixture
+            .handler
+            .maybe_validate_submitted_compactions()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stored_status(&fixture, rewrite).await,
+            Some(CompactionStatus::Failed)
+        );
+        assert_eq!(
+            stored_status(&fixture, elsewhere).await,
+            Some(CompactionStatus::Scheduled)
+        );
+        assert_eq!(stored_status(&fixture, merge).await, Some(in_flight));
+    }
+
+    /// Two submissions validated in one pass are checked against each other:
+    /// the first is accepted and claims its runs, the second is refused.
+    #[tokio::test]
+    async fn test_maybe_validate_submitted_compactions_fails_the_second_of_two_that_overlap() {
+        let mut fixture = CompactorEventHandlerTestFixture::new().await;
+        seed_sorted_runs(&mut fixture, &[7, 6, 5]);
+        let first = Ulid::from_parts(1, 0);
+        let second = Ulid::from_parts(2, 0);
+        let state = fixture.handler.state_mut();
+        state.insert_compaction_for_test(Compaction::new(first, sorted_run_spec(&[7, 6], 6)));
+        state.insert_compaction_for_test(Compaction::new(second, sorted_run_spec(&[6], 6)));
+
+        fixture
+            .handler
+            .maybe_validate_submitted_compactions()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stored_status(&fixture, first).await,
+            Some(CompactionStatus::Scheduled)
+        );
+        assert_eq!(
+            stored_status(&fixture, second).await,
+            Some(CompactionStatus::Failed)
+        );
+    }
+
+    /// A compaction in flight claims the run it writes as well as the runs
+    /// it reads: a submission that would write the same new run is refused.
+    /// A `Compacted` L0 compaction is used because the rule against parallel
+    /// L0 compactions does not look at it, so only the claim refuses this.
+    #[tokio::test]
+    async fn test_maybe_validate_submitted_compactions_fails_one_that_writes_the_run_of_a_compaction_in_flight(
+    ) {
+        let mut fixture = CompactorEventHandlerTestFixture::new().await;
+        fixture.write_l0().await;
+        fixture.handler.state_writer.refresh().await.unwrap();
+        let l0 = fixture.build_l0_compaction().await;
+        let in_flight = Ulid::from_parts(1, 0);
+        let same_run = Ulid::from_parts(2, 0);
+        let state = fixture.handler.state_mut();
+        state.insert_compaction_for_test(
+            Compaction::new(
+                in_flight,
+                CompactionSpec::new(vec![SourceId::SstView(Ulid::from_parts(9, 9))], 0),
+            )
+            .with_status(CompactionStatus::Compacted),
+        );
+        state.insert_compaction_for_test(Compaction::new(same_run, l0));
+
+        fixture
+            .handler
+            .maybe_validate_submitted_compactions()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stored_status(&fixture, same_run).await,
+            Some(CompactionStatus::Failed)
         );
     }
 
