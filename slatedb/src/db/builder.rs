@@ -125,7 +125,8 @@ use crate::clone::{SegmentFilterFn, SegmentProjectionFn};
 #[cfg(feature = "compaction_filters")]
 use crate::compaction_filter::CompactionFilterSupplier;
 use crate::compaction_worker::{
-    CompactionWorker, CompactionWorkerHandler, WorkerMessage, COMPACTION_WORKER_TASK_NAME,
+    CompactionWorker, CompactionWorkerHandler, WorkerFence, WorkerMessage,
+    COMPACTION_WORKER_TASK_NAME,
 };
 use crate::compactions_store::CompactionsStore;
 use crate::compactor::stats::CompactionStats;
@@ -1645,8 +1646,11 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             self.expected_epoch,
         )
         .await?;
+        // The embedded worker is fenced with this coordinator.
+        let compactor_epoch = handler.compactor_epoch();
         let worker = options.worker.clone().map(|worker_options| {
             CompactionWorkerHandler::build_worker_handler(
+                WorkerFence::CompactorEpoch(compactor_epoch),
                 manifest_store,
                 compactions_store,
                 table_store,
@@ -1858,7 +1862,11 @@ impl<P: Into<Path>> CompactionWorkerBuilder<P> {
             closed_result,
             self.system_clock.clone(),
         ));
+        // `Unfenced` is safe here. A standalone worker is not part of a
+        // database or compactor process that a later process supersedes. It
+        // serves each coordinator that takes the epoch.
         let (handler, rx) = CompactionWorkerHandler::build_worker_handler(
+            WorkerFence::Unfenced,
             manifest_store,
             compactions_store,
             table_store,

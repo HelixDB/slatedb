@@ -455,6 +455,7 @@ impl Compactor {
                 BlockCachePolicy::default(),
             ));
             let (worker_handler, worker_rx) = CompactionWorkerHandler::build_worker_handler(
+                crate::compaction_worker::WorkerFence::CompactorEpoch(handler.compactor_epoch()),
                 self.manifest_store.clone(),
                 self.compactions_store.clone(),
                 table_store,
@@ -678,6 +679,12 @@ impl CompactorEventHandler {
 
     fn state(&self) -> &CompactorState {
         &self.state_writer.state
+    }
+
+    /// The compactor epoch this coordinator took when it started. Later
+    /// coordinators take later epochs.
+    pub(crate) fn compactor_epoch(&self) -> u64 {
+        self.state().manifest().value.compactor_epoch
     }
 
     fn state_mut(&mut self) -> &mut CompactorState {
