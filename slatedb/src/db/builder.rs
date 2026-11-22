@@ -2587,6 +2587,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_embedded_worker_of_a_db_compactor_is_fenced_by_its_epoch() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_embedded_worker_of_a_db_compactor_is_fenced");
+        let manifest_store = Arc::new(ManifestStore::new(&path, object_store.clone()));
+        StoredManifest::create_new_db(
+            manifest_store.clone(),
+            ManifestCore::new(),
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+        let table_store = Arc::new(crate::tablestore::TableStore::new(
+            object_store.clone(),
+            crate::format::sst::SsTableFormat::default(),
+            path.clone(),
+            None,
+            crate::tablestore::TableStoreKind::Compactor,
+            crate::block_cache_policy::BlockCachePolicy::default(),
+        ));
+        let build = || {
+            crate::CompactorBuilder::new(path.clone(), object_store.clone()).build_handler(
+                table_store.clone(),
+                manifest_store.clone(),
+                Arc::new(CompactionsStore::new(&path, object_store.clone())),
+            )
+        };
+
+        // Each coordinator takes the next epoch, and its worker is fenced
+        // by exactly that one.
+        for epoch in 1..=2 {
+            let handlers = build().await.unwrap();
+            assert_eq!(handlers.handler.compactor_epoch(), epoch);
+            let (worker, _rx) = handlers.worker.expect("the default options embed a worker");
+            assert_eq!(
+                worker.fence(),
+                crate::compaction_worker::WorkerFence::CompactorEpoch(epoch)
+            );
+        }
+
+        // A standalone worker answers to no coordinator.
+        let (worker, _rx) = crate::compaction_worker::CompactionWorkerHandler::build_worker_handler(
+            crate::compaction_worker::WorkerFence::Unfenced,
+            manifest_store,
+            Arc::new(CompactionsStore::new(&path, object_store)),
+            table_store,
+            Arc::new(crate::config::CompactionWorkerOptions::default()),
+            tokio::runtime::Handle::current(),
+            Arc::new(slatedb_common::DbRand::default()),
+            Arc::new(crate::compactor::stats::CompactionStats::new(
+                &MetricsRecorderHelper::noop(),
+            )),
+            MetricsRecorderHelper::noop(),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(fail_parallel::FailPointRegistry::new()),
+            None,
+            #[cfg(feature = "compaction_filters")]
+            None,
+        );
+        assert_eq!(
+            worker.fence(),
+            crate::compaction_worker::WorkerFence::Unfenced
+        );
+    }
+
+    #[tokio::test]
     async fn test_standalone_compactor_and_gc_builder_metric_level_is_order_independent() {
         let object_store = Arc::new(InMemory::new());
 

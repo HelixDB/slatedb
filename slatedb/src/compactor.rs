@@ -75,7 +75,7 @@ use crate::compaction_worker::CompactionWorkerHandler;
 use crate::compactions_store::{CompactionsStore, StoredCompactions};
 use crate::compactor::stats::CompactionStats;
 use crate::compactor_state_protocols::CompactorStateWriter;
-use crate::config::CompactorOptions;
+use crate::config::{CompactionWorkerOptions, CompactorOptions};
 use crate::db_state::{SortedRun, SsTableView};
 use crate::db_status::ClosedResultWriter;
 use crate::dispatcher::{MessageHandler, MessageHandlerExecutor, MessageTickerDef};
@@ -409,22 +409,7 @@ impl Compactor {
         // own cancellation token; Compactor::stop and run() are responsible for
         // shutting it down alongside the coordinator.
         if let Some(worker_options) = self.options.worker.clone() {
-            let (worker_handler, worker_rx) = CompactionWorkerHandler::build_worker_handler(
-                crate::compaction_worker::WorkerFence::CompactorEpoch(compactor_epoch),
-                self.manifest_store.clone(),
-                self.compactions_store.clone(),
-                self.table_store.clone(),
-                Arc::new(worker_options),
-                self.compactor_runtime.clone(),
-                self.rand.clone(),
-                self.stats.clone(),
-                self.recorder.clone(),
-                self.system_clock.clone(),
-                self.fp_registry.clone(),
-                self.merge_operator.clone(),
-                #[cfg(feature = "compaction_filters")]
-                self.compaction_filter_supplier.clone(),
-            );
+            let (worker_handler, worker_rx) = self.embedded_worker(compactor_epoch, worker_options);
             self.task_executor
                 .add_handler(
                     crate::compaction_worker::COMPACTION_WORKER_TASK_NAME.to_string(),
@@ -437,6 +422,34 @@ impl Compactor {
 
         self.task_executor.monitor_on(&Handle::current())?;
         Ok(())
+    }
+
+    /// The worker embedded in this compactor, fenced with the coordinator
+    /// that holds `compactor_epoch`.
+    fn embedded_worker(
+        &self,
+        compactor_epoch: u64,
+        options: CompactionWorkerOptions,
+    ) -> (
+        CompactionWorkerHandler,
+        async_channel::Receiver<crate::compaction_worker::WorkerMessage>,
+    ) {
+        CompactionWorkerHandler::build_worker_handler(
+            crate::compaction_worker::WorkerFence::CompactorEpoch(compactor_epoch),
+            self.manifest_store.clone(),
+            self.compactions_store.clone(),
+            self.table_store.clone(),
+            Arc::new(options),
+            self.compactor_runtime.clone(),
+            self.rand.clone(),
+            self.stats.clone(),
+            self.recorder.clone(),
+            self.system_clock.clone(),
+            self.fp_registry.clone(),
+            self.merge_operator.clone(),
+            #[cfg(feature = "compaction_filters")]
+            self.compaction_filter_supplier.clone(),
+        )
     }
 
     pub(crate) async fn join(&self) -> Result<(), Error> {
@@ -5554,6 +5567,20 @@ mod tests {
                 .expect("missing stored compaction")
                 .status(),
             CompactionStatus::Scheduled
+        );
+    }
+
+    #[tokio::test]
+    async fn test_embedded_worker_of_a_compactor_is_fenced_by_its_epoch() {
+        let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_embedded_worker_of_a_compactor_is_fenced");
+        let compactor = CompactorBuilder::new(path, os).build();
+
+        let (worker, _rx) = compactor.embedded_worker(7, CompactionWorkerOptions::default());
+
+        assert_eq!(
+            worker.fence(),
+            crate::compaction_worker::WorkerFence::CompactorEpoch(7)
         );
     }
 
