@@ -2065,6 +2065,150 @@ mod tests {
         assert_eq!(manifest_store.read_latest_manifest().await.unwrap(), before);
     }
 
+    /// Tells the test when the coordinator has finished a poll.
+    struct PollSignalScheduler {
+        polled: Arc<tokio::sync::Notify>,
+    }
+
+    impl CompactionScheduler for PollSignalScheduler {
+        fn propose(&self, _state: &CompactorStateView) -> Vec<CompactionSpec> {
+            self.polled.notify_one();
+            vec![]
+        }
+    }
+
+    impl CompactionSchedulerSupplier for PollSignalScheduler {
+        fn compaction_scheduler(
+            &self,
+            _options: &CompactorOptions,
+        ) -> Box<dyn CompactionScheduler + Send + Sync> {
+            Box::new(Self {
+                polled: self.polled.clone(),
+            })
+        }
+    }
+
+    /// The worker that `Compactor::start` embeds is fenced with its
+    /// coordinator. The coordinator here polls once and then waits an hour,
+    /// so only the worker can see the later epoch: the worker fails with
+    /// `Fenced` and takes the compactor down, while the coordinator task is
+    /// only cancelled.
+    #[tokio::test]
+    async fn test_embedded_worker_of_a_superseded_compactor_stops() {
+        let os = Arc::new(InMemory::new());
+        let (manifest_store, compactions_store, _) = build_test_stores(os.clone());
+        StoredManifest::create_new_db(
+            manifest_store.clone(),
+            ManifestCore::new(),
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+        let polled = Arc::new(tokio::sync::Notify::new());
+        let compactor = CompactorBuilder::new(PATH, os)
+            .with_options(CompactorOptions {
+                poll_interval: Duration::from_secs(3600),
+                worker: Some(CompactionWorkerOptions {
+                    compactions_poll_interval: Duration::from_millis(10),
+                    ..CompactionWorkerOptions::default()
+                }),
+                ..compactor_options()
+            })
+            .with_scheduler_supplier(Arc::new(PollSignalScheduler {
+                polled: polled.clone(),
+            }))
+            .build();
+        compactor.start().await.unwrap();
+        // The coordinator's only poll within the test has read the stores.
+        polled.notified().await;
+
+        // A coordinator that starts elsewhere takes the next epoch.
+        let superseding =
+            start_coordinator(manifest_store, compactions_store, compactor_options()).await;
+        assert_eq!(superseding.compactor_epoch(), 2);
+
+        let worker = tokio::time::timeout(
+            Duration::from_secs(30),
+            compactor
+                .task_executor
+                .join_task(crate::compaction_worker::COMPACTION_WORKER_TASK_NAME),
+        )
+        .await
+        .expect("the superseded worker kept running");
+        assert!(matches!(worker, Err(SlateDBError::Fenced)));
+        let coordinator = compactor.task_executor.join_task(COMPACTOR_TASK_NAME).await;
+        assert!(coordinator.is_ok(), "{coordinator:?}");
+        assert_eq!(
+            compactor.join().await.unwrap_err().kind(),
+            crate::ErrorKind::Closed(crate::CloseReason::Fenced)
+        );
+    }
+
+    /// Starts a coordinator on the stores, as a process that takes over
+    /// does. It takes the next compactor epoch.
+    async fn start_coordinator(
+        manifest_store: Arc<ManifestStore>,
+        compactions_store: Arc<CompactionsStore>,
+        options: CompactorOptions,
+    ) -> CompactorEventHandler {
+        CompactorEventHandler::new(
+            manifest_store,
+            compactions_store,
+            Arc::new(options),
+            Arc::new(MockScheduler::new()),
+            Arc::new(DbRand::default()),
+            Arc::new(CompactionStats::new(&MetricsRecorderHelper::noop())),
+            Arc::new(DefaultSystemClock::new()),
+            MetricsRecorderHelper::noop(),
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// A database closes with `Fenced` through its embedded worker when a
+    /// later coordinator takes over. The coordinator of the database polls
+    /// once and then waits an hour, so only the worker can see the later
+    /// epoch.
+    #[tokio::test]
+    async fn test_superseded_db_closes_through_its_embedded_worker() {
+        let os = Arc::new(InMemory::new());
+        let polled = Arc::new(tokio::sync::Notify::new());
+        let compactor = CompactorBuilder::new(PATH, os.clone())
+            .with_options(CompactorOptions {
+                poll_interval: Duration::from_secs(3600),
+                worker: Some(CompactionWorkerOptions {
+                    compactions_poll_interval: Duration::from_millis(10),
+                    ..CompactionWorkerOptions::default()
+                }),
+                ..compactor_options()
+            })
+            .with_scheduler_supplier(Arc::new(PollSignalScheduler {
+                polled: polled.clone(),
+            }));
+        let db = Db::builder(PATH, os.clone())
+            .with_settings(db_options(None))
+            .with_compactor_builder(compactor)
+            .build()
+            .await
+            .unwrap();
+        let mut status = db.subscribe();
+        // The coordinator's only poll within the test has read the stores.
+        polled.notified().await;
+
+        let (manifest_store, compactions_store, _) = build_test_stores(os);
+        start_coordinator(manifest_store, compactions_store, compactor_options()).await;
+
+        let closed = tokio::time::timeout(
+            Duration::from_secs(30),
+            status.wait_for(|status| status.close_reason.is_some()),
+        )
+        .await
+        .expect("the superseded database stayed open")
+        .expect("the status channel closed");
+        assert_eq!(closed.close_reason, Some(crate::CloseReason::Fenced));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_compactor_compacts_l0() {
         // given:

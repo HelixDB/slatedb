@@ -275,6 +275,12 @@ impl CompactionWorkerHandler {
         }
     }
 
+    /// How this worker is fenced.
+    #[cfg(test)]
+    pub(crate) fn fence(&self) -> WorkerFence {
+        self.fence
+    }
+
     /// Builds the worker's [`CompactionWorkerHandler`] and the receiver that
     /// the handler reads completion messages from. Shared between the
     /// standalone `run()` path and the embedded-worker path in `Compactor::run`.
