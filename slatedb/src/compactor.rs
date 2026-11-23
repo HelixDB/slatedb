@@ -1443,7 +1443,10 @@ impl CompactorEventHandler {
     /// promotes valid tiered specs to `Scheduled` — the coordinator's "ready
     /// for a worker to claim" state. Drain specs and trivial moves short-circuit
     /// the executor and are applied directly to the in-memory manifest (→
-    /// `Completed`). Invalid specs are marked `Failed`. State changes are
+    /// `Completed`). Invalid specs are marked `Failed`. A spec that shares a
+    /// source or its destination with a compaction in flight is marked
+    /// `Failed` too. So is one that shares them with a submission accepted
+    /// earlier in the same pass. State changes are
     /// persisted before any worker (including the local executor) can act on
     /// them: when a submission changed the manifest, the manifest and
     /// `.compactions` are written together, otherwise `.compactions` alone.
@@ -1466,7 +1469,36 @@ impl CompactorEventHandler {
 
         let mut manifest_changed = false;
 
+        // Every source and destination of a compaction that is past this
+        // gate. A submission that shares one with them would run beside that
+        // compaction. The commit of the one that finished second would see
+        // only that its sources still exist by id. For example, a rewrite
+        // `[SR k] -> SR k` that commits after a merge into `SR k` would
+        // replace the merged run with the rows of the old run. The scheduler
+        // never proposes such a spec. A submission from outside can, and so
+        // can a proposal made before a conflicting submission was read.
+        let mut in_use = self
+            .state()
+            .compactions_with_status(&[
+                CompactionStatus::Scheduled,
+                CompactionStatus::Running,
+                CompactionStatus::Compacted,
+            ])
+            .flat_map(|c| Self::uses(c.spec()))
+            .collect::<HashSet<_>>();
+
         for compaction in &submitted_compactions {
+            let uses = Self::uses(compaction.spec()).collect::<Vec<_>>();
+            if let Some(conflict) = uses.iter().find(|used| in_use.contains(used)) {
+                warn!(
+                    "rejected compaction: {:?} is in use by a compaction in flight [compaction={:?}]",
+                    conflict, compaction
+                );
+                self.state_mut().update_compaction(&compaction.id(), |c| {
+                    c.set_status(CompactionStatus::Failed)
+                });
+                continue;
+            }
             // Validate the candidate compaction; mark as failed if invalid.
             if let Err(e) = self.validate_compaction(compaction) {
                 error!(
@@ -1478,6 +1510,11 @@ impl CompactorEventHandler {
                 });
                 continue;
             }
+            // A valid submission keeps what it names in use for the rest of
+            // this pass, whatever happens to it below. One that waits for
+            // capacity stays ahead of a later submission that overlaps it.
+            // One that is applied here has changed the runs it names.
+            in_use.extend(uses);
 
             // Coordinator-local compactions never enter Scheduled because no
             // worker runs them. Everything else becomes ready to claim.
@@ -1537,6 +1574,15 @@ impl CompactorEventHandler {
         }
 
         Ok(())
+    }
+
+    /// What a compaction reads or replaces while it is in flight: its
+    /// sources, and the sorted run it writes.
+    fn uses(spec: &CompactionSpec) -> impl Iterator<Item = SourceId> + '_ {
+        spec.sources()
+            .iter()
+            .copied()
+            .chain(spec.destination().map(SourceId::SortedRun))
     }
 
     /// Records a failed compaction attempt.
@@ -5356,6 +5402,7 @@ mod tests {
     }
 
     struct CompactorEventHandlerTestFixture {
+        object_store: Arc<dyn ObjectStore>,
         manifest: StoredManifest,
         manifest_store: Arc<ManifestStore>,
         compactions_store: Arc<CompactionsStore>,
@@ -5425,6 +5472,7 @@ mod tests {
                     .await
                     .unwrap();
             Self {
+                object_store: os,
                 manifest,
                 manifest_store,
                 compactions_store,
@@ -5497,6 +5545,7 @@ mod tests {
                 .await
                 .unwrap();
             Self {
+                object_store: os,
                 manifest,
                 manifest_store,
                 compactions_store,
@@ -6214,6 +6263,531 @@ mod tests {
                 .status(),
             CompactionStatus::Failed
         );
+    }
+
+    /// Seeds sorted runs `ids` (newest first) into the handler's manifest.
+    fn seed_sorted_runs(fixture: &mut CompactorEventHandlerTestFixture, ids: &[u32]) {
+        let core = &mut fixture
+            .handler
+            .state_writer
+            .state
+            .manifest_mut_for_test()
+            .value
+            .core;
+        Arc::make_mut(&mut core.tree).compacted =
+            ids.iter().map(|id| SortedRun::new(*id, [])).collect();
+    }
+
+    fn sorted_run_spec(sources: &[u32], destination: u32) -> CompactionSpec {
+        CompactionSpec::new(
+            sources.iter().copied().map(SourceId::SortedRun).collect(),
+            destination,
+        )
+    }
+
+    async fn stored_status(
+        fixture: &CompactorEventHandlerTestFixture,
+        id: Ulid,
+    ) -> Option<CompactionStatus> {
+        fixture
+            .compactions_store
+            .read_latest_compactions()
+            .await
+            .unwrap()
+            .compactions
+            .get(&id)
+            .map(|compaction| compaction.status())
+    }
+
+    /// A fixture whose coordinator has room for several compactions, so that
+    /// only an overlap can hold a submission back.
+    async fn fixture_with_capacity(options: CompactorOptions) -> CompactorEventHandlerTestFixture {
+        CompactorEventHandlerTestFixture::new_with_clock(
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(CompactorOptions {
+                max_concurrent_compactions: 8,
+                ..options
+            }),
+        )
+        .await
+    }
+
+    /// A run rewritten as `[SR k] -> SR k` beside a merge into `SR k` would,
+    /// committed second, replace the merged run with the old one's rows: its
+    /// only source still exists by id. Such a submission is refused, in each
+    /// state the merge can be in once it is past validation, while one that
+    /// shares nothing with the merge is accepted. `SR 3` is the run the merge
+    /// writes, and `SR 4` is a run it only reads.
+    #[rstest]
+    #[tokio::test]
+    async fn test_maybe_validate_submitted_compactions_fails_one_that_shares_a_run_with_a_compaction_in_flight(
+        #[values(
+            CompactionStatus::Scheduled,
+            CompactionStatus::Running,
+            CompactionStatus::Compacted
+        )]
+        in_flight: CompactionStatus,
+        #[values(3, 4)] rewritten: u32,
+    ) {
+        let mut fixture = fixture_with_capacity(compactor_options()).await;
+        seed_sorted_runs(&mut fixture, &[7, 6, 5, 4, 3]);
+        let merge = Ulid::from_parts(1, 0);
+        let rewrite = Ulid::from_parts(2, 0);
+        let elsewhere = Ulid::from_parts(3, 0);
+        let state = fixture.handler.state_mut();
+        state.insert_compaction_for_test(
+            Compaction::new(merge, sorted_run_spec(&[5, 4, 3], 3)).with_status(in_flight),
+        );
+        state.insert_compaction_for_test(Compaction::new(
+            rewrite,
+            sorted_run_spec(&[rewritten], rewritten),
+        ));
+        state.insert_compaction_for_test(Compaction::new(elsewhere, sorted_run_spec(&[7], 7)));
+
+        fixture
+            .handler
+            .maybe_validate_submitted_compactions()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stored_status(&fixture, rewrite).await,
+            Some(CompactionStatus::Failed)
+        );
+        assert_eq!(
+            stored_status(&fixture, elsewhere).await,
+            Some(CompactionStatus::Scheduled)
+        );
+        assert_eq!(stored_status(&fixture, merge).await, Some(in_flight));
+    }
+
+    /// Two submissions validated in one pass are checked against each other:
+    /// the first is accepted and keeps its runs in use, the second is refused.
+    #[tokio::test]
+    async fn test_maybe_validate_submitted_compactions_fails_the_second_of_two_that_overlap() {
+        let mut fixture = fixture_with_capacity(compactor_options()).await;
+        seed_sorted_runs(&mut fixture, &[7, 6, 5]);
+        let first = Ulid::from_parts(1, 0);
+        let second = Ulid::from_parts(2, 0);
+        let state = fixture.handler.state_mut();
+        state.insert_compaction_for_test(Compaction::new(first, sorted_run_spec(&[7, 6], 6)));
+        state.insert_compaction_for_test(Compaction::new(second, sorted_run_spec(&[6], 6)));
+
+        fixture
+            .handler
+            .maybe_validate_submitted_compactions()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stored_status(&fixture, first).await,
+            Some(CompactionStatus::Scheduled)
+        );
+        assert_eq!(
+            stored_status(&fixture, second).await,
+            Some(CompactionStatus::Failed)
+        );
+    }
+
+    /// A compaction in flight uses the run it writes as well as the runs it
+    /// reads: a submission that would write the same new run is refused. A
+    /// `Compacted` L0 compaction is the one in flight because the rule
+    /// against parallel L0 compactions does not look at it, so only the
+    /// overlap refuses this.
+    #[tokio::test]
+    async fn test_maybe_validate_submitted_compactions_fails_one_that_writes_the_run_of_a_compaction_in_flight(
+    ) {
+        let mut fixture = fixture_with_capacity(compactor_options()).await;
+        fixture.write_l0().await;
+        fixture.handler.state_writer.refresh().await.unwrap();
+        let l0 = fixture.build_l0_compaction().await;
+        let in_flight = Ulid::from_parts(1, 0);
+        let same_run = Ulid::from_parts(2, 0);
+        let state = fixture.handler.state_mut();
+        state.insert_compaction_for_test(
+            Compaction::new(
+                in_flight,
+                CompactionSpec::new(vec![SourceId::SstView(Ulid::from_parts(9, 9))], 0),
+            )
+            .with_status(CompactionStatus::Compacted),
+        );
+        state.insert_compaction_for_test(Compaction::new(same_run, l0));
+
+        fixture
+            .handler
+            .maybe_validate_submitted_compactions()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stored_status(&fixture, same_run).await,
+            Some(CompactionStatus::Failed)
+        );
+    }
+
+    /// A valid submission that waits for capacity stays `Submitted`, and it
+    /// keeps its runs in use in every pass: a later submission that overlaps
+    /// it is refused, and the first is promoted when a slot is free.
+    #[tokio::test]
+    async fn test_maybe_validate_submitted_compactions_keeps_the_runs_of_one_that_waits_for_capacity(
+    ) {
+        // The fixture defaults to a capacity of 1.
+        let mut fixture = CompactorEventHandlerTestFixture::new().await;
+        seed_sorted_runs(&mut fixture, &[7, 6, 3]);
+        let running = Ulid::from_parts(1, 0);
+        let waiting = Ulid::from_parts(2, 0);
+        let overlapping = Ulid::from_parts(3, 0);
+        let state = fixture.handler.state_mut();
+        state.insert_compaction_for_test(
+            Compaction::new(running, sorted_run_spec(&[3], 3))
+                .with_status(CompactionStatus::Running),
+        );
+        state.insert_compaction_for_test(Compaction::new(waiting, sorted_run_spec(&[7, 6], 6)));
+        state.insert_compaction_for_test(Compaction::new(overlapping, sorted_run_spec(&[6], 6)));
+
+        fixture
+            .handler
+            .maybe_validate_submitted_compactions()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stored_status(&fixture, waiting).await,
+            Some(CompactionStatus::Submitted)
+        );
+        assert_eq!(
+            stored_status(&fixture, overlapping).await,
+            Some(CompactionStatus::Failed)
+        );
+
+        // The running compaction leaves the limit.
+        fixture
+            .handler
+            .state_mut()
+            .update_compaction(&running, |c| c.set_status(CompactionStatus::Failed));
+        fixture
+            .handler
+            .maybe_validate_submitted_compactions()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stored_status(&fixture, waiting).await,
+            Some(CompactionStatus::Scheduled)
+        );
+    }
+
+    /// Seeds two sorted runs with disjoint key ranges, so that `[SR 4, SR 3]
+    /// -> SR 3` is a trivial move.
+    fn seed_trivially_movable_runs(fixture: &mut CompactorEventHandlerTestFixture) {
+        let core = &mut fixture
+            .handler
+            .state_writer
+            .state
+            .manifest_mut_for_test()
+            .value
+            .core;
+        Arc::make_mut(&mut core.tree).compacted = vec![
+            SortedRun::new(4, [bounded_sst_view(1, b"a", b"b")]),
+            SortedRun::new(3, [bounded_sst_view(2, b"m", b"n")]),
+        ];
+    }
+
+    fn sorted_run_ids(fixture: &CompactorEventHandlerTestFixture) -> Vec<u32> {
+        let tree = &fixture.handler.state().db_state().tree;
+        tree.compacted.iter().map(|run| run.id).collect()
+    }
+
+    /// A compaction the coordinator applies by itself is refused like any
+    /// other when it overlaps a compaction in flight: a rewrite of `SR 3`
+    /// that commits after the move would replace the moved run with the old
+    /// one's rows. A rewrite that has finished uses nothing, and the same
+    /// submission is applied.
+    #[rstest]
+    #[case::after_a_rewrite(CompactionStatus::Completed, CompactionStatus::Completed, vec![3])]
+    #[case::beside_a_rewrite(CompactionStatus::Running, CompactionStatus::Failed, vec![4, 3])]
+    #[tokio::test]
+    async fn test_maybe_validate_submitted_compactions_fails_a_trivial_move_that_overlaps_a_compaction_in_flight(
+        #[case] rewrite_status: CompactionStatus,
+        #[case] expected: CompactionStatus,
+        #[case] expected_runs: Vec<u32>,
+    ) {
+        let mut fixture = fixture_with_capacity(CompactorOptions {
+            enable_trivial_move: true,
+            ..compactor_options()
+        })
+        .await;
+        seed_trivially_movable_runs(&mut fixture);
+        let trivial_move = Ulid::from_parts(2, 0);
+        let state = fixture.handler.state_mut();
+        state.insert_compaction_for_test(
+            Compaction::new(Ulid::from_parts(1, 0), sorted_run_spec(&[3], 3))
+                .with_status(rewrite_status),
+        );
+        state
+            .insert_compaction_for_test(Compaction::new(trivial_move, sorted_run_spec(&[4, 3], 3)));
+
+        fixture
+            .handler
+            .maybe_validate_submitted_compactions()
+            .await
+            .unwrap();
+
+        assert_eq!(stored_status(&fixture, trivial_move).await, Some(expected));
+        assert_eq!(sorted_run_ids(&fixture), expected_runs);
+    }
+
+    /// A compaction the coordinator applies changes the runs it names at
+    /// once. A later submission in the same pass that names one of them was
+    /// written against the old runs, and it is refused.
+    #[tokio::test]
+    async fn test_maybe_validate_submitted_compactions_fails_one_that_overlaps_a_trivial_move_applied_before_it(
+    ) {
+        let mut fixture = fixture_with_capacity(CompactorOptions {
+            enable_trivial_move: true,
+            ..compactor_options()
+        })
+        .await;
+        seed_trivially_movable_runs(&mut fixture);
+        let trivial_move = Ulid::from_parts(1, 0);
+        let rewrite = Ulid::from_parts(2, 0);
+        let state = fixture.handler.state_mut();
+        state
+            .insert_compaction_for_test(Compaction::new(trivial_move, sorted_run_spec(&[4, 3], 3)));
+        state.insert_compaction_for_test(Compaction::new(rewrite, sorted_run_spec(&[3], 3)));
+
+        fixture
+            .handler
+            .maybe_validate_submitted_compactions()
+            .await
+            .unwrap();
+
+        // The move was applied: one run holds the tables of both.
+        assert_eq!(sorted_run_ids(&fixture), vec![3]);
+        let tree = &fixture.handler.state().db_state().tree;
+        assert_eq!(tree.compacted[0].sst_views().len(), 2);
+        assert_eq!(
+            stored_status(&fixture, rewrite).await,
+            Some(CompactionStatus::Failed)
+        );
+    }
+
+    /// A drain is applied by the coordinator too, and it is refused when a
+    /// compaction in flight reads a run it would remove. A compaction that
+    /// has finished uses nothing, and the same drain is applied.
+    #[rstest]
+    #[case::after_a_rewrite(CompactionStatus::Failed, CompactionStatus::Completed, 0)]
+    #[case::beside_a_rewrite(CompactionStatus::Scheduled, CompactionStatus::Failed, 1)]
+    #[tokio::test]
+    async fn test_maybe_validate_submitted_compactions_fails_a_drain_that_overlaps_a_compaction_in_flight(
+        #[case] rewrite_status: CompactionStatus,
+        #[case] expected: CompactionStatus,
+        #[case] expected_runs: usize,
+    ) {
+        let mut fixture = fixture_with_capacity(compactor_options()).await;
+        let prefix = Bytes::from_static(b"seg/");
+        fixture
+            .handler
+            .state_writer
+            .state
+            .manifest_mut_for_test()
+            .value
+            .core
+            .segments = vec![Segment {
+            prefix: prefix.clone(),
+            tree: Arc::new(LsmTreeState {
+                last_compacted_l0_sst_view_id: None,
+                last_compacted_l0_sst_id: None,
+                l0: VecDeque::new(),
+                compacted: vec![SortedRun::new(9, [bounded_sst_view(1, b"seg/a", b"seg/b")])],
+            }),
+        }];
+        let drain = Ulid::from_parts(2, 0);
+        let state = fixture.handler.state_mut();
+        state.insert_compaction_for_test(
+            Compaction::new(
+                Ulid::from_parts(1, 0),
+                CompactionSpec::for_segment(prefix.clone(), vec![SourceId::SortedRun(9)], 9),
+            )
+            .with_status(rewrite_status),
+        );
+        state.insert_compaction_for_test(Compaction::new(
+            drain,
+            CompactionSpec::drain_segment(prefix.clone(), vec![SourceId::SortedRun(9)]),
+        ));
+
+        fixture
+            .handler
+            .maybe_validate_submitted_compactions()
+            .await
+            .unwrap();
+
+        assert_eq!(stored_status(&fixture, drain).await, Some(expected));
+        let segment = fixture.handler.state().db_state().tree_for_segment(&prefix);
+        assert_eq!(
+            segment.map_or(0, |tree| tree.compacted.len()),
+            expected_runs
+        );
+    }
+
+    /// A coordinator that restarts moves a `Scheduled` job back to
+    /// `Submitted` with the output a worker stored for it. The job takes its
+    /// runs again when it passes the gate, so a compaction submitted from
+    /// outside that overlaps it is refused, and the job keeps its output.
+    #[tokio::test]
+    async fn test_restarted_coordinator_fails_a_submission_that_overlaps_a_job_it_resumes() {
+        use crate::compactor_state::CompactionContext;
+        use crate::subcompaction::Subcompaction;
+
+        let mut fixture = fixture_with_capacity(compactor_options()).await;
+        seed_sorted_runs(&mut fixture, &[7, 6, 5]);
+        fixture
+            .handler
+            .state_writer
+            .write_manifest_safely()
+            .await
+            .unwrap();
+        let resumed = Ulid::from_parts(1, 0);
+        let ctx = CompactionContext::new(
+            vec![Subcompaction::new(BytesRange::unbounded())
+                .with_output_ssts(vec![fake_output_sst()])],
+            Some(0),
+        );
+        fixture.handler.state_mut().insert_compaction_for_test(
+            Compaction::new(resumed, sorted_run_spec(&[7, 6], 6))
+                .with_status(CompactionStatus::Scheduled)
+                .with_ctx(Some(ctx.clone())),
+        );
+        fixture
+            .handler
+            .state_writer
+            .write_compactions_safely()
+            .await
+            .unwrap();
+        // Submitted the way `Admin::submit_compaction` does.
+        let rewrite = Compactor::submit(
+            sorted_run_spec(&[6], 6),
+            fixture.compactions_store.clone(),
+            Arc::new(DbRand::default()),
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+
+        let mut restarted = start_coordinator(
+            fixture.manifest_store.clone(),
+            fixture.compactions_store.clone(),
+            CompactorOptions {
+                max_concurrent_compactions: 8,
+                ..compactor_options()
+            },
+        )
+        .await;
+        let submitted = [resumed, rewrite].map(|id| {
+            let compactions = &restarted.state().compactions().value;
+            compactions.get(&id).map(|compaction| compaction.status())
+        });
+        assert_eq!(submitted, [Some(CompactionStatus::Submitted); 2]);
+
+        restarted.handle_ticker().await.unwrap();
+
+        let stored = fixture
+            .compactions_store
+            .read_latest_compactions()
+            .await
+            .unwrap()
+            .compactions;
+        let job = stored.get(&resumed).expect("the resumed job is missing");
+        assert_eq!(job.status(), CompactionStatus::Scheduled);
+        assert_eq!(job.ctx(), Some(&ctx));
+        assert_eq!(
+            stored.get(&rewrite).map(|compaction| compaction.status()),
+            Some(CompactionStatus::Failed)
+        );
+    }
+
+    /// The data loss that the refusal prevents, shown on rows. A merge into
+    /// `SR 0` is in flight when a rewrite of `SR 0` into itself is submitted.
+    /// Without the refusal both run and the merge commits first. The rewrite
+    /// then replaces the merged run with the rows of the old `SR 0`.
+    #[tokio::test]
+    async fn test_rows_survive_a_rewrite_submitted_beside_a_merge_into_the_same_run() {
+        let mut fixture = fixture_with_capacity(compactor_options()).await;
+        // One sorted run for each batch. The last batch replaces a row of
+        // the first.
+        let batches: [&[(&str, &str)]; 3] = [
+            &[("a", "a0"), ("shared", "old")],
+            &[("b", "b1")],
+            &[("c", "c2"), ("shared", "new")],
+        ];
+        for (id, rows) in batches.iter().enumerate() {
+            for (key, value) in rows.iter() {
+                fixture
+                    .db
+                    .put(key.as_bytes(), value.as_bytes())
+                    .await
+                    .unwrap();
+            }
+            let flush_type = FlushType::MemTable;
+            fixture
+                .db
+                .flush_with_options(FlushOptions { flush_type })
+                .await
+                .unwrap();
+            let l0 = fixture.latest_db_state().await.tree.l0.clone();
+            let l0 = l0.iter().map(|view| SourceId::SstView(view.id)).collect();
+            fixture
+                .scheduler
+                .inject_compaction(CompactionSpec::new(l0, id as u32));
+            fixture.handler.handle_ticker().await.unwrap();
+            fixture.simulate_worker_completes().await;
+            fixture.handler.handle_ticker().await.unwrap();
+        }
+        assert_eq!(sorted_run_ids(&fixture), vec![2, 1, 0]);
+        // Submits the way `Admin::submit_compaction` does.
+        let compactions_store = fixture.compactions_store.clone();
+        let submit = |spec| {
+            Compactor::submit(
+                spec,
+                compactions_store.clone(),
+                Arc::new(DbRand::default()),
+                Arc::new(DefaultSystemClock::new()),
+            )
+        };
+
+        let merge = submit(sorted_run_spec(&[2, 1, 0], 0)).await.unwrap();
+        fixture.handler.handle_ticker().await.unwrap();
+        assert_eq!(
+            stored_status(&fixture, merge).await,
+            Some(CompactionStatus::Scheduled)
+        );
+        // The id of the rewrite must sort after the id of the merge, and an
+        // id starts with the time in milliseconds.
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let rewrite = submit(sorted_run_spec(&[0], 0)).await.unwrap();
+        assert!(merge < rewrite);
+        fixture.handler.handle_ticker().await.unwrap();
+        // A worker runs each compaction that passed the gate. The coordinator
+        // then commits the results in id order, so the merge commits first.
+        fixture.simulate_worker_completes().await;
+        fixture.handler.handle_ticker().await.unwrap();
+
+        assert_eq!(
+            stored_status(&fixture, rewrite).await,
+            Some(CompactionStatus::Failed)
+        );
+        assert_eq!(sorted_run_ids(&fixture), vec![0]);
+        let reader = crate::DbReader::builder(PATH, fixture.object_store.clone())
+            .build()
+            .await
+            .unwrap();
+        for (key, value) in [("a", "a0"), ("b", "b1"), ("c", "c2"), ("shared", "new")] {
+            assert_eq!(
+                reader.get(key.as_bytes()).await.unwrap(),
+                Some(Bytes::from_static(value.as_bytes())),
+                "row {key}"
+            );
+        }
     }
 
     #[tokio::test]
