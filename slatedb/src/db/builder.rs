@@ -125,7 +125,8 @@ use crate::clone::{SegmentFilterFn, SegmentProjectionFn};
 #[cfg(feature = "compaction_filters")]
 use crate::compaction_filter::CompactionFilterSupplier;
 use crate::compaction_worker::{
-    CompactionWorker, CompactionWorkerHandler, WorkerMessage, COMPACTION_WORKER_TASK_NAME,
+    CompactionWorker, CompactionWorkerHandler, WorkerFence, WorkerMessage,
+    COMPACTION_WORKER_TASK_NAME,
 };
 use crate::compactions_store::CompactionsStore;
 use crate::compactor::stats::CompactionStats;
@@ -1645,8 +1646,11 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             self.expected_epoch,
         )
         .await?;
+        // The embedded worker is fenced with this coordinator.
+        let compactor_epoch = handler.compactor_epoch();
         let worker = options.worker.clone().map(|worker_options| {
             CompactionWorkerHandler::build_worker_handler(
+                WorkerFence::CompactorEpoch(compactor_epoch),
                 manifest_store,
                 compactions_store,
                 table_store,
@@ -1858,7 +1862,11 @@ impl<P: Into<Path>> CompactionWorkerBuilder<P> {
             closed_result,
             self.system_clock.clone(),
         ));
+        // `Unfenced` is safe here. A standalone worker is not part of a
+        // database or compactor process that a later process supersedes. It
+        // serves each coordinator that takes the epoch.
         let (handler, rx) = CompactionWorkerHandler::build_worker_handler(
+            WorkerFence::Unfenced,
             manifest_store,
             compactions_store,
             table_store,
@@ -2808,6 +2816,161 @@ mod tests {
                 .contains("max_wal_flushes_before_l0_flush must be at least 4096"),
             "unexpected error: {err}"
         );
+    }
+
+    /// `DbBuilder::build` registers the handlers `build_handler` returns, so
+    /// this is the worker a database embeds.
+    #[tokio::test]
+    async fn test_embedded_worker_of_a_db_compactor_is_fenced_by_its_epoch() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_embedded_worker_of_a_db_compactor_is_fenced");
+        let manifest_store = Arc::new(ManifestStore::new(&path, object_store.clone()));
+        StoredManifest::create_new_db(
+            manifest_store.clone(),
+            ManifestCore::new(),
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+        let table_store = Arc::new(crate::tablestore::TableStore::new(
+            object_store.clone(),
+            crate::format::sst::SsTableFormat::default(),
+            path.clone(),
+            None,
+            crate::tablestore::TableStoreKind::Compactor,
+            crate::block_cache_policy::BlockCachePolicy::default(),
+        ));
+        let build = |builder: crate::CompactorBuilder<Path>| {
+            builder.build_handler(
+                table_store.clone(),
+                manifest_store.clone(),
+                Arc::new(CompactionsStore::new(&path, object_store.clone())),
+            )
+        };
+        let builder = || crate::CompactorBuilder::new(path.clone(), object_store.clone());
+
+        // Each coordinator takes the next epoch, and its worker is fenced
+        // by exactly that one. A coordinator that names the epoch it saw
+        // takes the one after it.
+        for (builder, epoch) in [
+            (builder(), 1),
+            (builder(), 2),
+            (builder().with_expected_epoch(2), 3),
+        ] {
+            let handlers = build(builder).await.unwrap();
+            assert_eq!(handlers.handler.compactor_epoch(), epoch);
+            let (worker, _rx) = handlers.worker.expect("the default options embed a worker");
+            assert_eq!(
+                worker.fence(),
+                crate::compaction_worker::WorkerFence::CompactorEpoch(epoch)
+            );
+        }
+
+        // A coordinator without a worker embeds none.
+        let handlers = build(builder().with_options(CompactorOptions {
+            worker: None,
+            ..CompactorOptions::default()
+        }))
+        .await
+        .unwrap();
+        assert!(handlers.worker.is_none());
+    }
+
+    /// A standalone worker answers to no coordinator. The worker that
+    /// `CompactionWorkerBuilder` builds claims and completes a compaction
+    /// scheduled under an epoch taken after the worker started.
+    #[tokio::test]
+    async fn test_standalone_worker_claims_and_completes_under_a_later_epoch() {
+        use crate::compactions_store::FenceableCompactions;
+        use crate::compactor_state::{Compaction, CompactionSpec, CompactionStatus, SourceId};
+        use std::time::Duration;
+
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_standalone_worker_under_a_later_epoch");
+        let clock = Arc::new(DefaultSystemClock::new());
+        let db = crate::Db::builder(path.clone(), object_store.clone())
+            .with_settings(Settings {
+                compactor_options: None,
+                ..Settings::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        db.put(b"key", b"value").await.unwrap();
+        db.flush_with_options(crate::config::FlushOptions {
+            flush_type: crate::config::FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+        db.close().await.unwrap();
+        let manifest_store = Arc::new(ManifestStore::new(&path, object_store.clone()));
+        let sources = StoredManifest::load(manifest_store, clock.clone())
+            .await
+            .unwrap()
+            .db_state()
+            .tree
+            .l0
+            .iter()
+            .map(|view| SourceId::SstView(view.id))
+            .collect::<Vec<_>>();
+        assert!(!sources.is_empty());
+        let compactions_store = Arc::new(CompactionsStore::new(&path, object_store.clone()));
+        if StoredCompactions::try_load(compactions_store.clone())
+            .await
+            .unwrap()
+            .is_none()
+        {
+            StoredCompactions::create(compactions_store.clone(), 0)
+                .await
+                .unwrap();
+        }
+        // A coordinator that starts takes the next compactor epoch.
+        let start_coordinator = || {
+            let (compactions_store, clock) = (compactions_store.clone(), clock.clone());
+            async move {
+                let stored = StoredCompactions::load(compactions_store).await.unwrap();
+                FenceableCompactions::init(stored, Duration::from_secs(300), clock)
+                    .await
+                    .unwrap();
+            }
+        };
+        start_coordinator().await;
+
+        let worker = CompactionWorkerBuilder::new(path.clone(), object_store.clone())
+            .with_options(CompactionWorkerOptions {
+                compactions_poll_interval: Duration::from_millis(10),
+                ..CompactionWorkerOptions::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        worker.start().unwrap();
+        start_coordinator().await;
+        let mut stored = StoredCompactions::load(compactions_store.clone())
+            .await
+            .unwrap();
+        let before = stored.prepare_dirty().unwrap();
+        assert!(before.value.compactor_epoch >= 2);
+        let id = ulid::Ulid::from_parts(1, 0);
+        let mut dirty = before;
+        dirty.value.insert(
+            Compaction::new(id, CompactionSpec::new(sources, 0))
+                .with_status(CompactionStatus::Scheduled),
+        );
+        stored.update(dirty).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let status = stored.refresh().await.unwrap().get(&id).unwrap().status();
+                if status == CompactionStatus::Compacted {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the standalone worker did not complete the compaction");
+        worker.stop().await.unwrap();
     }
 
     #[tokio::test]
