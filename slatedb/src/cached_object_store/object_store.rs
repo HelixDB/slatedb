@@ -32,6 +32,15 @@ use slatedb_common::metrics::{
     MetricLevel, MetricsRecorder, MetricsRecorderHelper, NoopMetricsRecorder,
 };
 
+/// Most parts of one ranged read fetched or read from disk at once.
+///
+/// A range spanning many uncached parts, such as a large block on a cold
+/// cache, issues one ranged GET per part; read one after another they take
+/// one request's latency each, about 50 MB/s with 4 MiB parts on S3. Reading
+/// this many at once multiplies that while holding at most this many parts
+/// beyond what the caller has consumed: 64 MiB with 4 MiB parts.
+const MAX_CONCURRENT_PART_READS: usize = 16;
+
 /// An [`ObjectStore`] wrapper that caches object parts on local disk.
 ///
 /// The cache splits each object into fixed-size parts and stores them under a
@@ -333,7 +342,12 @@ impl CachedObjectStore {
                 }
             })
             .collect::<Vec<_>>();
-        let result_stream = stream::iter(futures).then(|fut| fut).boxed();
+        // Up to MAX_CONCURRENT_PART_READS parts are read at once and yielded in
+        // order: one at a time, a large uncached range was fetched one ranged
+        // GET after another, at one request's latency per part.
+        let result_stream = stream::iter(futures)
+            .buffered(MAX_CONCURRENT_PART_READS)
+            .boxed();
 
         Ok(GetResult {
             meta,
@@ -1237,6 +1251,81 @@ mod tests {
             stats,
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_uncached_parts_of_one_range_are_fetched_concurrently_in_order() {
+        let part_size = 1024;
+        let parts = super::MAX_CONCURRENT_PART_READS * 2 + 1;
+        let payload = gen_rand_bytes(part_size * (parts + 1));
+        let location = Path::from("/data/parallel");
+        let mem = Arc::new(object_store::memory::InMemory::new());
+        mem.put(&location, PutPayload::from_bytes(payload.clone()))
+            .await
+            .unwrap();
+        let gated = Arc::new(GatedObjectStore::new(mem));
+        let cached_store = new_cached_store_with_part_size(gated.clone(), part_size);
+        // Caches the head and the first part, so the rest are read part by part.
+        let first = cached_store
+            .cached_get_opts(
+                &location,
+                GetOptions {
+                    range: Some(GetRange::Bounded(0..part_size as u64)),
+                    ..Default::default()
+                },
+                false,
+            )
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(first, payload.slice(0..part_size));
+
+        let before = gated.get_opts_gate.arrivals();
+        gated.get_opts_gate.close();
+        let range = part_size as u64..(part_size * (parts + 1)) as u64;
+        let read = tokio::spawn({
+            let cached_store = cached_store.clone();
+            let location = location.clone();
+            let range = range.clone();
+            async move {
+                cached_store
+                    .cached_get_opts(
+                        &location,
+                        GetOptions {
+                            range: Some(GetRange::Bounded(range)),
+                            ..Default::default()
+                        },
+                        false,
+                    )
+                    .await?
+                    .bytes()
+                    .await
+            }
+        });
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            gated
+                .get_opts_gate
+                .wait_for_arrivals(before + super::MAX_CONCURRENT_PART_READS),
+        )
+        .await
+        .expect("uncached parts are fetched concurrently");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            gated.get_opts_gate.arrivals(),
+            before + super::MAX_CONCURRENT_PART_READS,
+            "no more parts than the bound are in flight"
+        );
+        gated.get_opts_gate.release();
+        let bytes = read.await.unwrap().unwrap();
+        assert_eq!(
+            bytes,
+            payload.slice(range.start as usize..range.end as usize),
+            "parts are yielded in order"
+        );
+        assert_eq!(gated.get_opts_gate.arrivals(), before + parts);
     }
 
     #[tokio::test]
