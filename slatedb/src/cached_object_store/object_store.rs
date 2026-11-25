@@ -1328,6 +1328,106 @@ mod tests {
         assert_eq!(gated.get_opts_gate.arrivals(), before + parts);
     }
 
+    /// A range read dropped while its concurrent part reads write their parts
+    /// to disk still has every one of those parts counted by the evictor.
+    #[tokio::test]
+    async fn a_range_read_dropped_mid_stream_counts_every_part_it_cached() {
+        use crate::cached_object_store::storage_fs::tests::{
+            files_on_disk, wait_for_usage, ReleaseOnDrop, WriteHook,
+        };
+        let part_size = 1024;
+        let parts = super::MAX_CONCURRENT_PART_READS * 2;
+        let payload = gen_rand_bytes(part_size * parts);
+        let location = Path::from("/data/dropped");
+        let mem = Arc::new(object_store::memory::InMemory::new());
+        mem.put(&location, PutPayload::from_bytes(payload.clone()))
+            .await
+            .unwrap();
+        let root = tempfile::Builder::new()
+            .prefix("objstore_cache_dropped_read_")
+            .tempdir()
+            .unwrap();
+        let recorder = MetricsRecorderHelper::noop();
+        let stats = Arc::new(CachedObjectStoreStats::new(&recorder));
+        let hook = Arc::new(WriteHook::default());
+        let _release = ReleaseOnDrop(Arc::clone(&hook));
+        let storage = Arc::new(
+            FsCacheStorage::new(
+                root.path().to_path_buf(),
+                None,
+                None,
+                stats.clone(),
+                Arc::new(DefaultSystemClock::new()),
+                Arc::new(DbRand::default()),
+                1000,
+            )
+            .with_write_hook(Arc::clone(&hook)),
+        );
+        let cached_store = CachedObjectStore::new(
+            mem,
+            storage.clone(),
+            part_size,
+            CachePutConfig::default(),
+            stats,
+        )
+        .unwrap();
+        cached_store.start_evictor().await;
+        wait_for_usage(&storage, 0).await;
+        // Caches the head and the first part, so the rest are read part by
+        // part, concurrently.
+        cached_store
+            .cached_get_opts(
+                &location,
+                GetOptions {
+                    range: Some(GetRange::Bounded(0..part_size as u64)),
+                    ..Default::default()
+                },
+                false,
+            )
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        hook.wait(|_, finished| finished == 1).await;
+
+        hook.hold();
+        let read = tokio::spawn({
+            let cached_store = cached_store.clone();
+            let location = location.clone();
+            async move {
+                cached_store
+                    .cached_get_opts(
+                        &location,
+                        GetOptions {
+                            range: Some(GetRange::Bounded(
+                                part_size as u64..(part_size * parts) as u64,
+                            )),
+                            ..Default::default()
+                        },
+                        false,
+                    )
+                    .await?
+                    .bytes()
+                    .await
+            }
+        });
+        hook.wait(|waiting, _| waiting == super::MAX_CONCURRENT_PART_READS)
+            .await;
+        read.abort();
+        assert!(read.await.unwrap_err().is_cancelled());
+        hook.release();
+        hook.wait(|_, finished| finished == 1 + super::MAX_CONCURRENT_PART_READS)
+            .await;
+        let (on_disk, temporary) = files_on_disk(root.path());
+        assert!(!temporary);
+        assert!(
+            on_disk >= ((1 + super::MAX_CONCURRENT_PART_READS) * part_size) as u64,
+            "every part in flight landed on disk: {on_disk} bytes"
+        );
+        wait_for_usage(&storage, on_disk).await;
+    }
+
     #[tokio::test]
     async fn test_upstream_part_range_does_not_retain_full_part() {
         let part_size = 4 * 1024 * 1024;

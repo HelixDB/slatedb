@@ -154,6 +154,8 @@ pub struct FsCacheStorage {
     evictor: Arc<FsCacheEvictor>,
     rand: Arc<DbRand>,
     file_handle_cache: FileHandleCache,
+    #[cfg(test)]
+    write_hook: Option<Arc<tests::WriteHook>>,
 }
 
 impl FsCacheStorage {
@@ -182,7 +184,17 @@ impl FsCacheStorage {
             evictor,
             rand,
             file_handle_cache,
+            #[cfg(test)]
+            write_hook: None,
         }
+    }
+
+    /// Makes every part and head write of this storage's entries pass `hook`
+    /// between writing its temporary file and renaming it.
+    #[cfg(test)]
+    pub(crate) fn with_write_hook(mut self, hook: Arc<tests::WriteHook>) -> Self {
+        self.write_hook = Some(hook);
+        self
     }
 
     #[cfg(test)]
@@ -201,6 +213,8 @@ impl LocalCacheStorage for FsCacheStorage {
             part_size,
             rand: self.rand.clone(),
             file_handle_cache: self.file_handle_cache.clone(),
+            #[cfg(test)]
+            write_hook: self.write_hook.clone(),
         })
     }
 
@@ -227,19 +241,30 @@ pub(crate) struct FsCacheEntry {
     evictor: Option<Arc<FsCacheEvictor>>,
     rand: Arc<DbRand>,
     file_handle_cache: FileHandleCache,
+    #[cfg(test)]
+    write_hook: Option<Arc<tests::WriteHook>>,
 }
 
 impl FsCacheEntry {
+    /// Writes `buf` to `path` through a temporary file and an atomic rename,
+    /// then reports the write to the evictor.
+    ///
+    /// Everything after the reservation runs inside one blocking task, which
+    /// runs to completion even when the future awaiting it is dropped, as a
+    /// caller that stops reading a multi-part range drops the part reads it
+    /// has in flight. Reporting after the await would skip the report for a
+    /// file the task still writes, leaving bytes on disk that the evictor
+    /// never counts until its next full scan. A write that fails removes its
+    /// temporary file, so it leaves nothing on disk to count.
     async fn atomic_write(&self, path: std::path::PathBuf, buf: Bytes) -> object_store::Result<()> {
         let tmp_path = path.with_extension(format!("_tmp{}", self.make_rand_suffix()));
         let bytes = buf.len();
 
-        let Some(write_reservation) = (if let Some(evictor) = &self.evictor {
+        let Some(write_reservation) = (match &self.evictor {
             // If the evictor is backpressured, skip this cache write to avoid
             // stalling foreground PUTs. Cache writes are best-effort.
-            evictor.reserve_entry_access()
-        } else {
-            Some(WriteReservation::Untracked)
+            Some(evictor) => evictor.reserve_entry_access(),
+            None => Some(WriteReservation::Untracked),
         }) else {
             return Ok(());
         };
@@ -250,44 +275,63 @@ impl FsCacheEntry {
         // blocking task adds overhead, so its better to just batch all the calls into a single
         // blocking task.
         // see https://github.com/slatedb/slatedb/pull/1342
-        let invalidate_path = path.clone();
+        let file_handle_cache = self.file_handle_cache.clone();
+        #[cfg(test)]
+        let write_hook = self.write_hook.clone();
         #[allow(clippy::disallowed_methods)]
         tokio::task::spawn_blocking(move || {
-            let tmp_path = tmp_path.as_path();
-            // ensure the parent folder exists
-            if let Some(folder_path) = tmp_path.parent() {
-                std::fs::create_dir_all(folder_path).map_err(wrap_io_err)?;
+            let written = (|| {
+                // ensure the parent folder exists
+                if let Some(folder_path) = tmp_path.parent() {
+                    std::fs::create_dir_all(folder_path)?;
+                }
+
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&tmp_path)?;
+                file.write_all(&buf)?;
+                #[cfg(test)]
+                if let Some(hook) = &write_hook {
+                    hook.before_rename(&path)?;
+                }
+
+                // Note: There is no fsync before the rename. The cache holds copies
+                // of durable upstream bytes, so part durability is not required, only
+                // correctness. The tmp file plus atomic rename means a reader never
+                // observes a partially written part. If a crash leaves a renamed but
+                // not yet flushed part that reads back corrupt, block validation
+                // fails on read, the retried GET will override the cached entry.
+                std::fs::rename(&tmp_path, &path)
+            })();
+            let outcome = match written {
+                Ok(()) => {
+                    match write_reservation {
+                        WriteReservation::Reserved(permit) => {
+                            permit.send((path.clone(), EntryAccess::Write(bytes)));
+                        }
+                        WriteReservation::Untracked => {}
+                    }
+                    // The rename replaced the file at `path`, so any previously cached
+                    // handle now points to the old (unlinked) inode. Invalidate it so
+                    // the next read opens the new file.
+                    file_handle_cache.invalidate(&path);
+                    Ok(())
+                }
+                Err(error) => {
+                    // Dropping the reservation unsent releases its slot.
+                    let _ = std::fs::remove_file(&tmp_path);
+                    Err(wrap_io_err(error))
+                }
+            };
+            #[cfg(test)]
+            if let Some(hook) = &write_hook {
+                hook.finished(&path);
             }
-
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(tmp_path)
-                .map_err(wrap_io_err)?;
-            file.write_all(&buf).map_err(wrap_io_err)?;
-
-            // Note: There is no fsync before the rename. The cache holds copies
-            // of durable upstream bytes, so part durability is not required, only
-            // correctness. The tmp file plus atomic rename means a reader never
-            // observes a partially written part. If a crash leaves a renamed but
-            // not yet flushed part that reads back corrupt, block validation
-            // fails on read, the retried GET will override the cached entry.
-            std::fs::rename(tmp_path, path).map_err(wrap_io_err)
+            outcome
         })
         .await?
-        .map_err(wrap_io_err)?;
-
-        if let WriteReservation::Reserved(permit) = write_reservation {
-            permit.send((invalidate_path.clone(), EntryAccess::Write(bytes)));
-        }
-
-        // The rename replaced the file at `path`, so any previously cached
-        // handle now points to the old (unlinked) inode. Invalidate it so
-        // the next read opens the new file.
-        self.file_handle_cache.invalidate(&invalidate_path);
-
-        Ok(())
     }
 
     // every origin file will be split into multiple parts, and all the parts will be saved in the same
@@ -549,9 +593,10 @@ enum EntryAccess {
 
 type FsCacheEvictorWork = (std::path::PathBuf, EntryAccess);
 
-enum WriteReservation<'a> {
+enum WriteReservation {
     Untracked,
-    Reserved(tokio::sync::mpsc::Permit<'a, FsCacheEvictorWork>),
+    /// Owned, so the blocking task that writes the file can report it.
+    Reserved(tokio::sync::mpsc::OwnedPermit<FsCacheEvictorWork>),
 }
 // Minimum time between aggregated "evictor queue is full" warnings.
 const QUEUE_FULL_LOG_INTERVAL_MS: i64 = 30_000;
@@ -675,11 +720,11 @@ impl FsCacheEvictor {
         self.usage.snapshot()
     }
 
-    fn reserve_entry_access(&self) -> Option<WriteReservation<'_>> {
+    fn reserve_entry_access(&self) -> Option<WriteReservation> {
         if !self.started() {
             return Some(WriteReservation::Untracked);
         }
-        match self.tx.try_reserve() {
+        match self.tx.clone().try_reserve_owned() {
             Ok(permit) => Some(WriteReservation::Reserved(permit)),
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 self.mark_accounting_dirty();
@@ -1320,7 +1365,7 @@ async fn delete_cache_entry(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::cached_object_store::stats::{CACHE_BYTES, CACHE_KEYS, EVICTED_BYTES, EVICTED_KEYS};
     use crate::test_utils::gen_rand_bytes;
@@ -1328,6 +1373,221 @@ mod tests {
     use slatedb_common::clock::DefaultSystemClock;
     use slatedb_common::metrics::{lookup_metric, DefaultMetricsRecorder, MetricsRecorderHelper};
     use std::{io::Write, sync::atomic::Ordering, time::SystemTime};
+
+    /// Holds, or fails, part writes between writing their temporary file and
+    /// renaming it, and counts the part writes that reached and left that
+    /// point. Head writes pass.
+    #[derive(Debug, Default)]
+    pub(crate) struct WriteHook {
+        state: std::sync::Mutex<WriteHookState>,
+        changed: std::sync::Condvar,
+    }
+
+    #[derive(Debug, Default)]
+    struct WriteHookState {
+        held: bool,
+        /// Writes waiting at the hook.
+        waiting: usize,
+        /// Writes whose blocking task returned, however.
+        finished: usize,
+        /// Writes still to fail at the hook.
+        fail_next: usize,
+    }
+
+    impl WriteHook {
+        pub(crate) fn held() -> Arc<Self> {
+            let hook = Arc::new(Self::default());
+            hook.hold();
+            hook
+        }
+
+        pub(crate) fn hold(&self) {
+            self.state.lock().unwrap().held = true;
+        }
+
+        fn failing(writes: usize) -> Arc<Self> {
+            let hook = Self::default();
+            hook.state.lock().unwrap().fail_next = writes;
+            Arc::new(hook)
+        }
+
+        fn is_part(path: &std::path::Path) -> bool {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("_part"))
+        }
+
+        pub(crate) fn before_rename(&self, path: &std::path::Path) -> std::io::Result<()> {
+            if !Self::is_part(path) {
+                return Ok(());
+            }
+            let mut state = self.state.lock().unwrap();
+            state.waiting += 1;
+            self.changed.notify_all();
+            while state.held {
+                state = self.changed.wait(state).unwrap();
+            }
+            state.waiting -= 1;
+            if state.fail_next == 0 {
+                return Ok(());
+            }
+            state.fail_next -= 1;
+            Err(std::io::Error::other("injected cache write failure"))
+        }
+
+        pub(crate) fn finished(&self, path: &std::path::Path) {
+            if !Self::is_part(path) {
+                return;
+            }
+            self.state.lock().unwrap().finished += 1;
+            self.changed.notify_all();
+        }
+
+        pub(crate) fn release(&self) {
+            self.state.lock().unwrap().held = false;
+            self.changed.notify_all();
+        }
+
+        /// Waits, off the async workers, until `done` holds.
+        pub(crate) async fn wait(
+            self: &Arc<Self>,
+            done: fn(waiting: usize, finished: usize) -> bool,
+        ) {
+            let hook = Arc::clone(self);
+            #[allow(clippy::disallowed_methods)]
+            let waited = tokio::task::spawn_blocking(move || {
+                let mut state = hook.state.lock().unwrap();
+                while !done(state.waiting, state.finished) {
+                    let (next, timeout) = hook
+                        .changed
+                        .wait_timeout(state, Duration::from_secs(10))
+                        .unwrap();
+                    assert!(!timeout.timed_out(), "the cache writes reach the hook");
+                    state = next;
+                }
+            });
+            waited.await.unwrap();
+        }
+    }
+
+    /// Releases `0` when dropped, so a failing test never leaves its held
+    /// writes blocking the runtime's shutdown.
+    pub(crate) struct ReleaseOnDrop(pub(crate) Arc<WriteHook>);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    /// Bytes of every file under `root`, and whether any is a temporary one.
+    pub(crate) fn files_on_disk(root: &std::path::Path) -> (u64, bool) {
+        WalkDir::new(root)
+            .into_iter()
+            .map(Result::unwrap)
+            .filter(|entry| entry.file_type().is_file())
+            .fold((0, false), |(bytes, temporary), entry| {
+                (
+                    bytes + entry.metadata().unwrap().len(),
+                    temporary || entry.file_name().to_string_lossy().contains("_tmp"),
+                )
+            })
+    }
+
+    /// Waits until the evictor counts exactly `bytes`.
+    pub(crate) async fn wait_for_usage(storage: &FsCacheStorage, bytes: u64) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !matches!(
+                storage.usage_snapshot(),
+                CacheUsageSnapshot::Ready { used_bytes, .. } if used_bytes == bytes
+            ) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the evictor counts {bytes} bytes, not {:?}",
+                storage.usage_snapshot()
+            )
+        });
+    }
+
+    async fn started_storage(root: &std::path::Path, hook: Arc<WriteHook>) -> FsCacheStorage {
+        let recorder = MetricsRecorderHelper::noop();
+        let storage = FsCacheStorage::new(
+            root.to_path_buf(),
+            None,
+            None,
+            Arc::new(CachedObjectStoreStats::new(&recorder)),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+            10,
+        )
+        .with_write_hook(hook);
+        storage.start_evictor().await;
+        wait_for_usage(&storage, 0).await;
+        storage
+    }
+
+    /// A part write whose caller is dropped while its blocking task writes
+    /// the file still reports it, so the evictor counts every byte on disk.
+    #[tokio::test]
+    async fn a_write_whose_caller_is_dropped_is_still_counted() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("objstore_cache_dropped_write_")
+            .tempdir()
+            .unwrap();
+        let hook = WriteHook::held();
+        let _release = ReleaseOnDrop(Arc::clone(&hook));
+        let storage = Arc::new(started_storage(temp_dir.path(), Arc::clone(&hook)).await);
+        const PARTS: usize = 16;
+        let writes = (0..PARTS)
+            .map(|part| {
+                let entry = storage.entry(&Path::from("cached/object"), 1024);
+                tokio::spawn(async move {
+                    entry
+                        .save_part(part, Bytes::from(vec![7; 100 + part]))
+                        .await
+                })
+            })
+            .collect::<Vec<_>>();
+        hook.wait(|waiting, _| waiting == PARTS).await;
+        for write in &writes {
+            write.abort();
+        }
+        for write in writes {
+            assert!(write.await.unwrap_err().is_cancelled());
+        }
+        hook.release();
+        hook.wait(|_, finished| finished == PARTS).await;
+        let expected = (0..PARTS).map(|part| 100 + part as u64).sum::<u64>();
+        wait_for_usage(&storage, expected).await;
+        assert_eq!(files_on_disk(temp_dir.path()), (expected, false));
+    }
+
+    /// Writes that fail after creating their temporary file remove it and are
+    /// never counted, while the rest of the same read's writes are.
+    #[tokio::test]
+    async fn failed_writes_leave_nothing_on_disk_and_the_rest_are_counted() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("objstore_cache_failed_write_")
+            .tempdir()
+            .unwrap();
+        let storage = started_storage(temp_dir.path(), WriteHook::failing(3)).await;
+        let entry = storage.entry(&Path::from("cached/object"), 1024);
+        let mut failed = 0;
+        for part in 0..8 {
+            failed += usize::from(
+                entry
+                    .save_part(part, Bytes::from(vec![1; 50]))
+                    .await
+                    .is_err(),
+            );
+        }
+        assert_eq!(failed, 3);
+        wait_for_usage(&storage, 5 * 50).await;
+        assert_eq!(files_on_disk(temp_dir.path()), (5 * 50, false));
+    }
 
     fn gen_rand_file(
         folder_path: &std::path::Path,
