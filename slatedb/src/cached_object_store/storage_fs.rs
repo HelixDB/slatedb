@@ -598,6 +598,12 @@ enum WriteReservation {
     /// Owned, so the blocking task that writes the file can report it.
     Reserved(tokio::sync::mpsc::OwnedPermit<FsCacheEvictorWork>),
 }
+/// Slots of an evictor's queue: one per part or head write in flight (held
+/// from before the write until it reports), or per access event not yet
+/// processed. A write or event that finds every slot taken is skipped and
+/// makes the evictor rescan the whole cache.
+pub(crate) const EVICTOR_QUEUE_CAPACITY: usize = 100;
+
 // Minimum time between aggregated "evictor queue is full" warnings.
 const QUEUE_FULL_LOG_INTERVAL_MS: i64 = 30_000;
 
@@ -652,7 +658,7 @@ impl FsCacheEvictor {
         rand: Arc<DbRand>,
         file_handle_cache: FileHandleCache,
     ) -> Self {
-        let (tx, rx) = tokio::sync::mpsc::channel(100);
+        let (tx, rx) = tokio::sync::mpsc::channel(EVICTOR_QUEUE_CAPACITY);
         let usage = Arc::new(FsCacheUsage {
             initialized: AtomicBool::new(false),
             used_bytes: AtomicU64::new(0),

@@ -1267,6 +1267,9 @@ pub(crate) struct GatedObjectStore {
     /// the pre-0.13 single-call `delete` semantics now that callers go through
     /// `ObjectStoreExt::delete`, which fans out into `delete_stream`.
     pub(crate) delete_stream_gate: Arc<Gate>,
+    /// Start offsets of ranged GETs that wait, after `get_opts_gate`, until
+    /// [`Self::release_range`] removes them.
+    held_ranges: std::sync::Mutex<std::collections::HashSet<u64>>,
 }
 
 impl GatedObjectStore {
@@ -1281,7 +1284,18 @@ impl GatedObjectStore {
             rename_gate: Gate::default(),
             list_gate: Arc::new(Gate::default()),
             delete_stream_gate: Arc::new(Gate::default()),
+            held_ranges: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// Holds every later ranged GET starting at `start` until released.
+    pub(crate) fn hold_range(&self, start: u64) {
+        self.held_ranges.lock().unwrap().insert(start);
+    }
+
+    /// Lets ranged GETs starting at `start` through.
+    pub(crate) fn release_range(&self, start: u64) {
+        self.held_ranges.lock().unwrap().remove(&start);
     }
 }
 
@@ -1302,6 +1316,11 @@ impl ObjectStore for GatedObjectStore {
             self.head_gate.wait().await?;
         } else {
             self.get_opts_gate.wait().await?;
+        }
+        if let Some(GetRange::Bounded(range)) = &options.range {
+            while self.held_ranges.lock().unwrap().contains(&range.start) {
+                tokio::task::yield_now().await;
+            }
         }
         self.inner.get_opts(location, options).await
     }

@@ -41,6 +41,24 @@ use slatedb_common::metrics::{
 /// beyond what the caller has consumed: 64 MiB with 4 MiB parts.
 const MAX_CONCURRENT_PART_READS: usize = 16;
 
+/// Most part reads in flight in this process beyond each ranged read's
+/// first unfinished part (see [`PART_FAN_OUT`]).
+///
+/// A part read that misses holds one slot of its cache's evictor queue
+/// while it writes the part, and a write that finds the queue full is
+/// skipped and makes the evictor rescan the whole cache. Each read keeps at
+/// most one part in flight without a permit, as a read that reads its parts
+/// one after another does, so the fan-out adds at most half the queue,
+/// however many reads run at once.
+const MAX_FAN_OUT_PART_READS: usize =
+    crate::cached_object_store::storage_fs::EVICTOR_QUEUE_CAPACITY / 2;
+
+/// Permits for the part reads ranged reads run ahead of their first
+/// unfinished part, shared by every [`CachedObjectStore`] in the process,
+/// since several may share one cache and its evictor.
+static PART_FAN_OUT: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_FAN_OUT_PART_READS);
+
 /// An [`ObjectStore`] wrapper that caches object parts on local disk.
 ///
 /// The cache splits each object into fixed-size parts and stores them under a
@@ -80,6 +98,9 @@ pub struct CachedObjectStore {
     // Deduplicates concurrent fetches of the same part after a cache miss.
     // Keyed on (path, part_id) so multiple readers needing the same part share one fetch.
     part_flights: SingleFlight<(Path, PartID), Bytes>,
+    // Permits for part reads ahead of a ranged read's first unfinished part:
+    // [`PART_FAN_OUT`], or a test's own.
+    part_fan_out: &'static tokio::sync::Semaphore,
 }
 
 impl CachedObjectStore {
@@ -131,7 +152,18 @@ impl CachedObjectStore {
             head_flights: SingleFlight::new(),
             prefetch_flights: SingleFlight::new(),
             part_flights: SingleFlight::new(),
+            part_fan_out: &PART_FAN_OUT,
         }))
+    }
+
+    /// Gives this store, not yet shared, its own `permits` fan-out permits,
+    /// so a test counts its reads' parts without other tests' reads.
+    #[cfg(test)]
+    pub(crate) fn with_own_part_fan_out(mut this: Arc<Self>, permits: usize) -> Arc<Self> {
+        Arc::get_mut(&mut this)
+            .expect("the store is not yet shared")
+            .part_fan_out = Box::leak(Box::new(tokio::sync::Semaphore::new(permits)));
+        this
     }
 
     pub(crate) async fn start_evictor(&self) {
@@ -318,27 +350,62 @@ impl CachedObjectStore {
 
         // Read parts and concatenate them into a single stream. Some parts may not
         // be cached; read_part falls back to the object store for the missing ones.
+        //
+        // Each part's future signals `done` once it and every part before it
+        // finished. A part starts once the parts before it are done, as in a
+        // read that reads its parts one after another, or earlier holding a
+        // process-wide fan-out permit, which it releases as soon as its own
+        // read finishes. So each read has at most one part in flight without
+        // a permit, and permits are never held while waiting.
+        let fan_out = self.part_fan_out;
+        let mut previous: Option<tokio::sync::oneshot::Receiver<()>> = None;
         let futures = parts
             .into_iter()
             .map(|(part_id, range_in_part)| {
                 let this = self.clone();
                 let location = location.clone();
+                let (done, next) = tokio::sync::oneshot::channel::<()>();
+                let mut before = previous.replace(next);
                 async move {
-                    this.stats.object_store_cache_part_access.increment(1);
-                    let result = this
-                        .read_part(&location, part_id, range_in_part, force_refresh)
-                        .await;
-                    let Ok((bytes, part_source)) = result else {
-                        query_metrics::record_cache_access(QueryCacheKind::Object, false);
-                        return result.map(|(bytes, _)| bytes);
+                    // Signals the next part when this future ends, however.
+                    let _done = done;
+                    let permit = match before.as_mut() {
+                        None => None,
+                        Some(before_done) => tokio::select! {
+                            biased;
+                            _ = before_done => None,
+                            permit = fan_out.acquire() => {
+                                Some(permit.expect("the fan-out semaphore is never closed"))
+                            }
+                        },
                     };
-                    let hit = head_source == ReadResultSource::Disk
-                        && part_source == ReadResultSource::Disk;
-                    query_metrics::record_cache_access(QueryCacheKind::Object, hit);
-                    if hit {
-                        this.stats.object_store_cache_part_hits.increment(1);
+                    let ahead = permit.is_some();
+                    let result = async {
+                        this.stats.object_store_cache_part_access.increment(1);
+                        let result = this
+                            .read_part(&location, part_id, range_in_part, force_refresh)
+                            .await;
+                        let Ok((bytes, part_source)) = result else {
+                            query_metrics::record_cache_access(QueryCacheKind::Object, false);
+                            return result.map(|(bytes, _)| bytes);
+                        };
+                        let hit = head_source == ReadResultSource::Disk
+                            && part_source == ReadResultSource::Disk;
+                        query_metrics::record_cache_access(QueryCacheKind::Object, hit);
+                        if hit {
+                            this.stats.object_store_cache_part_hits.increment(1);
+                        }
+                        Ok::<Bytes, object_store::Error>(bytes)
                     }
-                    Ok::<Bytes, object_store::Error>(bytes)
+                    .await;
+                    drop(permit);
+                    // A part that ran ahead is done only once the parts
+                    // before it are; a dropped sender also means done.
+                    let (true, Some(before_done)) = (ahead, before) else {
+                        return result;
+                    };
+                    let _ = before_done.await;
+                    result
                 }
             })
             .collect::<Vec<_>>();
@@ -1264,7 +1331,10 @@ mod tests {
             .await
             .unwrap();
         let gated = Arc::new(GatedObjectStore::new(mem));
-        let cached_store = new_cached_store_with_part_size(gated.clone(), part_size);
+        let cached_store = CachedObjectStore::with_own_part_fan_out(
+            new_cached_store_with_part_size(gated.clone(), part_size),
+            super::MAX_FAN_OUT_PART_READS,
+        );
         // Caches the head and the first part, so the rest are read part by part.
         let first = cached_store
             .cached_get_opts(
@@ -1425,6 +1495,258 @@ mod tests {
             on_disk >= ((1 + super::MAX_CONCURRENT_PART_READS) * part_size) as u64,
             "every part in flight landed on disk: {on_disk} bytes"
         );
+        wait_for_usage(&storage, on_disk).await;
+    }
+
+    /// A part that ran ahead on a fan-out permit counts as done only once
+    /// every part before it is: while a read's first part is held, the
+    /// permit passes from part to part, and no later part runs without one.
+    #[tokio::test]
+    async fn a_read_runs_one_part_without_a_permit_however_others_finish() {
+        let part_size = 1024;
+        let parts = 6;
+        let payload = gen_rand_bytes(part_size * parts);
+        let location = Path::from("/data/chain");
+        let mem = Arc::new(object_store::memory::InMemory::new());
+        mem.put(&location, PutPayload::from_bytes(payload.clone()))
+            .await
+            .unwrap();
+        let gated = Arc::new(GatedObjectStore::new(mem));
+        let cached_store = CachedObjectStore::with_own_part_fan_out(
+            new_cached_store_with_part_size(gated.clone(), part_size),
+            1,
+        );
+        let range = |range: std::ops::Range<usize>| GetOptions {
+            range: Some(GetRange::Bounded(range.start as u64..range.end as u64)),
+            ..Default::default()
+        };
+        // Caches the head and the first part, so the rest are read part by part.
+        cached_store
+            .cached_get_opts(&location, range(0..part_size), false)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        for part in 1..parts {
+            gated.hold_range((part * part_size) as u64);
+        }
+        let before = gated.get_opts_gate.arrivals();
+        let read = tokio::spawn({
+            let cached_store = cached_store.clone();
+            let location = location.clone();
+            async move {
+                cached_store
+                    .cached_get_opts(&location, range(part_size..part_size * parts), false)
+                    .await?
+                    .bytes()
+                    .await
+            }
+        });
+        let settled = |expected: usize| {
+            let gated = gated.clone();
+            async move {
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    gated.get_opts_gate.wait_for_arrivals(before + expected),
+                )
+                .await
+                .expect("the parts are fetched");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                assert_eq!(gated.get_opts_gate.arrivals(), before + expected);
+            }
+        };
+        // The first part, and the second on the one permit.
+        settled(2).await;
+        // The second finishes; its permit passes to the third, while the
+        // first part still holds the read's only permit-free slot.
+        gated.release_range((2 * part_size) as u64);
+        settled(3).await;
+        for part in 1..parts {
+            gated.release_range((part * part_size) as u64);
+        }
+        assert_eq!(
+            read.await.unwrap().unwrap(),
+            payload.slice(part_size..part_size * parts)
+        );
+    }
+
+    /// With no fan-out permit free, a read still reads every part, one after
+    /// another: each starts once the part before it is done.
+    #[tokio::test]
+    async fn a_read_without_permits_reads_its_parts_one_after_another() {
+        let part_size = 1024;
+        let parts = 5;
+        let payload = gen_rand_bytes(part_size * parts);
+        let location = Path::from("/data/sequential");
+        let mem = Arc::new(object_store::memory::InMemory::new());
+        mem.put(&location, PutPayload::from_bytes(payload.clone()))
+            .await
+            .unwrap();
+        let gated = Arc::new(GatedObjectStore::new(mem));
+        let cached_store = CachedObjectStore::with_own_part_fan_out(
+            new_cached_store_with_part_size(gated.clone(), part_size),
+            0,
+        );
+        let range = |range: std::ops::Range<usize>| GetOptions {
+            range: Some(GetRange::Bounded(range.start as u64..range.end as u64)),
+            ..Default::default()
+        };
+        cached_store
+            .cached_get_opts(&location, range(0..part_size), false)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        for part in 1..parts {
+            gated.hold_range((part * part_size) as u64);
+        }
+        let before = gated.get_opts_gate.arrivals();
+        let read = tokio::spawn({
+            let cached_store = cached_store.clone();
+            let location = location.clone();
+            async move {
+                cached_store
+                    .cached_get_opts(&location, range(part_size..part_size * parts), false)
+                    .await?
+                    .bytes()
+                    .await
+            }
+        });
+        for part in 1..parts {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                gated.get_opts_gate.wait_for_arrivals(before + part),
+            )
+            .await
+            .expect("the next part starts once the one before it is done");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(
+                gated.get_opts_gate.arrivals(),
+                before + part,
+                "one at a time"
+            );
+            gated.release_range((part * part_size) as u64);
+        }
+        assert_eq!(
+            read.await.unwrap().unwrap(),
+            payload.slice(part_size..part_size * parts)
+        );
+    }
+
+    /// Concurrent ranged reads over uncached parts never hold more evictor
+    /// queue slots than one part each plus the process-wide fan-out, which
+    /// is half the queue: no part write is skipped for a full queue, and the
+    /// evictor counts every part on disk.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_ranged_reads_never_fill_the_evictor_queue() {
+        use crate::cached_object_store::storage_fs::tests::{
+            files_on_disk, wait_for_usage, ReleaseOnDrop, WriteHook,
+        };
+        use crate::cached_object_store::storage_fs::EVICTOR_QUEUE_CAPACITY;
+        const READS: usize = 8;
+        const IN_FLIGHT: usize = READS + super::MAX_FAN_OUT_PART_READS;
+        const PARTS: usize = super::MAX_CONCURRENT_PART_READS + 4;
+        // Unbounded, the reads would hold more writes than the queue has slots.
+        const _: () = assert!(READS * super::MAX_CONCURRENT_PART_READS > EVICTOR_QUEUE_CAPACITY);
+        const _: () = assert!(IN_FLIGHT < EVICTOR_QUEUE_CAPACITY);
+        let part_size = 1024;
+        let parts = PARTS;
+        let mem = Arc::new(object_store::memory::InMemory::new());
+        let locations = (0..READS)
+            .map(|read| Path::from(format!("/data/concurrent-{read}")))
+            .collect::<Vec<_>>();
+        for location in &locations {
+            mem.put(
+                location,
+                PutPayload::from_bytes(gen_rand_bytes(part_size * parts)),
+            )
+            .await
+            .unwrap();
+        }
+        let root = tempfile::Builder::new()
+            .prefix("objstore_cache_concurrent_reads_")
+            .tempdir()
+            .unwrap();
+        let recorder = MetricsRecorderHelper::noop();
+        let stats = Arc::new(CachedObjectStoreStats::new(&recorder));
+        let hook = Arc::new(WriteHook::default());
+        let _release = ReleaseOnDrop(Arc::clone(&hook));
+        let storage = Arc::new(
+            FsCacheStorage::new(
+                root.path().to_path_buf(),
+                None,
+                None,
+                stats.clone(),
+                Arc::new(DefaultSystemClock::new()),
+                Arc::new(DbRand::default()),
+                1000,
+            )
+            .with_write_hook(Arc::clone(&hook)),
+        );
+        let cached_store = CachedObjectStore::with_own_part_fan_out(
+            CachedObjectStore::new(
+                mem.clone(),
+                storage.clone(),
+                part_size,
+                CachePutConfig::default(),
+                stats,
+            )
+            .unwrap(),
+            super::MAX_FAN_OUT_PART_READS,
+        );
+        cached_store.start_evictor().await;
+        wait_for_usage(&storage, 0).await;
+        let range = |range: std::ops::Range<usize>| GetOptions {
+            range: Some(GetRange::Bounded(range.start as u64..range.end as u64)),
+            ..Default::default()
+        };
+        // Caches each head and first part, so the rest are read part by part.
+        for location in &locations {
+            cached_store
+                .cached_get_opts(location, range(0..part_size), false)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+        }
+        hook.wait(|_, finished| finished == READS).await;
+
+        hook.hold();
+        let reads = locations
+            .iter()
+            .map(|location| {
+                let cached_store = cached_store.clone();
+                let location = location.clone();
+                tokio::spawn(async move {
+                    cached_store
+                        .cached_get_opts(&location, range(part_size..part_size * parts), false)
+                        .await?
+                        .bytes()
+                        .await
+                })
+            })
+            .collect::<Vec<_>>();
+        hook.wait(|waiting, _| waiting >= IN_FLIGHT).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        hook.wait(|waiting, _| waiting == IN_FLIGHT).await;
+        hook.release();
+        for (read, location) in reads.into_iter().zip(&locations) {
+            let bytes = read.await.unwrap().unwrap();
+            let stored = mem.get(location).await.unwrap().bytes().await.unwrap();
+            assert_eq!(bytes, stored.slice(part_size..part_size * parts));
+        }
+        hook.wait(|_, finished| finished == READS * PARTS).await;
+        let (on_disk, temporary) = files_on_disk(root.path());
+        assert!(!temporary);
+        let part_files = walkdir::WalkDir::new(root.path())
+            .into_iter()
+            .map(Result::unwrap)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("_part"))
+            .count();
+        assert_eq!(part_files, READS * parts, "every part write landed");
         wait_for_usage(&storage, on_disk).await;
     }
 
