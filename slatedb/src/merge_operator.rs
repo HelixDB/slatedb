@@ -581,9 +581,22 @@ impl<T: RowEntryIterator> RowEntryIterator for MergeOperatorIterator<T> {
         Ok(None)
     }
 
+    /// Positions the iterator at the first key at or after `next_key`.
+    ///
+    /// Merging a key reads one entry past it, which `buffered_entry` keeps
+    /// while the delegate is already past it. When that entry's key is at or
+    /// after `next_key`, it is the first entry the seek must yield, and the
+    /// delegate already stands at the entries that follow it, so the seek
+    /// keeps it and leaves the delegate where it is: seeking the delegate
+    /// would skip that entry, and with it the key, or its newest versions.
     async fn seek(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {
-        self.buffered_entry = None;
-        self.delegate.seek(next_key).await
+        match self.buffered_entry.take() {
+            Some(entry) if entry.key.as_ref() >= next_key => {
+                self.buffered_entry = Some(entry);
+                Ok(())
+            }
+            Some(_) | None => self.delegate.seek(next_key).await,
+        }
     }
 }
 
@@ -942,6 +955,58 @@ mod tests {
         );
     }
 
+    /// A seek to the key of the entry the previous merge read past, or to
+    /// any key before it, yields that key whole: its newest version
+    /// included, merged with the older ones. A seek past it moves on.
+    #[rstest]
+    #[case::to_the_buffered_key(b"key2".as_slice(), Some(b"key2".as_slice()), Some(b"abc".as_slice()))]
+    #[case::before_the_buffered_key(b"key1a".as_slice(), Some(b"key2".as_slice()), Some(b"abc".as_slice()))]
+    #[case::past_the_buffered_key(b"key2a".as_slice(), Some(b"key3".as_slice()), Some(b"v".as_slice()))]
+    #[case::past_every_key(b"key4".as_slice(), None, None)]
+    #[tokio::test]
+    async fn test_seek_keeps_the_entry_a_merge_read_past(
+        #[case] target: &[u8],
+        #[case] key: Option<&[u8]>,
+        #[case] value: Option<&[u8]>,
+    ) {
+        let merge_operator = Arc::new(MockMergeOperator {});
+        let data = vec![
+            RowEntry::new_merge(b"key1", b"1", 1),
+            RowEntry::new_merge(b"key1", b"2", 2),
+            RowEntry::new_merge(b"key2", b"a", 3),
+            RowEntry::new_merge(b"key2", b"b", 4),
+            RowEntry::new_merge(b"key2", b"c", 5),
+            RowEntry::new_value(b"key3", b"v", 6),
+        ];
+        let mut iterator = MergeOperatorIterator::<MockRowEntryIterator>::new(
+            merge_operator,
+            data.into(),
+            true,
+            None,
+        );
+        iterator.init().await.unwrap();
+        let first = iterator.next().await.unwrap().unwrap();
+        assert_eq!(
+            (first.key.as_ref(), first.value.as_bytes().unwrap().as_ref()),
+            (b"key1".as_slice(), b"12".as_slice())
+        );
+
+        iterator.seek(target).await.unwrap();
+        let next = iterator.next().await.unwrap();
+        assert_eq!(
+            next.as_ref().map(|entry| entry.key.as_ref()),
+            key,
+            "the first key at or after the target"
+        );
+        assert_eq!(
+            next.as_ref()
+                .and_then(|entry| entry.value.as_bytes())
+                .as_deref(),
+            value,
+            "every version of it"
+        );
+    }
+
     #[derive(Debug)]
     struct TestCase {
         unsorted_data: Vec<RowEntry>,
@@ -1072,7 +1137,13 @@ mod tests {
         }
 
         async fn seek(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {
-            self.values.retain(|entry| entry.key == next_key);
+            while self
+                .values
+                .front()
+                .is_some_and(|entry| entry.key.as_ref() < next_key)
+            {
+                self.values.pop_front();
+            }
             Ok(())
         }
     }

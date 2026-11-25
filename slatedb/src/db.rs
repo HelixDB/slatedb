@@ -2889,6 +2889,39 @@ mod tests {
         kv_store.close().await.unwrap();
     }
 
+    /// Merging a key reads the first entry of the next; a seek to that next
+    /// key, or to any key before it, still yields every version of it.
+    #[tokio::test]
+    async fn test_seek_after_a_merged_key_keeps_the_next_key_whole() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = Db::builder("/tmp/test_seek_after_merged_key", object_store)
+            .with_settings(test_db_options(0, 1024 * 1024, None))
+            .with_merge_operator(Arc::new(StringConcatMergeOperator {}))
+            .build()
+            .await
+            .unwrap();
+        for (key, operand) in [(b"a", b"1"), (b"a", b"2"), (b"c", b"x"), (b"c", b"y")] {
+            db.merge(key, operand).await.unwrap();
+        }
+        for target in [b"b".as_slice(), b"c".as_slice()] {
+            let mut iter = db.scan(..).await.unwrap();
+            let first = iter.next().await.unwrap().unwrap();
+            assert_eq!(
+                (first.key.as_ref(), first.value.as_ref()),
+                (b"a".as_slice(), b"12".as_slice())
+            );
+            iter.seek(target).await.unwrap();
+            let next = iter.next().await.unwrap().unwrap();
+            assert_eq!(
+                (next.key.as_ref(), next.value.as_ref()),
+                (b"c".as_slice(), b"xy".as_slice()),
+                "seek to {target:?}"
+            );
+            assert_eq!(iter.next().await.unwrap(), None);
+        }
+        db.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn test_seek_rejected_for_descending_scan() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
